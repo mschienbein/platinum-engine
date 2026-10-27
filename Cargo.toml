@@ -1,7 +1,7 @@
 [package]
 name = "platinum-engine"
 version = "0.1.0"
-license = "0BSD"
+license = "MIT"
 edition = "2024"
 rust-version = "1.99"
 publish = false
