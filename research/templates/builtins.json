@@ -1,0 +1,349 @@
+{
+  "source": {
+    "path": "/Applications/Platinum Notes 10.app/Contents/Resources/Templates.xml",
+    "sha256": "de54515d8824a50202a0e6ad8b9cd44435009c81d23fd3d21ad393bf9fc067d7",
+    "basis": "Static source XML and observed native parser/setter arithmetic; no execution of target code. All three source templates use finite, valid decimal literals."
+  },
+  "contract": "contract.json",
+  "templates_in_load_order": [
+    {
+      "contract_version": 1,
+      "template": {
+        "unique_id": "1D466ABE-2536-4ACC-A49D-D46C3F6DFF23",
+        "name": "The Official Platinum Notes Template",
+        "description": "Custom created by Yakov Vorobyev @ Mixed In Key LLC",
+        "is_builtin": true,
+        "is_default": true,
+        "analysis_volume": "0xc2100000",
+        "clip": {
+          "enabled": true,
+          "low": "0xc1500000",
+          "high": "0x00000000",
+          "percentage": "0x42c76666",
+          "headroom": "0x3fc00000"
+        },
+        "pitch": {
+          "enabled": false,
+          "threshold_cents": "10",
+          "option": 0
+        },
+        "exciter_option": 0,
+        "expansion": {
+          "enabled": true,
+          "low": "0xc1600000",
+          "high": "0x00000000",
+          "target_volume": "0xc1500000",
+          "headroom": "0x40900000",
+          "bands": [
+            {
+              "threshold": "0xc1b00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x428c0000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1a80000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x42480000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f99999a",
+              "attack": "0x41f00000",
+              "release": "0x43200000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f99999a",
+              "attack": "0x41a00000",
+              "release": "0x43200000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x42be0000",
+            "0x44098000",
+            "0x45abe000"
+          ]
+        },
+        "compression": {
+          "enabled": false,
+          "low": "0x00000000",
+          "high": "0x00000000",
+          "target_volume": "0x00000000",
+          "bands": [
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x00000000",
+            "0x00000000",
+            "0x00000000"
+          ]
+        },
+        "output": {
+          "limiter_threshold": "0xc1380000",
+          "margin": "0xbf19999a",
+          "character": "4",
+          "limiter_release": "0x40400000"
+        }
+      }
+    },
+    {
+      "contract_version": 1,
+      "template": {
+        "unique_id": "6C8F0DE3-5B5E-45B8-B284-07BA95F81103",
+        "name": "Festival",
+        "description": "Custom created by Yakov Vorobyev @ Mixed In Key LLC",
+        "is_builtin": true,
+        "is_default": false,
+        "analysis_volume": "0xc2100000",
+        "clip": {
+          "enabled": true,
+          "low": "0xc1500000",
+          "high": "0x00000000",
+          "percentage": "0x42c76666",
+          "headroom": "0x3fc00000"
+        },
+        "pitch": {
+          "enabled": false,
+          "threshold_cents": "10",
+          "option": 0
+        },
+        "exciter_option": 0,
+        "expansion": {
+          "enabled": true,
+          "low": "0xc1600000",
+          "high": "0x00000000",
+          "target_volume": "0xc1500000",
+          "headroom": "0x40400000",
+          "bands": [
+            {
+              "threshold": "0xc1b00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x428c0000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1a80000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x42480000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x41f00000",
+              "release": "0x43200000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f99999a",
+              "attack": "0x41a00000",
+              "release": "0x43200000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x42be0000",
+            "0x44098000",
+            "0x45dac000"
+          ]
+        },
+        "compression": {
+          "enabled": false,
+          "low": "0x00000000",
+          "high": "0x00000000",
+          "target_volume": "0x00000000",
+          "bands": [
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x43020000",
+            "0x44480000",
+            "0x45548000"
+          ]
+        },
+        "output": {
+          "limiter_threshold": "0xc1380000",
+          "margin": "0xbf19999a",
+          "character": "4",
+          "limiter_release": "0x40400000"
+        }
+      }
+    },
+    {
+      "contract_version": 1,
+      "template": {
+        "unique_id": "7F9C4BAB-C063-46DB-970A-837E0EE27ED3",
+        "name": "The Big Boost",
+        "description": "",
+        "is_builtin": true,
+        "is_default": false,
+        "analysis_volume": "0xc2100000",
+        "clip": {
+          "enabled": true,
+          "low": "0xc1380000",
+          "high": "0x00000000",
+          "percentage": "0x42c76666",
+          "headroom": "0x3fc00000"
+        },
+        "pitch": {
+          "enabled": true,
+          "threshold_cents": "10",
+          "option": 0
+        },
+        "exciter_option": 0,
+        "expansion": {
+          "enabled": true,
+          "low": "0xc1600000",
+          "high": "0x00000000",
+          "target_volume": "0xc1500000",
+          "headroom": "0x40900000",
+          "bands": [
+            {
+              "threshold": "0xc1b00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x428c0000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1a80000",
+              "gain": "0x00000000",
+              "ratio": "0x3f8ccccd",
+              "attack": "0x42480000",
+              "release": "0x42f00000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f99999a",
+              "attack": "0x41f00000",
+              "release": "0x43200000"
+            },
+            {
+              "threshold": "0xc1c00000",
+              "gain": "0x00000000",
+              "ratio": "0x3f99999a",
+              "attack": "0x41a00000",
+              "release": "0x43200000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x42be0000",
+            "0x44098000",
+            "0x45abe000"
+          ]
+        },
+        "compression": {
+          "enabled": false,
+          "low": "0x00000000",
+          "high": "0x00000000",
+          "target_volume": "0x00000000",
+          "bands": [
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            },
+            {
+              "threshold": "0x00000000",
+              "gain": "0x00000000",
+              "ratio": "0x00000000",
+              "attack": "0x00000000",
+              "release": "0x00000000"
+            }
+          ],
+          "crossovers_hz": [
+            "0x00000000",
+            "0x00000000",
+            "0x00000000"
+          ]
+        },
+        "output": {
+          "limiter_threshold": "0xc1180000",
+          "margin": "0xbf19999a",
+          "character": "4",
+          "limiter_release": "0x40400000"
+        }
+      }
+    }
+  ]
+}

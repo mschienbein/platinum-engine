@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platinum-engine.invalid/research/template-contract-1.json",
+  "title": "Platinum Notes 10 template effective-state interchange contract",
+  "description": "Research contract, not an implementation or a claim of DSP equivalence. Values represent effective PNTemplate fields after legacy XML parsing and setter effects, not raw XML literals. Float values are exact IEEE-754 binary32 bits encoded as eight hexadecimal digits prefixed by 0x; this represents endpoints, signed zero, and non-finite bit patterns in JSON. The consumer must not infer UI constraints as parser validation. Native GUI export clones the selected template to a new ID, clears its default flag, and serializes floats lossily; this contract does not claim native XML is identity- or precision-preserving.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "template"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "template": {"$ref": "#/$defs/template"}
+  },
+  "$defs": {
+    "f32": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{8}$",
+      "description": "IEEE-754 binary32 bits in big-endian hexadecimal notation; e.g. 0x00000000 is +0.0 and 0x80000000 is -0.0."
+    },
+    "i32": {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
+    "i64": {"type": "string", "pattern": "^-?(0|[1-9][0-9]*)$", "description": "Signed 64-bit integer encoded as decimal text; reject values outside the i64 range."},
+    "band": {
+      "type": "object", "additionalProperties": false,
+      "required": ["threshold", "gain", "ratio", "attack", "release"],
+      "properties": {
+        "threshold": {"$ref": "#/$defs/f32"},
+        "gain": {"$ref": "#/$defs/f32"},
+        "ratio": {"$ref": "#/$defs/f32"},
+        "attack": {"$ref": "#/$defs/f32"},
+        "release": {"$ref": "#/$defs/f32"}
+      }
+    },
+    "bands": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "description": "Ordered band 1 through band 4, including all fields even if the effect is disabled.",
+      "items": {"$ref": "#/$defs/band"}
+    },
+    "crossovers": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "description": "Ordered midpoint12, midpoint23, midpoint34 in Hz, after ordered native setter effects.",
+      "items": {"$ref": "#/$defs/f32"}
+    },
+    "template": {
+      "type": "object", "additionalProperties": false,
+      "required": ["unique_id", "name", "description", "is_builtin", "is_default", "analysis_volume", "clip", "pitch", "exciter_option", "expansion", "compression", "output"],
+      "properties": {
+        "unique_id": {"type": ["string", "null"], "description": "Exact legacy uniqueId attribute. Native XML parsing overwrites the constructor UUID with the attribute value, including nil when absent. Preserve any existing spelling; do not generate a replacement merely while importing."},
+        "name": {"type": ["string", "null"]},
+        "description": {"type": ["string", "null"]},
+        "is_builtin": {"type": "boolean"},
+        "is_default": {"type": "boolean", "description": "Serialized flag; manager fallback uses first template rather than searching this flag."},
+        "analysis_volume": {"$ref": "#/$defs/f32", "description": "AnalysisVolume / volumeThresholdPre."},
+        "clip": {
+          "type": "object", "additionalProperties": false,
+          "required": ["enabled", "low", "high", "percentage", "headroom"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "low": {"$ref": "#/$defs/f32", "description": "Effective clipThresholdVolumeLow, after XML conversion and coupled setters."},
+            "high": {"$ref": "#/$defs/f32", "description": "Effective clipThresholdVolumeHigh, after XML conversion and coupled setters."},
+            "percentage": {"$ref": "#/$defs/f32"},
+            "headroom": {"$ref": "#/$defs/f32"}
+          }
+        },
+        "pitch": {
+          "type": "object", "additionalProperties": false,
+          "required": ["enabled", "threshold_cents", "option"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "threshold_cents": {"$ref": "#/$defs/i64", "description": "XML PitchCents is first parsed by NSString intValue then sign-extended; native storage is signed long."},
+            "option": {"$ref": "#/$defs/i32", "description": "PitchType. UI selectedIndex 0 preserves tempo; 1 is turntable-style."}
+          }
+        },
+        "exciter_option": {"$ref": "#/$defs/i32", "description": "Raw effective ExciterOption, not legacy ExciterEnabled or ExciterPreset. Typical options: -1 none, 0 gentle, 2 hot; retain other signed values rather than collapsing them."},
+        "expansion": {
+          "type": "object", "additionalProperties": false,
+          "required": ["enabled", "low", "high", "target_volume", "headroom", "bands", "crossovers_hz"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "low": {"$ref": "#/$defs/f32"},
+            "high": {"$ref": "#/$defs/f32"},
+            "target_volume": {"$ref": "#/$defs/f32"},
+            "headroom": {"$ref": "#/$defs/f32"},
+            "bands": {"$ref": "#/$defs/bands"},
+            "crossovers_hz": {"$ref": "#/$defs/crossovers"}
+          }
+        },
+        "compression": {
+          "type": "object", "additionalProperties": false,
+          "required": ["enabled", "low", "high", "target_volume", "bands", "crossovers_hz"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "low": {"$ref": "#/$defs/f32"},
+            "high": {"$ref": "#/$defs/f32"},
+            "target_volume": {"$ref": "#/$defs/f32"},
+            "bands": {"$ref": "#/$defs/bands"},
+            "crossovers_hz": {"$ref": "#/$defs/crossovers"}
+          }
+        },
+        "output": {
+          "type": "object", "additionalProperties": false,
+          "required": ["limiter_threshold", "margin", "character", "limiter_release"],
+          "properties": {
+            "limiter_threshold": {"$ref": "#/$defs/f32", "description": "Effective PN volumeLimiterThreshold, after XML +1/clamp and piecewise transform."},
+            "margin": {"$ref": "#/$defs/f32"},
+            "character": {"$ref": "#/$defs/i64", "description": "Raw volumeLimiterCharacter; do not conflate the archived UI label with its tag."},
+            "limiter_release": {"$ref": "#/$defs/f32", "description": "Native constructor initializes 3.0. This field is used in processing but is not XML-serialized or copied; loading or duplicating a template restores 3.0."}
+          }
+        }
+      }
+    }
+  }
+}
