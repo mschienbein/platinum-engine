@@ -57,7 +57,7 @@ The analyzer is identified from static evidence as K-weighted integrated LUFS-st
 
 ## Licensing
 
-No project license granting reuse is included in this checkout. Third-party components have their own license terms; consult their upstream packages and the [build guide](docs/BUILD.md) before distributing them. This project does not grant rights to the reference application or its artifacts.
+Project-owned contributions are available under the [Zero-Clause BSD license (0BSD)](LICENSE), to the extent their contributors can grant those rights. It permits use, modification and distribution, including commercially, without an attribution condition. Third-party dependencies have their own terms; consult their upstream packages and the [build guide](docs/BUILD.md) before distributing them. This license does not grant rights to the reference application or its artifacts.
 
 This reconstruction was informed by static binary analysis and measured reference behavior; it is not a clean-room provenance claim. Compatibility names, identifiers and typed parameter values retain their reference-derived provenance. The public snapshot excludes original serialized preset blobs, raw decompiler/disassembly exports, compiled resources, screenshots and the private research history.
 
