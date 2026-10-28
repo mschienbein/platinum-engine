@@ -23,6 +23,7 @@ fn shipped_effective_states_match_complete_recovered_contract_and_original_xml()
     assert_eq!(states[1].exciter_option, 0); // absent in Festival; legacy tags do not set it
 
     // A local licensed installation is optional for the rest of this suite.
+    #[cfg(target_os = "macos")]
     if let Ok(xml) = std::fs::read_to_string("/Applications/Platinum Notes 10.app/Contents/Resources/Templates.xml") {
         let parsed = parse_xml_report(&xml).unwrap();
         assert_eq!(parsed.templates.len(), expected.len());

@@ -7,11 +7,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[link(name = "System")]
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-    fn kill(pid: i32, signal: i32) -> i32;
-}
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture { root: PathBuf, home: PathBuf, state: PathBuf }
@@ -51,22 +46,46 @@ fn hold_statistics_lock(fixture: &Fixture) -> File {
     fixture.ok(&["statistics", "show"]);
     let file = OpenOptions::new().read(true).write(true).open(fixture.state.join("statistics.lock")).unwrap();
     // SAFETY: file owns a valid descriptor until the caller drops it.
-    assert_eq!(unsafe { flock(file.as_raw_fd(), 2) }, 0);
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
     file
+}
+
+#[cfg(target_os = "macos")]
+fn has_lock_descriptor(child: &Child, path: &Path) -> io::Result<bool> {
+    let canonical = fs::canonicalize(path)?;
+    let output = Command::new("/usr/sbin/lsof").arg("-a").arg("-p").arg(child.id().to_string())
+        .arg("-Fn").output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.strip_prefix('n'))
+        .any(|name| Path::new(name) == path || Path::new(name) == canonical.as_path()))
+}
+
+#[cfg(target_os = "linux")]
+fn has_lock_descriptor(child: &Child, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let target = fs::metadata(path)?;
+    for entry in fs::read_dir(format!("/proc/{}/fd", child.id()))? {
+        match fs::metadata(entry?.path()) {
+            Ok(meta) if meta.dev() == target.dev() && meta.ino() == target.ino() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 // Observe the real CLI's open lock descriptor before SIGINT. The handler is
 // installed before execute() opens it, and the caller still holds the lock.
 fn wait_for_lock_descriptor(child: &mut Child, path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
-    let canonical = fs::canonicalize(path).unwrap();
     loop {
         if let Some(status) = child.try_wait().unwrap() { panic!("CLI exited before lock contention: {status}"); }
-        let output = Command::new("/usr/sbin/lsof").arg("-a").arg("-p").arg(child.id().to_string())
-            .arg("-Fn").output().unwrap();
-        let seen = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.strip_prefix('n'))
-            .any(|name| Path::new(name) == path || Path::new(name) == canonical.as_path());
-        if seen { return; }
+        match has_lock_descriptor(child, path) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect CLI lock descriptor: {error}"),
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -81,8 +100,8 @@ fn interrupt_while_contended(fixture: &Fixture, _held: &File, args: &[&str], tim
         .env("HOME", &fixture.home).arg("--state-dir").arg(&fixture.state).arg("--json").args(args)
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     wait_for_lock_descriptor(&mut child, &fixture.state.join("statistics.lock"), timeout);
-    // SAFETY: child is our live subprocess and signal 2 is Darwin SIGINT.
-    assert_eq!(unsafe { kill(child.id() as i32, 2) }, 0);
+    // SAFETY: child is our live subprocess and SIGINT is the requested signal.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if child.try_wait().unwrap().is_some() { break; }
@@ -174,12 +193,40 @@ fn unsuccessful_process_and_read_only_commands_do_not_record() {
 fn default_directory_belongs_to_engine_not_vendor() {
     let fixture = Fixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_platinum")).env("HOME", &fixture.home)
+        .env_remove("XDG_CONFIG_HOME").env_remove("XDG_STATE_HOME")
         .args(["--json", "statistics", "show"]).output().unwrap();
     assert!(output.status.success());
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["data"]["processed_songs"], 0);
-    assert!(fixture.home.join("Library/Application Support/Platinum Engine/statistics.lock").exists());
-    assert!(!fixture.home.join("Library/Application Support/Mixedinkey").exists());
+    #[cfg(target_os = "macos")]
+    {
+        assert!(fixture.home.join("Library/Application Support/Platinum Engine/statistics.lock").exists());
+        assert!(!fixture.home.join("Library/Application Support/Mixedinkey").exists());
+    }
+    #[cfg(target_os = "linux")]
+    assert!(fixture.home.join(".local/state/platinum-engine/statistics.lock").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_directories_honor_absolute_xdg_and_ignore_relative_paths() {
+    let fixture = Fixture::new();
+    let config = fixture.root.join("config-root");
+    let state = fixture.root.join("state-root");
+    let run = |config_path: &Path, state_path: &Path, args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_platinum"))
+            .env("HOME", &fixture.home).env("XDG_CONFIG_HOME", config_path).env("XDG_STATE_HOME", state_path)
+            .arg("--json").args(args).output().unwrap();
+        assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    };
+    run(&config, &state, &["statistics", "show"]);
+    run(&config, &state, &["config", "set", "output.format", "\"wav\""]);
+    assert!(state.join("platinum-engine/statistics.lock").exists());
+    assert!(config.join("platinum-engine/settings.lock").exists());
+    run(Path::new("relative-config"), Path::new("relative-state"), &["statistics", "show"]);
+    run(Path::new("relative-config"), Path::new("relative-state"), &["config", "set", "output.format", "\"wav\""]);
+    assert!(fixture.home.join(".local/state/platinum-engine/statistics.lock").exists());
+    assert!(fixture.home.join(".config/platinum-engine/settings.lock").exists());
 }
 
 #[test]

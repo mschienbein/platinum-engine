@@ -629,11 +629,7 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
         }
     } else { None };
     let plans: Vec<_> = prepared.iter().map(|item| item.output_plan()).collect();
-    let conflict = overwrite_error.or_else(|| file_workflow::validate_batch(&plans).err().map(workflow_error)).or_else(|| {
-        // Also protect selected inputs whose own preflight failed.
-        plans.iter().find_map(|plan| files.iter().find(|file| plan.destination() == file.path.as_path() && plan.source() != file.path.as_path())
-            .map(|file| json!({"message": format!("destination {} conflicts with selected input {}", plan.destination().display(), file.path.display())})))
-    });
+    let conflict = overwrite_error.or_else(|| file_workflow::validate_batch(&plans, &files).err().map(workflow_error));
     if conflict.is_none() && !cancel.is_cancelled() {
         let job_trace = JobTrace::from_env()?;
         let slots: Vec<_> = (0..ready.len()).collect();
@@ -653,21 +649,31 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
 
 /// Diagnostic only: `PLATINUM_DIAGNOSTIC_JOB_TRACE` names a new file that
 /// receives one JSON line when each file job enters and leaves processing, and
-/// one line for every Mach-O image dyld maps while tracing (with its in-memory
-/// LC_UUID), so evidence tooling can bind libraries loaded during a job.
-struct JobTrace { file: std::sync::Mutex<std::fs::File>, origin: std::time::Instant }
+/// records loaded images with Mach-O UUIDs on macOS or GNU build IDs on Linux.
+struct JobTrace {
+    file: std::sync::Mutex<std::fs::File>, origin: std::time::Instant,
+    #[cfg(target_os = "linux")]
+    images: std::sync::Mutex<std::collections::BTreeSet<(Vec<u8>, Option<String>)>>,
+}
 static JOB_TRACE: std::sync::OnceLock<JobTrace> = std::sync::OnceLock::new();
 impl JobTrace {
     fn from_env() -> Result<Option<&'static Self>, AppError> {
+        #[cfg(target_os = "macos")]
         unsafe extern "C" { fn _dyld_register_func_for_add_image(callback: extern "C" fn(*const u8, isize)); }
         let Some(path) = std::env::var_os("PLATINUM_DIAGNOSTIC_JOB_TRACE") else { return Ok(None) };
         if JOB_TRACE.get().is_some() { return Err(AppError::io("job trace already initialized")); }
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
             .map_err(|e| AppError::io(format!("create job trace {}: {e}", Path::new(&path).display())))?;
-        let trace = JOB_TRACE.get_or_init(|| Self { file: std::sync::Mutex::new(file), origin: std::time::Instant::now() });
-        // SAFETY: the callback only reads the supplied mapped header and writes
-        // to the process-lifetime trace; dyld also replays already-loaded images.
+        let trace = JOB_TRACE.get_or_init(|| Self {
+            file: std::sync::Mutex::new(file), origin: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            images: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        });
+        #[cfg(target_os = "macos")]
+        // dyld replays already-loaded images through the process-lifetime callback.
         unsafe { _dyld_register_func_for_add_image(image_added) };
+        #[cfg(target_os = "linux")]
+        record_linux_images();
         Ok(Some(trace))
     }
     fn write(&self, mut line: Value) {
@@ -680,10 +686,13 @@ impl JobTrace {
         let _ = writeln!(file, "{line}").and_then(|()| file.sync_data());
     }
     fn event(&self, event: &str, slot: usize, input: &Path) {
+        #[cfg(target_os = "linux")]
+        record_linux_images();
         self.write(json!({"event": event, "slot": slot, "input": path_value(input)}));
     }
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn image_added(header: *const u8, _slide: isize) {
     #[repr(C)]
     struct DlInfo { fname: *const std::ffi::c_char, fbase: *mut std::ffi::c_void, sname: *const std::ffi::c_char, saddr: *mut std::ffi::c_void }
@@ -714,6 +723,74 @@ extern "C" fn image_added(header: *const u8, _slide: isize) {
     };
     if path.as_deref().is_some_and(|p| p.starts_with("/System/") || p.starts_with("/usr/lib/")) { return; }
     trace.write(json!({"event": "image", "path": path, "uuid": uuid}));
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn elf_gnu_build_id(bytes: &[u8]) -> Option<String> {
+    let mut offset = 0usize;
+    while let Some(header) = bytes.get(offset..offset.saturating_add(12)) {
+        let namesz = u32::from_ne_bytes(header[0..4].try_into().ok()?) as usize;
+        let descsz = u32::from_ne_bytes(header[4..8].try_into().ok()?) as usize;
+        let kind = u32::from_ne_bytes(header[8..12].try_into().ok()?);
+        let name_start = offset.checked_add(12)?;
+        let desc_start = name_start.checked_add(namesz.checked_add(3)? & !3)?;
+        let next = desc_start.checked_add(descsz.checked_add(3)? & !3)?;
+        if next > bytes.len() { return None; }
+        if kind == 3 && bytes.get(name_start..name_start.checked_add(namesz)?) == Some(b"GNU\0".as_slice())
+            && descsz > 0 && descsz <= 128 {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut text = String::with_capacity(descsz * 2);
+            for &byte in bytes.get(desc_start..desc_start.checked_add(descsz)?)? {
+                text.push(HEX[usize::from(byte >> 4)] as char); text.push(HEX[usize::from(byte & 15)] as char);
+            }
+            return Some(text);
+        }
+        offset = next;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn record_linux_images() {
+    unsafe { libc::dl_iterate_phdr(Some(linux_image_added), std::ptr::null_mut()); }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn linux_image_added(info: *mut libc::dl_phdr_info, size: usize, _data: *mut std::ffi::c_void) -> i32 {
+    let _ = std::panic::catch_unwind(|| {
+        let Some(trace) = JOB_TRACE.get() else { return };
+        if info.is_null() || size < std::mem::size_of::<libc::dl_phdr_info>() { return; }
+        let info = unsafe { &*info };
+        if info.dlpi_phdr.is_null() || usize::from(info.dlpi_phnum) > 4096 { return; }
+        let headers = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+        let base = info.dlpi_addr as usize;
+        let mut build_id = None;
+        for note in headers.iter().filter(|entry| entry.p_type == libc::PT_NOTE) {
+            let Some(start) = base.checked_add(note.p_vaddr as usize) else { continue };
+            let Some(end) = start.checked_add(note.p_memsz as usize) else { continue };
+            if note.p_memsz == 0 || note.p_memsz > 1_048_576 || !headers.iter().any(|load| {
+                if load.p_type != libc::PT_LOAD || load.p_flags & libc::PF_R == 0 { return false; }
+                base.checked_add(load.p_vaddr as usize).and_then(|low| low.checked_add(load.p_memsz as usize).map(|high| (low, high)))
+                    .is_some_and(|(low, high)| start >= low && end <= high)
+            }) { continue; }
+            let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+            build_id = elf_gnu_build_id(bytes);
+            if build_id.is_some() { break; }
+        }
+        let path = if info.dlpi_name.is_null() || unsafe { *info.dlpi_name } == 0 {
+            std::env::current_exe().ok()
+        } else {
+            let bytes = unsafe { std::ffi::CStr::from_ptr(info.dlpi_name) }.to_bytes();
+            Some(PathBuf::from(OsStr::from_bytes(bytes)))
+        };
+        let key = (path.as_ref().map_or_else(Vec::new, |p| p.as_os_str().as_bytes().to_vec()), build_id.clone());
+        let mut images = trace.images.lock().unwrap_or_else(|error| error.into_inner());
+        if images.insert(key) {
+            drop(images);
+            trace.write(json!({"event": "image", "path": path.as_deref().map(path_value), "build_id": build_id}));
+        }
+    });
+    0
 }
 fn analyze(args: AnalyzeArgs, mut settings: Settings, cores: usize, cancel: &Cancellation) -> Result<Outcome, AppError> {
     apply_run_template(&mut settings, &args.template)?;
@@ -813,8 +890,21 @@ fn execute(cli: Cli, cancel: &Cancellation) -> Result<Outcome, AppError> {
             let home = std::env::var_os("HOME").filter(|s| !s.is_empty()).map(PathBuf::from)
                 .ok_or_else(|| AppError::settings("HOME is not set; cannot resolve Engine defaults"))?;
             let cores = std::thread::available_parallelism().map(NonZeroUsize::get).unwrap_or(1);
-            let store = match cli.state_dir { Some(path) => SettingsStore::new(path, home, cores), None => SettingsStore::in_home(home, cores) };
-            let statistics_store = StatisticsStore::new(store.directory());
+            let (store, statistics_store) = match cli.state_dir {
+                Some(path) => {
+                    let store = SettingsStore::new(path, home, cores);
+                    let statistics_store = StatisticsStore::new(store.directory());
+                    (store, statistics_store)
+                }
+                None => {
+                    #[cfg(target_os = "linux")]
+                    let statistics_store = StatisticsStore::in_home(&home);
+                    let store = SettingsStore::in_home(home, cores);
+                    #[cfg(target_os = "macos")]
+                    let statistics_store = StatisticsStore::new(store.directory());
+                    (store, statistics_store)
+                }
+            };
             match command {
                 Command::Statistics { command } => statistics(command, &statistics_store, cancel),
                 command => {
@@ -899,8 +989,20 @@ mod statistics_outcome_tests {
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
-    #[link(name = "System")]
+    #[cfg_attr(target_os = "macos", link(name = "System"))]
     unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+
+    #[test]
+    fn elf_build_id_parser_checks_note_bounds_and_owner() {
+        let mut note = Vec::new();
+        note.extend_from_slice(&4u32.to_ne_bytes()); note.extend_from_slice(&3u32.to_ne_bytes());
+        note.extend_from_slice(&3u32.to_ne_bytes()); note.extend_from_slice(b"GNU\0");
+        note.extend_from_slice(&[0x01, 0xab, 0xff, 0]);
+        assert_eq!(elf_gnu_build_id(&note).as_deref(), Some("01abff"));
+        assert!(elf_gnu_build_id(&note[..note.len() - 1]).is_none());
+        note[12] = b'X';
+        assert!(elf_gnu_build_id(&note).is_none());
+    }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct Fixture(PathBuf);
@@ -927,7 +1029,7 @@ mod statistics_outcome_tests {
             encoded_length_frames: 1, input_frames: 1, healed_frames: 1, output_frames: 1,
             input_volume: 0.0, healed_volume: 0.0, output_volume: 0.6, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
             tempo_factor: 1.0, clip_count: 3, applied_stages: Vec::new(),
-            processing_marker_status: "present", input_marker_override: None, controlled_mp4_time_1904: None,
+            processing_marker_status: "present", input_marker_override: None, source_tags_unavailable: None, controlled_mp4_time_1904: None,
         }
     }
 

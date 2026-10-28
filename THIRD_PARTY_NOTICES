@@ -1,0 +1,63 @@
+Platinum Engine v0.1.0 — third-party notices
+===========================================
+
+Project-owned contributions are under LICENSE (MIT), subject to third-party
+rights. The project is not affiliated with the reference application's vendor.
+This document is not a legal-clearance determination.
+
+TagLib 1.11.1
+-------------
+The bridge links TagLib revision e36a9cabb9882e61276161c23834d966d62073b7
+statically into a separately loaded shared library; the executable itself
+loads that bridge dynamically. TagLib's source archive contains COPYING.LGPL
+(LGPL-2.1) and COPYING.MPL; consult the applicable upstream terms. Source:
+https://github.com/taglib/taglib/archive/e36a9cabb9882e61276161c23834d966d62073b7.tar.gz
+SHA-256: 5c80b1e5273849122ef11b5a9116e4b7f182b899cfdb28aefb704087216e1360
+
+The release packaging recipe supplies the unmodified TagLib source archive,
+the bridge source and header, the corresponding bridge object and libtag.a,
+and complete relinking instructions in corresponding-source/RELINK.txt; it
+includes the license texts, rather than relying on a written source offer.
+Users may modify TagLib and reverse engineer the application to debug those
+modifications, to the extent required by the applicable LGPL terms. Rebuilding
+the bridge can change behavior and bytes. On Linux, the shipped CLI refuses a
+modified bridge whose digest is not in its architecture-specific allowlist;
+using one requires building the public CLI source with an appropriately changed
+allowlist as well. That operation is not evidence of parity.
+
+LAME 3.100
+----------
+A separately loaded shared LAME library is used for MP3 encoding. LAME is
+licensed under the GNU Library General Public License version 2 or later;
+its source archive's COPYING and LICENSE are included by the packaging recipe.
+The macOS build applies the export-list correction; the Linux build additionally
+applies the supplied builtin and intrinsic-order patches and codec math shim.
+Source: https://ftp.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz
+SHA-256: ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+
+libFLAC 1.4.2
+-------------
+A separately loaded shared libFLAC is used for FLAC input and output. The
+library is distributed under the Xiph/BSD-3-Clause terms in COPYING.Xiph.
+Linux applies the supplied FP-order and fixed-predictor patches and math shim;
+the source archive, patches and build instructions accompany release payloads.
+Source: https://github.com/xiph/flac/releases/download/1.4.2/flac-1.4.2.tar.xz
+SHA-256: e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4
+
+Apple ALAC reference
+--------------------
+The portable Rust ALAC implementation was independently written after studying
+Apple's reference implementation, revision c38887c5c5e64a4b31108733bd79ca9b2496d987;
+no Apple source was pasted. Apple reference source: Copyright (c) 2011 Apple
+Inc. All rights reserved. Its Apache-2.0 license text is reproduced in NOTICE.
+Derivative status and any applicable attribution requirements need maintainer
+review. Source: https://github.com/macosforge/alac/tree/c38887c5c5e64a4b31108733bd79ca9b2496d987
+
+Rust dependencies and standard library
+--------------------------------------
+Cargo.lock identifies Rust dependencies; each has its own applicable license.
+The packaging recipe collects dependency license texts, notices, manifests and
+inventory, and Rust standard-library notices, into licenses/. Some objc2 crates
+require the pinned upstream workspace license statement. Source snapshots do
+not contain bundled native binaries. Review the actual distributed payload,
+including all source and license materials, before redistributing.

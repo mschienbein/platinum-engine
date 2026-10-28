@@ -1,5 +1,7 @@
 //! The reference uses macOS libSystem math, not interchangeable approximations.
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+mod native {
 unsafe extern "C" {
     fn __exp10(value: f64) -> f64;
     #[link_name = "exp2"]
@@ -63,3 +65,9 @@ pub(crate) fn powi_f64(value: f64, exponent: i32) -> f64 {
     // HeartCore imports this compiler-runtime primitive from libSystem.
     unsafe { native_powi(value, exponent) }
 }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+pub(crate) use native::{exp10, exp2, exp2f, expf, ln, logf, powi_f64, tan};
+#[cfg(any(target_os = "linux", feature = "portable"))]
+pub(crate) use crate::portable::math::{exp10, exp2, exp2f, expf, ln, logf, powi_f64, tan};

@@ -11,7 +11,7 @@ use libloading::Library;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -34,6 +34,10 @@ pub struct LibraryIdentity {
 pub enum FlacError {
     Io { operation: &'static str, source: io::Error },
     Library(String),
+    #[cfg(target_os = "linux")]
+    LibraryPolicy(crate::linux_libraries::LibraryPolicyError),
+    InvalidDigest,
+    DigestMismatch { expected: String, actual: String },
     IncompatibleLibrary { version: String, vendor: String },
     UnexpectedDefault { name: &'static str, expected: u64, actual: u64 },
     InvalidStagingFile(&'static str),
@@ -49,6 +53,10 @@ impl fmt::Display for FlacError {
         match self {
             Self::Io { operation, source } => write!(f, "{operation}: {source}"),
             Self::Library(message) => write!(f, "libFLAC: {message}"),
+            #[cfg(target_os = "linux")]
+            Self::LibraryPolicy(error) => write!(f, "{error}"),
+            Self::InvalidDigest => f.write_str("expected libFLAC SHA-256 must be 64 hexadecimal digits"),
+            Self::DigestMismatch { expected, actual } => write!(f, "libFLAC SHA-256 mismatch: expected {expected}, got {actual}"),
             Self::IncompatibleLibrary { version, vendor } => write!(f, "expected libFLAC {VERSION} and vendor {VENDOR:?}, got version {version:?}, vendor {vendor:?}"),
             Self::UnexpectedDefault { name, expected, actual } => write!(f, "libFLAC {name}: expected {expected}, got {actual}"),
             Self::InvalidStagingFile(message) => write!(f, "invalid FLAC staging file: {message}"),
@@ -65,6 +73,8 @@ impl std::error::Error for FlacError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            #[cfg(target_os = "linux")]
+            Self::LibraryPolicy(error) => Some(error),
             _ => None,
         }
     }
@@ -104,7 +114,8 @@ struct Functions {
 /// A caller-selected open-source libFLAC. Loading a dylib executes its normal
 /// initializers; the caller is responsible for choosing a trusted file.
 pub struct FlacLibrary {
-    library: Library,
+    library: std::sync::Arc<Library>,
+    _pinned: crate::native_library::PinnedLibrary,
     functions: Functions,
     identity: LibraryIdentity,
 }
@@ -137,13 +148,33 @@ impl FlacLibrary {
     /// Load exactly the specified library; no application-bundled lookup or
     /// fallback occurs. A version/vendor match is necessary, not sufficient,
     /// for reference equivalence.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, FlacError> {
+    pub fn load(path: impl AsRef<Path>, expected_sha256: &str) -> Result<Self, FlacError> {
+        if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FlacError::InvalidDigest);
+        }
         let path = std::fs::canonicalize(path).map_err(|e| io_error("resolve libFLAC path", e))?;
-        let sha256 = hash_file(&path)?;
+        #[cfg(target_os = "macos")]
+        let pinned = crate::native_library::PinnedLibrary::open(&path).map_err(|e| FlacError::Library(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let pinned = crate::linux_libraries::open_approved(&path, crate::linux_libraries::LibraryKind::Flac).map_err(FlacError::LibraryPolicy)?;
+        let sha256 = pinned.digest();
+        if !pinned.digest_matches(expected_sha256) {
+            return Err(FlacError::DigestMismatch {
+                expected: expected_sha256.to_ascii_lowercase(), actual: pinned.digest_hex(),
+            });
+        }
         // SAFETY: the caller explicitly supplies a trusted compatible library.
-        let library = unsafe { Library::new(&path) }.map_err(|e| FlacError::Library(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        let library = unsafe { pinned.load() }.map_err(|e| FlacError::Library(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let library = unsafe { pinned.load() }.map_err(|e| FlacError::LibraryPolicy(e.into()))?;
         // SAFETY: libFLAC defines these symbols with the declared C ABI.
         let (version, vendor, ogg_supported, functions) = unsafe {
+            let new: New = symbol(&library, b"FLAC__stream_encoder_new\0")?;
+            #[cfg(target_os = "macos")]
+            pinned.verify_symbol(new as *const () as *const c_void).map_err(|e| FlacError::Library(e.to_string()))?;
+            #[cfg(target_os = "linux")]
+            pinned.verify_symbol(new as *const () as *const c_void).map_err(|e| FlacError::LibraryPolicy(e.into()))?;
             let version = string_symbol(&library, b"FLAC__VERSION_STRING\0")?;
             let vendor = string_symbol(&library, b"FLAC__VENDOR_STRING\0")?;
             if version != VERSION || vendor != VENDOR {
@@ -155,7 +186,7 @@ impl FlacLibrary {
             }
             let ogg_supported = *ogg != 0;
             let functions = Functions {
-                new: symbol(&library, b"FLAC__stream_encoder_new\0")?,
+                new,
                 delete: symbol(&library, b"FLAC__stream_encoder_delete\0")?,
                 channels: symbol(&library, b"FLAC__stream_encoder_set_channels\0")?,
                 sample_rate: symbol(&library, b"FLAC__stream_encoder_set_sample_rate\0")?,
@@ -167,7 +198,7 @@ impl FlacLibrary {
             };
             (version, vendor, ogg_supported, functions)
         };
-        Ok(Self { library, functions, identity: LibraryIdentity { canonical_path: path, file_sha256: sha256, version, vendor, ogg_supported } })
+        Ok(Self { library, functions, identity: LibraryIdentity { canonical_path: path, file_sha256: sha256, version, vendor, ogg_supported }, _pinned: pinned })
     }
 
     pub fn identity(&self) -> &LibraryIdentity { &self.identity }
@@ -385,13 +416,8 @@ impl Drop for FlacEncoder<'_> {
     }
 }
 
-#[link(name = "System")]
-unsafe extern "C" {
-    fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
-    fn CC_SHA256_Init(context: *mut Sha256Context) -> c_int;
-    fn CC_SHA256_Update(context: *mut Sha256Context, data: *const c_void, len: u32) -> c_int;
-    fn CC_SHA256_Final(digest: *mut u8, context: *mut Sha256Context) -> c_int;
-}
+#[cfg_attr(target_os = "macos", link(name = "System"))]
+unsafe extern "C" { fn fcntl(fd: c_int, command: c_int, ...) -> c_int; }
 
 fn validate_staging_file(file: &mut File) -> Result<(), FlacError> {
     let metadata = file.metadata().map_err(|e| io_error("inspect FLAC staging file", e))?;
@@ -399,32 +425,14 @@ fn validate_staging_file(file: &mut File) -> Result<(), FlacError> {
     if file.stream_position().map_err(|e| io_error("inspect FLAC staging position", e))? != 0 {
         return Err(FlacError::InvalidStagingFile("position must be zero"));
     }
-    // Darwin F_GETFL=3, O_ACCMODE=3, O_RDONLY=0, O_APPEND=8.
     // SAFETY: F_GETFL takes no variadic argument and the fd is live.
-    let flags = unsafe { fcntl(file.as_raw_fd(), 3) };
+    let flags = unsafe { fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 { return Err(io_error("inspect FLAC staging flags", io::Error::last_os_error())); }
-    if flags & 3 == 0 { return Err(FlacError::InvalidStagingFile("file is not open for writing")); }
-    if flags & 8 != 0 { return Err(FlacError::InvalidStagingFile("append mode prevents STREAMINFO rewriting")); }
+    if flags & libc::O_ACCMODE == libc::O_RDONLY { return Err(FlacError::InvalidStagingFile("file is not open for writing")); }
+    if flags & libc::O_APPEND != 0 { return Err(FlacError::InvalidStagingFile("append mode prevents STREAMINFO rewriting")); }
     Ok(())
 }
 
-// Layout from the macOS CommonCrypto CommonDigest.h CC_SHA256_CTX ABI.
-#[repr(C)]
-struct Sha256Context { count: [u32; 2], hash: [u32; 8], buffer: [u32; 16] }
-
-fn hash_file(path: &Path) -> Result<[u8; 32], FlacError> {
-    let mut file = File::open(path).map_err(|e| io_error("open libFLAC for identity", e))?;
-    let mut context = std::mem::MaybeUninit::<Sha256Context>::uninit();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut digest = [0u8; 32];
-    // SAFETY: CommonCrypto initializes and consumes the correctly sized
-    // context; each buffer stays valid for the duration of its update.
-    unsafe { CC_SHA256_Init(context.as_mut_ptr()); }
-    loop {
-        let count = file.read(&mut buffer).map_err(|e| io_error("hash libFLAC", e))?;
-        if count == 0 { break; }
-        unsafe { CC_SHA256_Update(context.as_mut_ptr(), buffer.as_ptr().cast(), count as u32); }
-    }
-    unsafe { CC_SHA256_Final(digest.as_mut_ptr(), context.as_mut_ptr()); }
-    Ok(digest)
+impl FlacLibrary {
+    pub(crate) fn decoder_library(&self) -> &Library { &self.library }
 }

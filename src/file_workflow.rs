@@ -2,26 +2,26 @@
 //!
 //! The caller must inspect the source's PN marker and actual stream codec before
 //! planning, and finish encoding *and* metadata transfer before publication.
-//! A private staging directory is used so existing encoders can create a new
-//! file at `staging_path`. No operation uses the proprietary application.
+//! A private staging directory is pinned by descriptor; path-only codecs use
+//! an inode/descriptor alias rather than the directory's replaceable name.
+//! No operation uses the proprietary application.
 //!
 //! Separate outputs refuse collisions unless explicitly authorized. Source
-//! replacement retains a verified backup until a successful restore verifies
-//! and consumes it. Reservations coordinate this module's own jobs. Like any
-//! pathname API, this assumes another process with the same privileges is not
-//! maliciously replacing directories or changing files throughout an operation.
-//! External mutation detected during the transaction is reported.
+//! replacement retains a verified, directory-synced backup until successful
+//! restoration. Reservations coordinate this module's own jobs. Deliberate
+//! mutation by a process with the same privileges remains outside the model;
+//! detected external mutation is reported.
 
 use crate::metadata::{Marker, MarkerText};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::ffi::{CString, OsStr, OsString, c_char, c_int, c_long, c_uint, c_void};
+use std::ffi::{CString, OsStr, OsString, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,6 +124,7 @@ pub struct CleanupFailure { pub operation: &'static str, pub path: PathBuf, pub 
 pub enum WorkflowError {
     Io { operation: &'static str, path: PathBuf, source: io::Error },
     Move { from: PathBuf, to: PathBuf, source: io::Error },
+    AtomicRenameUnsupported { operation: &'static str, path: PathBuf, source: io::Error },
     InvalidPath { path: PathBuf, reason: &'static str },
     UnsupportedSource(PathBuf),
     ProtectedSource(PathBuf),
@@ -156,6 +157,7 @@ impl fmt::Display for WorkflowError {
         match self {
             Self::Io { operation, path, source } => write!(f, "{operation} {}: {source}", path.display()),
             Self::Move { from, to, source } => write!(f, "move without overwrite {} -> {}: {source}", from.display(), to.display()),
+            Self::AtomicRenameUnsupported { operation, path, source } => write!(f, "{operation} is unsupported for {}: {source}", path.display()),
             Self::InvalidPath { path, reason } => write!(f, "invalid path {}: {reason}", path.display()),
             Self::UnsupportedSource(p) => write!(f, "unsupported input {}", p.display()),
             Self::ProtectedSource(p) => write!(f, "protected input {}", p.display()),
@@ -202,7 +204,7 @@ impl WorkflowError {
 }
 impl Error for WorkflowError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self { Self::Io { source, .. } | Self::Move { source, .. } => Some(source), Self::Transaction { cause, .. } => Some(cause), _ => None }
+        match self { Self::Io { source, .. } | Self::Move { source, .. } | Self::AtomicRenameUnsupported { source, .. } => Some(source), Self::Transaction { cause, .. } => Some(cause), _ => None }
     }
 }
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> WorkflowError {
@@ -417,6 +419,10 @@ impl OutputPlan {
     /// verified backup is created before returning, so its path can be written
     /// into the PN marker. An abandoned transaction must be explicitly aborted.
     pub fn begin(&self, expected: &FileIdentity) -> Result<StagedOutput, WorkflowError> {
+        self.begin_impl(expected, #[cfg(test)] None)
+    }
+    fn begin_impl(&self, expected: &FileIdentity,
+        #[cfg(test)] sync_override: Option<Box<dyn FnOnce(&Path) -> Result<(), WorkflowError>>>) -> Result<StagedOutput, WorkflowError> {
         expected.verify(&self.source)?;
         let source_stamp = expected.stamp;
         create_mirror(&self.directory_root, &self.mirror_parent)?;
@@ -447,8 +453,24 @@ impl OutputPlan {
             Err(e) => return Err(transaction_error(e, None, None, None, release_reservations(&mut reservations), false)),
         };
         let mut transaction = StagedOutput { plan: self.clone(), workspace, reservations, source_stamp, destination_stamp, backup: None, backup_stamp: None,
-            #[cfg(test)] after_move: None, #[cfg(test)] before_commit: None, #[cfg(test)] after_overwrite_check: None,
-            #[cfg(test)] after_overwrite_swap: None, #[cfg(test)] before_overwrite_rollback: None };
+            new_mp3_mode: None,
+            #[cfg(test)] after_move: None, #[cfg(test)] before_commit: None, #[cfg(test)] after_publish: None,
+            #[cfg(test)] after_overwrite_check: None, #[cfg(test)] after_overwrite_swap: None,
+            #[cfg(test)] before_overwrite_rollback: None };
+        if let Err(error) = transaction.workspace.validate_parent(&self.destination) {
+            return Err(transaction.fail(error, None, None, false));
+        }
+        let parent_check = transaction.reservations.iter().try_for_each(|reservation| {
+            if reservation.same_parent(&transaction.workspace.parent).map_err(|e| io_error("inspect reservation parent", &reservation.path, e))? { Ok(()) }
+            else { Err(invalid(&reservation.path, "reservation and output workspace have different parents")) }
+        });
+        if let Err(error) = parent_check { return Err(transaction.fail(error, None, None, false)); }
+        if self.format == AudioFormat::Mp3 {
+            match transaction.workspace.default_file_mode() {
+                Ok(mode) => transaction.new_mp3_mode = Some(mode),
+                Err(error) => return Err(transaction.fail(error, None, None, false)),
+            }
+        }
         if let Some(directory) = &self.backup_directory {
             match create_backup(&self.source, &source_stamp, directory, #[cfg(test)] None) {
                 Ok(backup) => {
@@ -460,6 +482,13 @@ impl OutputPlan {
                     if let Err(e) = verify_backup(&self.source, &backup, backup_stamp) {
                         return Err(transaction.fail(e, None, None, false));
                     }
+                    #[cfg(test)]
+                    let sync = match sync_override { Some(hook) => hook(&backup), None => sync_backup_directory(&backup) };
+                    #[cfg(not(test))]
+                    let sync = sync_backup_directory(&backup);
+                    if let Err(e) = sync {
+                        return Err(transaction.fail(e, None, None, false));
+                    }
                 }
                 Err(e) => return Err(transaction.fail(e, None, None, false)),
             }
@@ -468,26 +497,36 @@ impl OutputPlan {
     }
 }
 
-/// Detect same-batch destination conflicts, including destinations that are
-/// selected sources or hard links to sources or other destinations.
-pub fn validate_batch<P: std::borrow::Borrow<OutputPlan>>(plans: &[P]) -> Result<(), WorkflowError> {
+/// Detect destination conflicts, including selected sources whose own
+/// preflight failed. `selected` must contain the complete discovered batch.
+pub fn validate_batch<P: std::borrow::Borrow<OutputPlan>>(plans: &[P], selected: &[DiscoveredFile]) -> Result<(), WorkflowError> {
+    validate_batch_with_policy(plans, selected, &destination_name_policy)
+}
+fn validate_batch_with_policy<P: std::borrow::Borrow<OutputPlan>>(
+    plans: &[P], selected: &[DiscoveredFile], policy: &impl Fn(&Path) -> Result<NamePolicy, WorkflowError>,
+) -> Result<(), WorkflowError> {
     let mut destinations = Vec::<(&Path, &Path, DestinationParent)>::new();
     let sources: BTreeSet<&Path> = plans.iter().map(|plan| {
         let plan: &OutputPlan = plan.borrow();
         plan.source.as_path()
-    }).collect();
+    }).chain(selected.iter().map(|file| file.path.as_path())).collect();
+    let sources = sources.into_iter().map(|source| Ok((source, destination_parent(source)?)))
+        .collect::<Result<Vec<_>, WorkflowError>>()?;
     for plan in plans {
         let plan: &OutputPlan = plan.borrow();
         let parent = destination_parent(&plan.destination)?;
         for (other_destination, other_source, other_parent) in &destinations {
-            if same_destination(&plan.destination, &parent, other_destination, other_parent)? {
+            if same_destination_using(&plan.destination, &parent, other_destination, other_parent, policy)? {
                 return Err(WorkflowError::DestinationConflict { destination: plan.destination.clone(), other_source: (*other_source).to_owned() });
             }
         }
-        destinations.push((&plan.destination, &plan.source, parent));
-        if plan.destination != plan.source && sources.contains(plan.destination.as_path()) {
-            return Err(WorkflowError::DestinationConflict { destination: plan.destination.clone(), other_source: plan.destination.clone() });
+        for (source, source_parent) in &sources {
+            if plan.is_replacement() && plan.destination == plan.source && *source == plan.source.as_path() { continue; }
+            if same_destination_using(&plan.destination, &parent, source, source_parent, policy)? {
+                return Err(WorkflowError::DestinationConflict { destination: plan.destination.clone(), other_source: (*source).to_owned() });
+            }
         }
+        destinations.push((&plan.destination, &plan.source, parent));
         if let Some(guard) = &plan.overwrite { check_overwrite_destination(&plan.destination, guard)?; }
     }
     Ok(())
@@ -520,17 +559,48 @@ fn check_destination(source: &Path, dest: &Path, replacement: bool) -> Result<bo
     }
 }
 
-#[link(name = "System")]
-unsafe extern "C" { fn pathconf(path: *const c_char, name: c_int) -> c_long; }
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFStringCreateWithBytes(allocator: *const c_void, bytes: *const u8, length: isize, encoding: u32, external: u8) -> *const c_void;
+    fn CFStringCreateMutableCopy(allocator: *const c_void, max_length: isize, source: *const c_void) -> *mut c_void;
+    fn CFStringNormalize(string: *mut c_void, form: isize);
+    fn CFStringFold(string: *mut c_void, flags: usize, locale: *const c_void);
     fn CFStringCompare(left: *const c_void, right: *const c_void, flags: usize) -> isize;
     fn CFRelease(value: *const c_void);
 }
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn CreateTextEncoding(base: u32, variant: u32, format: u32) -> u32;
+    fn TECCreateConverter(converter: *mut *mut c_void, input: u32, output: u32) -> i32;
+    fn TECConvertText(converter: *mut c_void, input: *const u8, length: usize, consumed: *mut usize,
+        output: *mut u8, capacity: usize, written: *mut usize) -> i32;
+    fn TECFlushText(converter: *mut c_void, output: *mut u8, capacity: usize, written: *mut usize) -> i32;
+    fn TECDisposeConverter(converter: *mut c_void) -> i32;
+    fn UCCompareTextNoLocale(options: u32, left: *const u16, left_len: usize, right: *const u16, right_len: usize,
+        equivalent: *mut u8, order: *mut i32) -> i32;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameNormalization { Apfs, HfsPlus, Bytes }
+#[derive(Debug, Clone, Copy)]
+struct NamePolicy { normalization: NameNormalization, case_sensitive: bool }
+
+fn policy_for_fs_type(fs_type: &[u8], case_sensitive: bool) -> NamePolicy {
+    let normalization = match fs_type {
+        b"apfs" => NameNormalization::Apfs,
+        b"hfs" | b"hfsx" => NameNormalization::HfsPlus,
+        _ => NameNormalization::Bytes,
+    };
+    NamePolicy { normalization, case_sensitive }
+}
+#[cfg(any(target_os = "macos", test))]
+fn pathconf_case_sensitive(result: libc::c_long) -> bool { result > 0 }
+
 #[derive(Debug)]
-struct DestinationParent { dev: u64, ino: u64, missing: Vec<OsString>, case_sensitive: bool }
+struct DestinationParent { dev: u64, ino: u64, missing: Vec<OsString>, ancestor: PathBuf }
 
 fn destination_parent(destination: &Path) -> Result<DestinationParent, WorkflowError> {
     let mut ancestor = destination.parent().ok_or_else(|| invalid(destination, "destination has no parent"))?;
@@ -547,47 +617,162 @@ fn destination_parent(destination: &Path) -> Result<DestinationParent, WorkflowE
         }
     };
     missing.reverse();
-    let path = CString::new(ancestor.as_os_str().as_bytes()).map_err(|_| invalid(ancestor, "path contains NUL"))?;
-    // _PC_CASE_SENSITIVE (11) is from the Darwin SDK; the path is a live C string.
-    let result = unsafe { pathconf(path.as_ptr(), 11) };
-    if result < 0 { return Err(io_error("inspect destination volume case sensitivity", ancestor, io::Error::last_os_error())); }
-    Ok(DestinationParent { dev: metadata.dev(), ino: metadata.ino(), missing, case_sensitive: result != 0 })
+    Ok(DestinationParent { dev: metadata.dev(), ino: metadata.ino(), missing, ancestor: ancestor.to_owned() })
 }
 
+#[cfg(target_os = "macos")]
+fn destination_name_policy(ancestor: &Path) -> Result<NamePolicy, WorkflowError> {
+    let path = CString::new(ancestor.as_os_str().as_bytes()).map_err(|_| invalid(ancestor, "path contains NUL"))?;
+    let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let mut fs_type = [0u8; 16];
+    // An unknown or unsupported filesystem uses byte comparison.
+    if unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) } == 0 {
+        let info = unsafe { info.assume_init() };
+        for (out, value) in fs_type.iter_mut().zip(info.f_fstypename) { *out = value as u8; }
+    }
+    let end = fs_type.iter().position(|&byte| byte == 0).unwrap_or(fs_type.len());
+    // Negative means indeterminate or unsupported, not case-sensitive.
+    let sensitivity = unsafe { libc::pathconf(path.as_ptr(), 11) };
+    Ok(policy_for_fs_type(&fs_type[..end], pathconf_case_sensitive(sensitivity)))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_case_sensitive(flags: Option<libc::c_long>) -> bool {
+    const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
+    flags.is_some_and(|flags| flags & FS_CASEFOLD_FL == 0)
+}
+#[cfg(target_os = "linux")]
+fn destination_name_policy(ancestor: &Path) -> Result<NamePolicy, WorkflowError> {
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
+    let case_sensitive = match File::open(ancestor) {
+        Ok(directory) => {
+            let mut flags: libc::c_long = 0;
+            let status = unsafe { libc::ioctl(directory.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) };
+            linux_case_sensitive((status == 0).then_some(flags))
+        }
+        Err(_) => linux_case_sensitive(None),
+    };
+    Ok(NamePolicy { normalization: NameNormalization::Bytes, case_sensitive })
+}
+
+#[cfg(test)]
 fn same_destination(left: &Path, left_parent: &DestinationParent, right: &Path, right_parent: &DestinationParent) -> Result<bool, WorkflowError> {
+    same_destination_using(left, left_parent, right, right_parent, &destination_name_policy)
+}
+fn same_destination_using(left: &Path, left_parent: &DestinationParent, right: &Path, right_parent: &DestinationParent,
+    resolve: &impl Fn(&Path) -> Result<NamePolicy, WorkflowError>) -> Result<bool, WorkflowError> {
     if (left_parent.dev, left_parent.ino) != (right_parent.dev, right_parent.ino)
         || left_parent.missing.len() != right_parent.missing.len() { return Ok(false); }
     let left_name = left.file_name().ok_or_else(|| invalid(left, "destination has no filename"))?;
     let right_name = right.file_name().ok_or_else(|| invalid(right, "destination has no filename"))?;
-    let sensitive = left_parent.case_sensitive && right_parent.case_sensitive;
+    if left_name == right_name && left_parent.missing == right_parent.missing { return Ok(true); }
+    let policy = resolve(&left_parent.ancestor)?;
+    same_destination_with_policy(left_name, left_parent, right_name, right_parent, policy)
+}
+
+fn same_destination_with_policy(left_name: &OsStr, left_parent: &DestinationParent, right_name: &OsStr,
+    right_parent: &DestinationParent, policy: NamePolicy) -> Result<bool, WorkflowError> {
+    if (left_parent.dev, left_parent.ino) != (right_parent.dev, right_parent.ino)
+        || left_parent.missing.len() != right_parent.missing.len() { return Ok(false); }
     for (a, b) in left_parent.missing.iter().map(OsString::as_os_str).chain(std::iter::once(left_name))
         .zip(right_parent.missing.iter().map(OsString::as_os_str).chain(std::iter::once(right_name))) {
-        if sensitive {
-            if a != b { return Ok(false); }
-        } else if !casefold_paths_equal(Path::new(a), Path::new(b))? { return Ok(false); }
+        if !names_equal(a, b, policy)? { return Ok(false); }
     }
     Ok(true)
 }
 
-fn casefold_paths_equal(left: &Path, right: &Path) -> Result<bool, WorkflowError> {
-    fn make_string(path: &Path) -> Result<*const c_void, WorkflowError> {
-        let bytes = path.as_os_str().as_bytes();
-        let length = isize::try_from(bytes.len()).map_err(|_| invalid(path, "path is too long to compare"))?;
-        // CoreFoundation accepts UTF-8 paths and handles canonical equivalence.
-        let value = unsafe { CFStringCreateWithBytes(std::ptr::null(), bytes.as_ptr(), length, 0x08000100, 0) };
-        if value.is_null() { Err(invalid(path, "path cannot be compared on a case-insensitive volume")) }
-        else { Ok(value) }
+fn names_equal(left: &OsStr, right: &OsStr, policy: NamePolicy) -> Result<bool, WorkflowError> {
+    if left == right { return Ok(true); }
+    let a = left.as_bytes(); let b = right.as_bytes();
+    if a.is_ascii() && b.is_ascii() { return Ok(!policy.case_sensitive && a.eq_ignore_ascii_case(b)); }
+    let (Ok(a_text), Ok(b_text)) = (std::str::from_utf8(a), std::str::from_utf8(b)) else {
+        return Ok(!policy.case_sensitive && a.eq_ignore_ascii_case(b));
+    };
+    match policy.normalization {
+        NameNormalization::Bytes => {
+            if policy.case_sensitive { return Ok(false); }
+            #[cfg(target_os = "macos")]
+            { let _ = (a_text, b_text); cf_names_equal(a, b, false, false) }
+            #[cfg(target_os = "linux")]
+            { Ok(a_text.chars().flat_map(char::to_lowercase).eq(b_text.chars().flat_map(char::to_lowercase))) }
+        }
+        #[cfg(target_os = "macos")]
+        NameNormalization::Apfs => cf_names_equal(a, b, policy.case_sensitive, true),
+        #[cfg(target_os = "macos")]
+        NameNormalization::HfsPlus => hfs_names_equal(a, b, policy.case_sensitive),
+        #[cfg(not(target_os = "macos"))]
+        NameNormalization::Apfs | NameNormalization::HfsPlus => Err(invalid(Path::new(left), "macOS filename policy is unavailable")),
     }
-    let a = make_string(left)?;
-    let b = match make_string(right) {
+}
+
+#[cfg(target_os = "macos")]
+fn cf_names_equal(left: &[u8], right: &[u8], case_sensitive: bool, normalize: bool) -> Result<bool, WorkflowError> {
+    fn make_string(bytes: &[u8], case_sensitive: bool, normalize: bool) -> Result<*mut c_void, WorkflowError> {
+        let length = isize::try_from(bytes.len()).map_err(|_| invalid(Path::new(""), "name is too long to compare"))?;
+        let original = unsafe { CFStringCreateWithBytes(std::ptr::null(), bytes.as_ptr(), length, 0x08000100, 0) };
+        if original.is_null() { return Err(invalid(Path::new(""), "cannot create Unicode name")); }
+        let value = unsafe { CFStringCreateMutableCopy(std::ptr::null(), 0, original) };
+        unsafe { CFRelease(original); }
+        if value.is_null() { return Err(invalid(Path::new(""), "cannot allocate normalized name")); }
+        unsafe {
+            if normalize { CFStringNormalize(value, 0); }
+            if !case_sensitive {
+                CFStringFold(value, 1, std::ptr::null());
+                if normalize { CFStringNormalize(value, 0); }
+            }
+        }
+        Ok(value)
+    }
+    let a = make_string(left, case_sensitive, normalize)?;
+    let b = match make_string(right, case_sensitive, normalize) {
         Ok(value) => value,
         Err(error) => { unsafe { CFRelease(a) }; return Err(error); }
     };
-    // Both strings are retained CF objects; flags 1 | 16 request
-    // case-insensitive, canonical nonliteral comparison.
-    let equal = unsafe { CFStringCompare(a, b, 1 | 16) == 0 };
+    let equal = unsafe { CFStringCompare(a, b, 0) == 0 };
     unsafe { CFRelease(a); CFRelease(b); }
     Ok(equal)
+}
+
+#[cfg(target_os = "macos")]
+fn hfs_decompose(name: &[u8]) -> Result<Vec<u8>, WorkflowError> {
+    // The HFS+ TEC mapping is fixed to Unicode 3.2 and preserves its excluded ranges.
+    let capacity = name.len().checked_mul(8).and_then(|size| size.checked_add(32))
+        .ok_or_else(|| invalid(Path::new(""), "HFS name is too long"))?;
+    let input = unsafe { CreateTextEncoding(0x0106, 0, 2) };
+    let output = unsafe { CreateTextEncoding(0x0106, 8, 2) };
+    let mut converter = std::ptr::null_mut();
+    let status = unsafe { TECCreateConverter(&mut converter, input, output) };
+    if status != 0 || converter.is_null() {
+        if !converter.is_null() { unsafe { TECDisposeConverter(converter) }; }
+        return Err(invalid(Path::new(""), "cannot create HFS name converter"));
+    }
+    let mut result = vec![0u8; capacity]; let mut consumed = 0; let mut written = 0;
+    let status = unsafe { TECConvertText(converter, name.as_ptr(), name.len(), &mut consumed, result.as_mut_ptr(), result.len(), &mut written) };
+    let mut flushed = 0;
+    let flush = if status == 0 && consumed == name.len() && written <= result.len() {
+        unsafe { TECFlushText(converter, result.as_mut_ptr().add(written), result.len() - written, &mut flushed) }
+    } else { -1 };
+    let dispose = unsafe { TECDisposeConverter(converter) };
+    if status != 0 || flush != 0 || dispose != 0 || consumed != name.len()
+        || written > result.len() || flushed > result.len() - written {
+        return Err(invalid(Path::new(""), "cannot normalize HFS filename"));
+    }
+    result.truncate(written + flushed);
+    Ok(result)
+}
+
+#[cfg(target_os = "macos")]
+fn hfs_names_equal(left: &[u8], right: &[u8], case_sensitive: bool) -> Result<bool, WorkflowError> {
+    let left = hfs_decompose(left)?; let right = hfs_decompose(right)?;
+    if case_sensitive { return Ok(left == right); }
+    let left = std::str::from_utf8(&left).map_err(|_| invalid(Path::new(""), "invalid HFS conversion"))?;
+    let right = std::str::from_utf8(&right).map_err(|_| invalid(Path::new(""), "invalid HFS conversion"))?;
+    let left: Vec<u16> = left.encode_utf16().collect(); let right: Vec<u16> = right.encode_utf16().collect();
+    let mut equivalent = 0u8; let mut order = 0i32;
+    // kUCCollateTypeHFSExtended and kUCCollateCaseInsensitiveMask.
+    let status = unsafe { UCCompareTextNoLocale((1 << 24) | 8, left.as_ptr(), left.len(), right.as_ptr(), right.len(), &mut equivalent, &mut order) };
+    if status != 0 { return Err(invalid(Path::new(""), "cannot compare HFS filenames")); }
+    Ok(equivalent != 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,22 +785,54 @@ fn stamp(path: &Path, operation: &'static str) -> Result<Stamp, WorkflowError> {
     if !meta.file_type().is_file() { return Err(invalid(path, "not a regular non-symlink file")); }
     Ok(metadata_stamp(&meta))
 }
+fn owner_metadata(file: &File, path: &Path) -> Result<fs::Metadata, WorkflowError> {
+    let mut meta = file.metadata().map_err(|e| io_error("inspect private ownership", path, e))?;
+    for _ in 0..2 {
+        if meta.uid() == unsafe { libc::geteuid() } { return Ok(meta); }
+        let next = file.metadata().map_err(|e| io_error("reinspect private ownership", path, e))?;
+        if metadata_stamp(&next) != metadata_stamp(&meta) || next.mode() != meta.mode() || next.nlink() != meta.nlink() {
+            return Err(WorkflowError::SourceChanged(path.to_owned()));
+        }
+        meta = next;
+    }
+    if meta.uid() == unsafe { libc::geteuid() } { Ok(meta) }
+    else { Err(invalid(path, "private ownership could not be established")) }
+}
+fn access_metadata(file: &File, path: &Path) -> Result<fs::Metadata, WorkflowError> {
+    let mut previous = file.metadata().map_err(|e| io_error("inspect access metadata", path, e))?;
+    for _ in 0..3 {
+        let next = file.metadata().map_err(|e| io_error("reinspect access metadata", path, e))?;
+        if metadata_stamp(&next) != metadata_stamp(&previous) || next.mode() != previous.mode() || next.nlink() != previous.nlink() {
+            return Err(WorkflowError::SourceChanged(path.to_owned()));
+        }
+        if (next.uid(), next.gid()) == (previous.uid(), previous.gid()) { return Ok(next); }
+        previous = next;
+    }
+    Err(invalid(path, "filesystem could not consistently establish file ownership"))
+}
 
 /// Identity captured before reading source metadata or a restoration marker.
 /// Verify it before committing decisions made from that inspection.
 #[derive(Debug, Clone)]
-pub struct FileIdentity { path: PathBuf, stamp: Stamp }
+pub struct FileIdentity { path: PathBuf, stamp: Stamp, file: Arc<File> }
 
 impl FileIdentity {
     pub fn capture(path: &Path) -> Result<Self, WorkflowError> {
-        let stamp = stamp(path, "inspect file before marker read")?;
+        let file = open_identity(path)?;
+        let opened = file.metadata().map_err(|e| io_error("inspect pinned source", path, e))?;
+        let stamp = metadata_stamp(&opened);
+        if stamp != self::stamp(path, "inspect file before marker read")? {
+            return Err(WorkflowError::SourceChanged(path.to_owned()));
+        }
         let path = fs::canonicalize(path).map_err(|e| io_error("resolve marker inspection file", path, e))?;
-        Ok(Self { path, stamp })
+        Ok(Self { path, stamp, file: Arc::new(file) })
     }
 
     pub fn verify(&self, path: &Path) -> Result<(), WorkflowError> {
         let current = fs::canonicalize(path).map_err(|e| io_error("resolve inspected file", path, e))?;
         if current != self.path { return Err(WorkflowError::SourceChanged(path.to_owned())); }
+        let opened = self.file.metadata().map_err(|e| io_error("inspect pinned source", path, e))?;
+        if metadata_stamp(&opened) != self.stamp { return Err(WorkflowError::SourceChanged(path.to_owned())); }
         check_stamp(path, self.stamp)
     }
 }
@@ -717,7 +934,7 @@ impl RestoreBatchSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestinationSnapshot { Missing, Regular(Stamp), NonRegular }
 #[derive(Debug)]
-struct GuardedDestination { path: PathBuf, snapshot: DestinationSnapshot }
+struct GuardedDestination { path: PathBuf, snapshot: DestinationSnapshot, _pin: Option<File> }
 
 /// Immutable batch-wide protection and destination snapshots for overwrites.
 #[derive(Debug)]
@@ -725,9 +942,16 @@ pub struct OverwriteGuard { sources: Vec<FileIdentity>, destinations: Vec<Guarde
 impl OverwriteGuard {
     pub fn new(inputs: &[DiscoveredFile], destinations: &[PathBuf]) -> Result<Self, WorkflowError> {
         let sources = inputs.iter().map(|input| FileIdentity::capture(&input.path)).collect::<Result<Vec<_>, _>>()?;
-        let destinations = destinations.iter().map(|path| Ok(GuardedDestination {
-            path: path.clone(), snapshot: destination_snapshot(path)?,
-        })).collect::<Result<Vec<_>, WorkflowError>>()?;
+        let destinations = destinations.iter().map(|path| {
+            let snapshot = destination_snapshot(path)?;
+            let pin = if let DestinationSnapshot::Regular(expected) = snapshot {
+                let file = open_identity(path)?;
+                let meta = file.metadata().map_err(|e| io_error("inspect pinned overwrite destination", path, e))?;
+                if metadata_stamp(&meta) != expected { return Err(WorkflowError::DestinationChanged(path.clone())); }
+                Some(file)
+            } else { None };
+            Ok(GuardedDestination { path: path.clone(), snapshot, _pin: pin })
+        }).collect::<Result<Vec<_>, WorkflowError>>()?;
         Ok(Self { sources, destinations })
     }
 }
@@ -786,49 +1010,100 @@ fn check_stamp(path: &Path, expected: Stamp) -> Result<(), WorkflowError> {
 }
 // Values and signatures in this section are from the macOS SDK's copyfile.h,
 // sys/xattr.h, sys/acl.h, sys/attr.h, sys/fcntl.h and unistd.h.
-const O_NOFOLLOW: c_int = 0x00000100;
+const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+#[cfg(target_os = "macos")]
 const COPYFILE_METADATA: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+#[cfg(target_os = "macos")]
 const XATTR_SHOWCOMPRESSION: c_int = 0x0020;
+#[cfg(target_os = "macos")]
 const ACL_TYPE_EXTENDED: c_int = 0x00000100;
+#[cfg(target_os = "macos")]
 const ATTR_CMN_CRTIME: u32 = 0x00000200;
+#[cfg(target_os = "macos")]
 const ATTR_CMN_FLAGS: u32 = 0x00040000;
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct AttrList {
     bitmapcount: u16, reserved: u16, commonattr: u32,
     volattr: u32, dirattr: u32, fileattr: u32, forkattr: u32,
 }
+#[cfg(target_os = "macos")]
 impl AttrList {
     fn common(commonattr: u32) -> Self {
         Self { bitmapcount: 5, reserved: 0, commonattr, volattr: 0, dirattr: 0, fileattr: 0, forkattr: 0 }
     }
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "System")]
 unsafe extern "C" {
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn fcopyfile(from: c_int, to: c_int, state: *mut c_void, flags: u32) -> c_int;
     fn flistxattr(fd: c_int, names: *mut c_char, size: usize, options: c_int) -> isize;
     fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize, position: u32, options: c_int) -> isize;
+    fn fsetxattr(fd: c_int, name: *const c_char, value: *const c_void, size: usize, position: u32, options: c_int) -> c_int;
+    fn fremovexattr(fd: c_int, name: *const c_char, options: c_int) -> c_int;
     fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
     fn acl_size(acl: *mut c_void) -> isize;
     fn acl_copy_ext(buffer: *mut c_void, acl: *mut c_void, size: isize) -> isize;
     fn acl_free(object: *mut c_void) -> c_int;
     fn fgetattrlist(fd: c_int, attributes: *mut AttrList, buffer: *mut c_void, size: usize, options: c_uint) -> c_int;
     fn fsetattrlist(fd: c_int, attributes: *mut AttrList, buffer: *const c_void, size: usize, options: c_uint) -> c_int;
+    #[cfg(not(feature = "portable"))]
     fn CC_SHA256_Init(context: *mut Sha256Context) -> c_int;
+    #[cfg(not(feature = "portable"))]
     fn CC_SHA256_Update(context: *mut Sha256Context, data: *const c_void, length: u32) -> c_int;
+    #[cfg(not(feature = "portable"))]
     fn CC_SHA256_Final(digest: *mut u8, context: *mut Sha256Context) -> c_int;
 }
+/// Darwin ACLs can grant access independently of the mode bits. A private
+/// workspace/state object must not inherit an ACL we cannot prove safe.
+#[cfg(target_os = "macos")]
+pub(crate) fn require_no_extended_acl(file: &File, path: &Path) -> Result<(), WorkflowError> {
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(io_error("inspect private ACL", path, error)) };
+    }
+    unsafe { acl_free(acl); }
+    Err(invalid(path, "extended ACL is not allowed on a private workspace or state file"))
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn require_no_extended_acl(_file: &File, _path: &Path) -> Result<(), WorkflowError> { Ok(()) }
 
 fn open_read(path: &Path) -> Result<File, WorkflowError> {
     OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path)
         .map_err(|e| io_error("open file without following symlinks", path, e))
 }
+fn open_identity(path: &Path) -> Result<File, WorkflowError> {
+    let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid(path, "path contains NUL"))?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_EVTONLY | O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let fd = unsafe { libc::open(path_c.as_ptr(), flags) };
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let fd = unsafe { libc::open(path_c.as_ptr(), flags) };
+        if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied {
+            // O_EVTONLY may still require read access. An existing output that
+            // is writable but unreadable can be pinned without truncation.
+            unsafe { libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | O_NOFOLLOW | libc::O_CLOEXEC) }
+        } else { fd }
+    };
+    if fd < 0 { return Err(io_error("pin file identity", path, io::Error::last_os_error())); }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata().map_err(|e| io_error("inspect pinned file identity", path, e))?;
+    if !meta.file_type().is_file() { return Err(invalid(path, "not a regular non-symlink file")); }
+    Ok(file)
+}
 
 // getattrlist prefixes each returned, four-byte-packed attribute with a u32
 // total size. A Darwin 64-bit timespec has two 64-bit fields.
-fn creation_time(file: &File, path: &Path) -> Result<[u8; 16], WorkflowError> {
+#[cfg(target_os = "macos")]
+fn creation_time(file: &File, path: &Path) -> Result<Option<[u8; 16]>, WorkflowError> {
     let mut attrs = AttrList::common(ATTR_CMN_CRTIME);
     let mut buffer = [0u8; 20];
     // SAFETY: the descriptor is live and the SDK-defined attribute buffer has
@@ -839,11 +1114,30 @@ fn creation_time(file: &File, path: &Path) -> Result<[u8; 16], WorkflowError> {
     if u32::from_ne_bytes(buffer[..4].try_into().unwrap()) != buffer.len() as u32 {
         return Err(invalid(path, "unexpected creation-time attribute length"));
     }
-    Ok(buffer[4..].try_into().unwrap())
+    Ok(Some(buffer[4..].try_into().unwrap()))
 }
 
+#[cfg(target_os = "linux")]
+fn creation_time(file: &File, path: &Path) -> Result<Option<[u8; 16]>, WorkflowError> {
+    let mut value = std::mem::MaybeUninit::<libc::statx>::uninit();
+    let status = unsafe { libc::statx(file.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        libc::STATX_BTIME, value.as_mut_ptr()) };
+    if status != 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)) { return Ok(None); }
+        return Err(io_error("read file creation time", path, error));
+    }
+    let value = unsafe { value.assume_init() };
+    if value.stx_mask & libc::STATX_BTIME == 0 { return Ok(None); }
+    let mut time = [0u8; 16];
+    time[..8].copy_from_slice(&value.stx_btime.tv_sec.to_ne_bytes());
+    time[8..].copy_from_slice(&i64::from(value.stx_btime.tv_nsec).to_ne_bytes());
+    Ok(Some(time))
+}
+
+#[cfg(target_os = "macos")]
 fn copy_creation_time(source: &File, dest: &File, source_path: &Path, dest_path: &Path) -> Result<(), WorkflowError> {
-    let time = creation_time(source, source_path)?;
+    let time = creation_time(source, source_path)?.ok_or_else(|| invalid(source_path, "creation time is unavailable"))?;
     let mut attrs = AttrList::common(ATTR_CMN_CRTIME);
     // SAFETY: `time` contains exactly the timespec returned by fgetattrlist.
     if unsafe { fsetattrlist(dest.as_raw_fd(), &mut attrs, time.as_ptr().cast(), time.len(), 0) } != 0 {
@@ -852,7 +1146,8 @@ fn copy_creation_time(source: &File, dest: &File, source_path: &Path, dest_path:
     Ok(())
 }
 
-fn file_flags(file: &File, path: &Path) -> Result<u32, WorkflowError> {
+#[cfg(target_os = "macos")]
+fn file_flags(file: &File, path: &Path) -> Result<Option<u32>, WorkflowError> {
     let mut attrs = AttrList::common(ATTR_CMN_FLAGS);
     let mut buffer = [0u32; 2];
     // SAFETY: the descriptor and fixed-size length/flags buffer are valid.
@@ -860,9 +1155,20 @@ fn file_flags(file: &File, path: &Path) -> Result<u32, WorkflowError> {
         return Err(io_error("read file flags", path, io::Error::last_os_error()));
     }
     if buffer[0] != std::mem::size_of_val(&buffer) as u32 { return Err(invalid(path, "unexpected file-flags attribute length")); }
-    Ok(buffer[1])
+    Ok(Some(buffer[1]))
 }
 
+#[cfg(target_os = "linux")]
+fn file_flags(file: &File, path: &Path) -> Result<Option<u32>, WorkflowError> {
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
+    let mut flags: libc::c_long = 0;
+    if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } == 0 { return Ok(Some(flags as u32)); }
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)) { Ok(None) }
+    else { Err(io_error("read file flags", path, error)) }
+}
+
+#[cfg(target_os = "macos")]
 fn acl_bytes(file: &File, path: &Path) -> Result<Option<Vec<u8>>, WorkflowError> {
     // SAFETY: the descriptor is live; the returned ACL is released below.
     let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
@@ -890,18 +1196,64 @@ fn acl_bytes(file: &File, path: &Path) -> Result<Option<Vec<u8>>, WorkflowError>
     result
 }
 
+#[cfg(target_os = "linux")]
+fn acl_bytes(_file: &File, _path: &Path) -> Result<Option<Vec<u8>>, WorkflowError> {
+    // Linux POSIX ACLs are represented and compared as system.posix_acl_* xattrs.
+    Ok(None)
+}
+
+fn comparable_xattr(name: &[u8]) -> bool {
+    // macOS assigns provenance to the creating/writing process; copyfile
+    // cannot reproduce another process's value, even when fsetxattr succeeds.
+    !cfg!(target_os = "macos") || name != b"com.apple.provenance"
+}
+
+fn list_xattrs(file: &File, buffer: *mut c_char, size: usize) -> isize {
+    #[cfg(target_os = "macos")]
+    { unsafe { flistxattr(file.as_raw_fd(), buffer, size, XATTR_SHOWCOMPRESSION) } }
+    #[cfg(target_os = "linux")]
+    { unsafe { libc::flistxattr(file.as_raw_fd(), buffer, size) } }
+}
+fn get_xattr(file: &File, name: &CString, buffer: *mut c_void, size: usize, offset: u32) -> isize {
+    #[cfg(target_os = "macos")]
+    { unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), buffer, size, offset, XATTR_SHOWCOMPRESSION) } }
+    #[cfg(target_os = "linux")]
+    {
+        if offset != 0 { return -1; }
+        unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), buffer, size) }
+    }
+}
+fn set_xattr(file: &File, path: &Path, name: &CString, value: &[u8], offset: u32) -> Result<(), WorkflowError> {
+    #[cfg(target_os = "macos")]
+    let status = unsafe { fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), offset, 0) };
+    #[cfg(target_os = "linux")]
+    let status = {
+        if offset != 0 { return Err(invalid(path, "Linux extended attributes do not support offsets")); }
+        unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) }
+    };
+    if status == 0 { Ok(()) } else { Err(io_error("restore copied extended attribute", path, io::Error::last_os_error())) }
+}
+fn remove_xattr(file: &File, path: &Path, name: &CString) -> Result<(), WorkflowError> {
+    #[cfg(target_os = "macos")]
+    let status = unsafe { fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) };
+    #[cfg(target_os = "linux")]
+    let status = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
+    if status == 0 { Ok(()) } else { Err(io_error("remove copied extended attribute", path, io::Error::last_os_error())) }
+}
+
 fn xattr_names(file: &File, path: &Path) -> Result<Vec<CString>, WorkflowError> {
     // SAFETY: a null buffer with zero length asks for the current list size.
-    let size = unsafe { flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, XATTR_SHOWCOMPRESSION) };
+    let size = list_xattrs(file, std::ptr::null_mut(), 0);
     if size < 0 { return Err(io_error("list extended attributes", path, io::Error::last_os_error())); }
     if size == 0 { return Ok(Vec::new()); }
     let mut buffer = vec![0u8; size as usize];
     // SAFETY: the buffer is writable for the advertised size.
-    let count = unsafe { flistxattr(file.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), XATTR_SHOWCOMPRESSION) };
+    let count = list_xattrs(file, buffer.as_mut_ptr().cast(), buffer.len());
     if count < 0 { return Err(io_error("list extended attributes", path, io::Error::last_os_error())); }
     buffer.truncate(count as usize);
     if buffer.last() != Some(&0) { return Err(invalid(path, "invalid extended-attribute name list")); }
     let mut names = buffer[..buffer.len() - 1].split(|b| *b == 0)
+        .filter(|name| comparable_xattr(name))
         .map(|name| CString::new(name).map_err(|_| invalid(path, "invalid extended-attribute name")))
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
@@ -910,40 +1262,80 @@ fn xattr_names(file: &File, path: &Path) -> Result<Vec<CString>, WorkflowError> 
 
 fn xattr_size(file: &File, path: &Path, name: &CString) -> Result<usize, WorkflowError> {
     // SAFETY: name is NUL-terminated; a null buffer requests the attribute size.
-    let size = unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0, 0, XATTR_SHOWCOMPRESSION) };
+    let size = get_xattr(file, name, std::ptr::null_mut(), 0, 0);
     if size < 0 { Err(io_error("size extended attribute", path, io::Error::last_os_error())) } else { Ok(size as usize) }
 }
 
 fn read_xattr(file: &File, path: &Path, name: &CString, buffer: &mut [u8], offset: u32) -> Result<(), WorkflowError> {
     // SAFETY: name and the writable buffer remain live for the call.
-    let count = unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len(), offset, XATTR_SHOWCOMPRESSION) };
+    #[cfg(target_os = "linux")]
+    if offset != 0 { return Err(invalid(path, "Linux extended attributes do not support offsets")); }
+    let count = get_xattr(file, name, buffer.as_mut_ptr().cast(), buffer.len(), offset);
     if count < 0 { return Err(io_error("read extended attribute", path, io::Error::last_os_error())); }
     if count as usize != buffer.len() { return Err(invalid(path, "extended attribute changed during verification")); }
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct Sha256Context { count: [u32; 2], hash: [u32; 8], buffer: [u32; 16] }
 
+struct WorkflowDigest {
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
+    context: Sha256Context,
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    context: crate::portable::digest::Sha256,
+}
+impl WorkflowDigest {
+    fn new(path: &Path) -> Result<Self, WorkflowError> {
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
+        {
+            let mut context = Sha256Context { count: [0; 2], hash: [0; 8], buffer: [0; 16] };
+            if unsafe { CC_SHA256_Init(&mut context) } != 1 { return Err(invalid(path, "cannot initialize SHA-256")); }
+            Ok(Self { context })
+        }
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        { let _ = path; Ok(Self { context: crate::portable::digest::Sha256::new() }) }
+    }
+    fn update(&mut self, bytes: &[u8], path: &Path) -> Result<(), WorkflowError> {
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
+        {
+            let length = u32::try_from(bytes.len()).map_err(|_| invalid(path, "SHA-256 input is too large"))?;
+            if unsafe { CC_SHA256_Update(&mut self.context, bytes.as_ptr().cast(), length) } != 1 {
+                return Err(invalid(path, "cannot update SHA-256"));
+            }
+        }
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        { let _ = path; self.context.update(bytes); }
+        Ok(())
+    }
+    fn finish(mut self, path: &Path) -> Result<[u8; 32], WorkflowError> {
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
+        {
+            let mut digest = [0u8; 32];
+            if unsafe { CC_SHA256_Final(digest.as_mut_ptr(), &mut self.context) } != 1 {
+                return Err(invalid(path, "cannot finalize SHA-256"));
+            }
+            Ok(digest)
+        }
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        { let _ = path; Ok(self.context.finalize()) }
+    }
+}
+
 fn content_digest(file: &File, path: &Path) -> Result<[u8; 32], WorkflowError> {
     let before = file.metadata().map_err(|e| io_error("inspect file for digest", path, e))?;
-    let mut context = Sha256Context { count: [0; 2], hash: [0; 8], buffer: [0; 16] };
-    if unsafe { CC_SHA256_Init(&mut context) } != 1 { return Err(invalid(path, "cannot initialize content digest")); }
+    let mut context = WorkflowDigest::new(path)?;
     let mut buffer = [0u8; 65536];
     let mut offset = 0u64;
     while offset < before.len() {
         let wanted = (before.len() - offset).min(buffer.len() as u64) as usize;
         let count = file.read_at(&mut buffer[..wanted], offset).map_err(|e| io_error("read file for digest", path, e))?;
         if count == 0 { return Err(invalid(path, "file shortened during digest")); }
-        if unsafe { CC_SHA256_Update(&mut context, buffer.as_ptr().cast(), count as u32) } != 1 {
-            return Err(invalid(path, "cannot hash file contents"));
-        }
+        context.update(&buffer[..count], path)?;
         offset += count as u64;
     }
-    let mut digest = [0u8; 32];
-    if unsafe { CC_SHA256_Final(digest.as_mut_ptr(), &mut context) } != 1 {
-        return Err(invalid(path, "cannot finalize content digest"));
-    }
+    let digest = context.finish(path)?;
     let after = file.metadata().map_err(|e| io_error("reinspect file after digest", path, e))?;
     if metadata_stamp(&before) != metadata_stamp(&after) { return Err(WorkflowError::SourceChanged(path.to_owned())); }
     Ok(digest)
@@ -951,7 +1343,7 @@ fn content_digest(file: &File, path: &Path) -> Result<[u8; 32], WorkflowError> {
 
 #[derive(PartialEq, Eq)]
 struct OverwriteMetadata {
-    mode: u32, uid: u32, gid: u32, flags: u32, creation: [u8; 16],
+    mode: u32, uid: u32, gid: u32, flags: Option<u32>, creation: Option<[u8; 16]>,
     acl: Option<Vec<u8>>, xattrs: Vec<(CString, usize, [u8; 32])>,
 }
 
@@ -960,8 +1352,7 @@ fn overwrite_metadata(file: &File, path: &Path) -> Result<OverwriteMetadata, Wor
     let mut xattrs = Vec::new();
     for name in xattr_names(file, path)? {
         let size = xattr_size(file, path, &name)?;
-        let mut context = Sha256Context { count: [0; 2], hash: [0; 8], buffer: [0; 16] };
-        if unsafe { CC_SHA256_Init(&mut context) } != 1 { return Err(invalid(path, "cannot initialize metadata digest")); }
+        let mut context = WorkflowDigest::new(path)?;
         if name.as_bytes() == b"com.apple.ResourceFork" {
             if size > u32::MAX as usize { return Err(invalid(path, "resource fork is too large to verify")); }
             let mut buffer = [0u8; 65536];
@@ -969,23 +1360,16 @@ fn overwrite_metadata(file: &File, path: &Path) -> Result<OverwriteMetadata, Wor
             while offset < size {
                 let count = (size - offset).min(buffer.len());
                 read_xattr(file, path, &name, &mut buffer[..count], offset as u32)?;
-                if unsafe { CC_SHA256_Update(&mut context, buffer.as_ptr().cast(), count as u32) } != 1 {
-                    return Err(invalid(path, "cannot hash output metadata"));
-                }
+                context.update(&buffer[..count], path)?;
                 offset += count;
             }
         } else if size != 0 {
-            let length = u32::try_from(size).map_err(|_| invalid(path, "extended attribute is too large to verify"))?;
+            u32::try_from(size).map_err(|_| invalid(path, "extended attribute is too large to verify"))?;
             let mut buffer = vec![0u8; size];
             read_xattr(file, path, &name, &mut buffer, 0)?;
-            if unsafe { CC_SHA256_Update(&mut context, buffer.as_ptr().cast(), length) } != 1 {
-                return Err(invalid(path, "cannot hash output metadata"));
-            }
+            context.update(&buffer, path)?;
         }
-        let mut digest = [0u8; 32];
-        if unsafe { CC_SHA256_Final(digest.as_mut_ptr(), &mut context) } != 1 {
-            return Err(invalid(path, "cannot finalize output metadata digest"));
-        }
+        let digest = context.finish(path)?;
         xattrs.push((name, size, digest));
     }
     let result = OverwriteMetadata { mode: before.mode(), uid: before.uid(), gid: before.gid(),
@@ -995,33 +1379,82 @@ fn overwrite_metadata(file: &File, path: &Path) -> Result<OverwriteMetadata, Wor
     Ok(result)
 }
 
+fn xattr_values_equal(a: &File, b: &File, a_path: &Path, b_path: &Path, name: &CString) -> Result<bool, WorkflowError> {
+    let size = xattr_size(a, a_path, name)?;
+    if size != xattr_size(b, b_path, name)? { return Ok(false); }
+    if size == 0 { return Ok(true); }
+    if name.as_bytes() == b"com.apple.ResourceFork" {
+        if size > u32::MAX as usize { return Err(invalid(a_path, "resource fork is too large to verify")); }
+        let mut left = [0u8; 65536]; let mut right = [0u8; 65536];
+        let mut offset = 0usize;
+        while offset < size {
+            let count = (size - offset).min(left.len());
+            read_xattr(a, a_path, name, &mut left[..count], offset as u32)?;
+            read_xattr(b, b_path, name, &mut right[..count], offset as u32)?;
+            if left[..count] != right[..count] { return Ok(false); }
+            offset += count;
+        }
+    } else {
+        // Darwin only supports offset reads for resource forks.
+        let mut left = vec![0u8; size]; let mut right = vec![0u8; size];
+        read_xattr(a, a_path, name, &mut left, 0)?;
+        read_xattr(b, b_path, name, &mut right, 0)?;
+        if left != right { return Ok(false); }
+    }
+    Ok(true)
+}
+
 fn xattrs_equal(a: &File, b: &File, a_path: &Path, b_path: &Path) -> Result<bool, WorkflowError> {
     let names = xattr_names(a, a_path)?;
     if names != xattr_names(b, b_path)? { return Ok(false); }
     for name in names {
-        let size = xattr_size(a, a_path, &name)?;
-        if size != xattr_size(b, b_path, &name)? { return Ok(false); }
-        if size == 0 { continue; }
-        if name.as_bytes() == b"com.apple.ResourceFork" {
-            if size > u32::MAX as usize { return Err(invalid(a_path, "resource fork is too large to verify")); }
-            let mut left = [0u8; 65536]; let mut right = [0u8; 65536];
-            let mut offset = 0usize;
-            while offset < size {
-                let count = (size - offset).min(left.len());
-                read_xattr(a, a_path, &name, &mut left[..count], offset as u32)?;
-                read_xattr(b, b_path, &name, &mut right[..count], offset as u32)?;
-                if left[..count] != right[..count] { return Ok(false); }
-                offset += count;
-            }
-        } else {
-            // Darwin only supports offset reads for resource forks.
-            let mut left = vec![0u8; size]; let mut right = vec![0u8; size];
-            read_xattr(a, a_path, &name, &mut left, 0)?;
-            read_xattr(b, b_path, &name, &mut right, 0)?;
-            if left != right { return Ok(false); }
-        }
+        if !xattr_values_equal(a, b, a_path, b_path, &name)? { return Ok(false); }
     }
     Ok(true)
+}
+
+fn reconcile_copied_xattrs(source: &File, dest: &File, source_path: &Path, dest_path: &Path, final_mode: Option<u32>) -> Result<(), WorkflowError> {
+    let source_names = xattr_names(source, source_path)?;
+    let dest_names = xattr_names(dest, dest_path)?;
+    for name in &dest_names {
+        if source_names.binary_search(name).is_err() {
+            // The private destination is owned by this transaction.
+            remove_xattr(dest, dest_path, name)?;
+        }
+    }
+    for pass in 0..2 {
+      if pass == 1 {
+        if let Some(mode) = final_mode {
+            if unsafe { libc::fchmod(dest.as_raw_fd(), mode as libc::mode_t) } != 0 {
+                return Err(io_error("restore copied file mode", dest_path, io::Error::last_os_error()));
+            }
+        }
+      }
+      for name in &source_names {
+        let deferred_acl = cfg!(target_os = "linux") && name.as_bytes().starts_with(b"system.posix_acl_");
+        if deferred_acl != (pass == 1) { continue; }
+        let present = dest_names.binary_search(name).is_ok();
+        if present && xattr_values_equal(source, dest, source_path, dest_path, name)? { continue; }
+        let size = xattr_size(source, source_path, name)?;
+        if name.as_bytes() == b"com.apple.ResourceFork" {
+            if size > u32::MAX as usize { return Err(invalid(source_path, "resource fork is too large to copy")); }
+            if present { remove_xattr(dest, dest_path, name)?; }
+            let mut buffer = [0u8; 65536]; let mut offset = 0usize;
+            while offset < size {
+                let count = (size - offset).min(buffer.len());
+                read_xattr(source, source_path, name, &mut buffer[..count], offset as u32)?;
+                set_xattr(dest, dest_path, name, &buffer[..count], offset as u32)?;
+                offset += count;
+            }
+            if size == 0 { set_xattr(dest, dest_path, name, &[], 0)?; }
+        } else {
+            let mut value = vec![0u8; size];
+            if size != 0 { read_xattr(source, source_path, name, &mut value, 0)?; }
+            set_xattr(dest, dest_path, name, &value, 0)?;
+        }
+    }
+    }
+    Ok(())
 }
 
 fn metadata_equal(a: &File, b: &File, a_path: &Path, b_path: &Path, compare_access_time: bool) -> Result<bool, WorkflowError> {
@@ -1032,9 +1465,14 @@ fn metadata_equal(a: &File, b: &File, a_path: &Path, b_path: &Path, compare_acce
         || (compare_access_time && (left.atime() != right.atime() || left.atime_nsec() != right.atime_nsec())) {
         return Ok(false);
     }
-    Ok(creation_time(a, a_path)? == creation_time(b, b_path)?
-        && file_flags(a, a_path)? == file_flags(b, b_path)?
-        && acl_bytes(a, a_path)? == acl_bytes(b, b_path)?
+    #[cfg(target_os = "macos")]
+    let platform_metadata_equal = creation_time(a, a_path)? == creation_time(b, b_path)?
+        && file_flags(a, a_path)? == file_flags(b, b_path)?;
+    // Linux cannot set statx birth time; filesystem flags are not part of the
+    // POSIX copy contract. Both are still checked on the same inode for swaps.
+    #[cfg(target_os = "linux")]
+    let platform_metadata_equal = true;
+    Ok(platform_metadata_equal && acl_bytes(a, a_path)? == acl_bytes(b, b_path)?
         && xattrs_equal(a, b, a_path, b_path)?)
 }
 
@@ -1078,24 +1516,47 @@ fn verify_backup(original: &Path, backup: &Path, expected: Stamp) -> Result<(), 
     }
     Ok(())
 }
-fn copy_new_verified(source: &Path, dest: &Path, expected: Stamp) -> Result<(), WorkflowError> {
+fn copy_new_verified(source: &Path, dest: &Path, expected: Stamp, workspace: Option<&Workspace>) -> Result<(), WorkflowError> {
     check_stamp(source, expected)?;
     let mut input = open_read(source)?;
     let opened = input.metadata().map_err(|e| io_error("inspect open copy source", source, e))?;
     if opened.dev() != expected.dev || opened.ino() != expected.ino { return Err(WorkflowError::SourceChanged(source.to_owned())); }
-    let mut output = OpenOptions::new().write(true).read(true).create_new(true).mode(0o600).open(dest)
-        .map_err(|e| io_error("create private copy", dest, e))?;
+    let mut output = if let Some(workspace) = workspace {
+        workspace.create_stage()?
+    } else {
+        OpenOptions::new().write(true).read(true).create_new(true).mode(0o600).open(dest)
+            .map_err(|e| io_error("create private copy", dest, e))?
+    };
     io::copy(&mut input, &mut output).map_err(|e| io_error("copy file", dest, e))?;
     check_stamp(source, expected)?;
     // Metadata copying can affect compressed files' backing streams; compare
     // the final data fork after it has completed.
     // Creation time is not copied by COPYFILE_STAT. Set it before metadata
     // copying, which can restore immutable flags and make later writes fail.
-    copy_creation_time(&input, &output, source, dest)?;
-    // SAFETY: both descriptors refer to live, regular files; the private
-    // destination was created exclusively. COPYFILE_METADATA requests no data copy.
-    if unsafe { fcopyfile(input.as_raw_fd(), output.as_raw_fd(), std::ptr::null_mut(), COPYFILE_METADATA) } != 0 {
-        return Err(io_error("copy file metadata", dest, io::Error::last_os_error()));
+    #[cfg(target_os = "macos")]
+    {
+        copy_creation_time(&input, &output, source, dest)?;
+        if unsafe { fcopyfile(input.as_raw_fd(), output.as_raw_fd(), std::ptr::null_mut(), COPYFILE_METADATA) } != 0 {
+            return Err(io_error("copy file metadata", dest, io::Error::last_os_error()));
+        }
+        reconcile_copied_xattrs(&input, &output, source, dest, None)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = input.metadata().map_err(|e| io_error("inspect copy metadata", source, e))?;
+        let created = output.metadata().map_err(|e| io_error("inspect copied file", dest, e))?;
+        if (metadata.uid(), metadata.gid()) != (created.uid(), created.gid())
+            && unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+            return Err(io_error("restore copied ownership", dest, io::Error::last_os_error()));
+        }
+        reconcile_copied_xattrs(&input, &output, source, dest, Some(metadata.mode() & 0o7777))?;
+        let times = [
+            libc::timespec { tv_sec: metadata.atime() as libc::time_t, tv_nsec: metadata.atime_nsec() as libc::c_long },
+            libc::timespec { tv_sec: metadata.mtime() as libc::time_t, tv_nsec: metadata.mtime_nsec() as libc::c_long },
+        ];
+        if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(io_error("restore copied timestamps", dest, io::Error::last_os_error()));
+        }
     }
     output.sync_all().map_err(|e| io_error("sync copied file", dest, e))?;
     if !metadata_equal(&input, &output, source, dest, true)? {
@@ -1105,91 +1566,461 @@ fn copy_new_verified(source: &Path, dest: &Path, expected: Stamp) -> Result<(), 
     check_stamp(source, expected)
 }
 
+fn directory_fd_path(file: &File) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok();
+    #[cfg(target_os = "macos")]
+    let path = {
+        let mut buffer = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == 0 {
+            let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+            Some(PathBuf::from(OsStr::from_bytes(&buffer[..end])))
+        } else { None }
+    };
+    let held = file.metadata().ok()?;
+    path.filter(|path| fs::metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == (held.dev(), held.ino())))
+}
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
-struct Workspace { directory: PathBuf, staged: PathBuf }
+fn remove_pinned_directory(parent: &File, name: &CString, identity: (u64, u64)) -> io::Result<()> {
+    let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), named.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let named = unsafe { named.assume_init() };
+    if named.st_mode & libc::S_IFMT != libc::S_IFDIR || (named.st_dev as u64, named.st_ino as u64) != identity {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "workspace directory was replaced; retained"));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+pub(crate) struct Workspace {
+    directory: PathBuf,
+    alias: PathBuf,
+    staged: PathBuf,
+    parent: File,
+    name: CString,
+    file: File,
+    identity: (u64, u64),
+    stage_file: Mutex<Option<File>>,
+    #[cfg(test)]
+    sync_error: Mutex<Option<io::Error>>,
+}
 impl Workspace {
-    fn create(parent: &Path, ext: &str) -> Result<Self, WorkflowError> {
+    pub(crate) fn create(parent: &Path, ext: &str) -> Result<Self, WorkflowError> {
+        Self::create_impl(parent, ext, #[cfg(test)] false, #[cfg(test)] None)
+    }
+    fn create_impl(parent: &Path, ext: &str, #[cfg(test)] fail_alias: bool,
+        #[cfg(test)] mut after_create: Option<Box<dyn FnOnce(&Path)>>) -> Result<Self, WorkflowError> {
+        let parent_fd = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent).map_err(|e| io_error("open workspace parent", parent, e))?;
         for _ in 0..128 {
             let id = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
-            let dir = parent.join(format!(".pn-workflow-{}-{id:x}", std::process::id()));
-            match DirBuilder::new().mode(0o700).create(&dir) {
-                Ok(()) => return Ok(Self { staged: dir.join(format!("output.{ext}")), directory: dir }),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(io_error("create private workspace", &dir, e)),
+            let name = CString::new(format!(".pn-workflow-{}-{id:x}", std::process::id())).unwrap();
+            let dir = parent.join(OsStr::from_bytes(name.as_bytes()));
+            if unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::AlreadyExists { continue; }
+                return Err(io_error("create private workspace", &dir, e));
             }
+            let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstatat(parent_fd.as_raw_fd(), name.as_ptr(), named.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                let cause = io_error("inspect created workspace", &dir, io::Error::last_os_error());
+                let cleanup = CleanupFailure { operation: "remove unpinned workspace", path: dir,
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "workspace identity unavailable; directory retained") };
+                return Err(transaction_error(cause, None, None, None, vec![cleanup], false));
+            }
+            let named = unsafe { named.assume_init() };
+            let created_identity = (named.st_dev as u64, named.st_ino as u64);
+            #[cfg(test)] if let Some(hook) = after_create.take() { hook(&dir); }
+            let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | O_NOFOLLOW | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let cause = io_error("pin private workspace", &dir, io::Error::last_os_error());
+                let cleanup = CleanupFailure { operation: "remove unpinned workspace", path: dir,
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "workspace identity unavailable; directory retained") };
+                return Err(transaction_error(cause, None, None, None, vec![cleanup], false));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let cause = io_error("inspect created workspace", &dir, error);
+                    let cleanup = CleanupFailure { operation: "remove unpinned workspace", path: dir,
+                        source: io::Error::new(io::ErrorKind::PermissionDenied, "workspace identity unavailable; directory retained") };
+                    return Err(transaction_error(cause, None, None, None, vec![cleanup], false));
+                }
+            };
+            let identity = (metadata.dev(), metadata.ino());
+            if named.st_mode & libc::S_IFMT != libc::S_IFDIR || identity != created_identity {
+                let cause = invalid(&dir, "workspace changed before it could be pinned");
+                let cleanup = CleanupFailure { operation: "remove unpinned workspace", path: dir,
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "created workspace was moved or replaced; location unavailable") };
+                return Err(transaction_error(cause, None, None, None, vec![cleanup], false));
+            }
+            let prepare = (|| {
+                let meta = owner_metadata(&file, &dir)?;
+                if !meta.is_dir() || (meta.dev(), meta.ino()) != identity || meta.mode() & 0o777 != 0o700 {
+                    return Err(invalid(&dir, "private workspace ownership or permissions changed"));
+                }
+                require_no_extended_acl(&file, &dir)?;
+                #[cfg(target_os = "macos")]
+                let alias = PathBuf::from(format!("/.vol/{}/{}", identity.0, identity.1));
+                #[cfg(target_os = "linux")]
+                let alias = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                #[cfg(test)] if fail_alias { return Err(invalid(&dir, "injected workspace alias failure")); }
+                let alias_meta = fs::metadata(&alias).map_err(|e| io_error("resolve pinned workspace", &dir, e))?;
+                if (alias_meta.dev(), alias_meta.ino()) != identity {
+                    return Err(invalid(&dir, "pinned workspace alias identifies another directory"));
+                }
+                Ok(alias)
+            })();
+            let alias = match prepare {
+                Ok(alias) => alias,
+                Err(cause) => {
+                    let cleanup = match remove_pinned_directory(&parent_fd, &name, identity) {
+                        Ok(()) => Vec::new(),
+                        Err(source) => vec![CleanupFailure { operation: "remove failed workspace", path: dir, source }],
+                    };
+                    return Err(if cleanup.is_empty() { cause } else { transaction_error(cause, None, None, None, cleanup, false) });
+                }
+            };
+            return Ok(Self { staged: alias.join(format!("output.{ext}")), directory: dir, alias,
+                parent: parent_fd, name, file, identity, stage_file: Mutex::new(None),
+                #[cfg(test)] sync_error: Mutex::new(None) });
         }
         Err(invalid(parent, "could not allocate a unique workspace"))
     }
-    fn displaced(&self) -> PathBuf { self.directory.join("original") }
-    fn cleanup(&self, retain_displaced: bool) -> Vec<CleanupFailure> {
+    pub(crate) fn staging_path(&self) -> &Path { &self.staged }
+    pub(crate) fn link_stage(&self, destination: &Path) -> Result<(), WorkflowError> {
+        if destination.parent() != self.directory.parent() {
+            return Err(invalid(destination, "destination is not in the pinned workspace parent"));
+        }
+        self.validate_parent(destination)?;
+        self.stage_stamp("inspect private publication stage")?;
+        link_no_replace(self, &self.staged, destination)
+    }
+    #[cfg(test)]
+    pub(crate) fn directory_path(&self) -> &Path { &self.directory }
+    pub(crate) fn mark_stage(&self) -> Result<(), WorkflowError> { self.remember_stage().map(|_| ()) }
+    fn displaced(&self) -> PathBuf { self.alias.join("original") }
+    fn argument(&self, path: &Path) -> Result<(c_int, CString), WorkflowError> {
+        if path.parent() == Some(self.alias.as_path()) {
+            let name = path.file_name().ok_or_else(|| invalid(path, "workspace entry has no name"))?;
+            Ok((self.file.as_raw_fd(), CString::new(name.as_bytes()).map_err(|_| invalid(path, "path contains NUL"))?))
+        } else if path.parent() == self.directory.parent() {
+            let name = path.file_name().ok_or_else(|| invalid(path, "parent entry has no name"))?;
+            Ok((self.parent.as_raw_fd(), CString::new(name.as_bytes()).map_err(|_| invalid(path, "path contains NUL"))?))
+        } else {
+            Ok((libc::AT_FDCWD, CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid(path, "path contains NUL"))?))
+        }
+    }
+    fn open_entry(&self, path: &Path) -> Result<File, WorkflowError> {
+        let (dir, name) = self.argument(path)?;
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), libc::O_RDONLY | O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 { return Err(io_error("open private file", path, io::Error::last_os_error())); }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata().map_err(|e| io_error("inspect private file", path, e))?;
+        if !meta.file_type().is_file() { return Err(invalid(path, "private entry is not a regular file")); }
+        Ok(file)
+    }
+    fn observe_stage(&self) -> Result<(File, Stamp), WorkflowError> {
+        let file = self.open_entry(&self.staged)?;
+        let meta = owner_metadata(&file, &self.staged)?;
+        let (dir, name) = self.argument(&self.staged)?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(dir, name.as_ptr(), named.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io_error("inspect named private stage", &self.staged, io::Error::last_os_error()));
+        }
+        let named = unsafe { named.assume_init() };
+        if named.st_mode & libc::S_IFMT != libc::S_IFREG
+            || (named.st_dev as u64, named.st_ino as u64) != (meta.dev(), meta.ino())
+            || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+            return Err(invalid(&self.staged, "private stage identity or ownership changed"));
+        }
+        Ok((file, metadata_stamp(&meta)))
+    }
+    fn remember_stage(&self) -> Result<Stamp, WorkflowError> {
+        let (file, stamp) = self.observe_stage()?;
+        let mut owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pinned) = owned.as_ref() {
+            let previous = pinned.metadata().map_err(|e| io_error("inspect pinned private stage", &self.staged, e))?;
+            if (previous.dev(), previous.ino()) != (stamp.dev, stamp.ino) {
+                return Err(invalid(&self.staged, "private stage was replaced; retained"));
+            }
+        } else {
+            *owned = Some(file);
+        }
+        Ok(stamp)
+    }
+    fn accept_rewritten_stage(&self) -> Result<(), WorkflowError> {
+        let (file, _) = self.observe_stage()?;
+        let mut owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_none() { return Err(invalid(&self.staged, "cannot adopt a rewrite of an unrecorded stage")); }
+        // Keep the replacement descriptor live across every subsequent check.
+        *owned = Some(file);
+        Ok(())
+    }
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.sync_error.lock().unwrap_or_else(|e| e.into_inner()).take() { return Err(error); }
+        self.parent.sync_all()
+    }
+    fn set_stage_file(&self, file: File) {
+        *self.stage_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+    pub(crate) fn create_stage(&self) -> Result<File, WorkflowError> {
+        let mut owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_some() { return Err(invalid(&self.staged, "private stage was already recorded")); }
+        let (dir, name) = self.argument(&self.staged)?;
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
+        if fd < 0 { return Err(io_error("create private stage", &self.staged, io::Error::last_os_error())); }
+        // Store the exclusive descriptor before any fallible initialization.
+        *owned = Some(unsafe { File::from_raw_fd(fd) });
+        owned.as_ref().unwrap().try_clone().map_err(|e| io_error("duplicate private stage", &self.staged, e))
+    }
+    fn stage_stamp(&self, operation: &'static str) -> Result<Stamp, WorkflowError> {
+        let owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        let file = owned.as_ref().ok_or_else(|| invalid(&self.staged, "private stage is not pinned"))?;
+        let meta = file.metadata().map_err(|e| io_error(operation, &self.staged, e))?;
+        let (dir, name) = self.argument(&self.staged)?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(dir, name.as_ptr(), named.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io_error(operation, &self.staged, io::Error::last_os_error()));
+        }
+        let named = unsafe { named.assume_init() };
+        if !meta.file_type().is_file() || named.st_mode & libc::S_IFMT != libc::S_IFREG
+            || (meta.dev(), meta.ino()) != (named.st_dev as u64, named.st_ino as u64) {
+            return Err(WorkflowError::SourceChanged(self.staged.clone()));
+        }
+        Ok(metadata_stamp(&meta))
+    }
+    fn check_stage_stamp(&self, expected: Stamp) -> Result<(), WorkflowError> {
+        if self.stage_stamp("inspect pinned stage")? == expected { Ok(()) }
+        else { Err(WorkflowError::SourceChanged(self.staged.clone())) }
+    }
+    fn default_file_mode(&self) -> Result<u32, WorkflowError> {
+        let name = c".pn-mode-probe";
+        let fd = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | O_NOFOLLOW | libc::O_CLOEXEC, 0o666) };
+        if fd < 0 { return Err(io_error("create mode probe", &self.directory, io::Error::last_os_error())); }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata().map_err(|e| io_error("inspect mode probe", &self.directory, e))?;
+        let probe = self.alias.join(".pn-mode-probe");
+        self.unlink_owned(&probe, (meta.dev(), meta.ino())).map_err(|e| io_error("remove mode probe", &self.directory, e))?;
+        Ok(meta.mode() & 0o7777)
+    }
+    fn set_stage_mode(&self, mode: u32) -> Result<(), WorkflowError> {
+        let file = self.open_entry(&self.staged)?;
+        let metadata = file.metadata().map_err(|e| io_error("inspect stage mode", &self.staged, e))?;
+        let owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        let expected = owned.as_ref().map(|file| file.metadata()).transpose()
+            .map_err(|e| io_error("inspect pinned private stage", &self.staged, e))?;
+        if expected.as_ref().map(|m| (m.dev(), m.ino())) != Some((metadata.dev(), metadata.ino())) {
+            return Err(invalid(&self.staged, "private stage was replaced; retained"));
+        }
+        if metadata.mode() & 0o7777 != mode && unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(io_error("set final output mode", &self.staged, io::Error::last_os_error()));
+        }
+        if file.metadata().map_err(|e| io_error("reinspect stage mode", &self.staged, e))?.mode() & 0o7777 != mode {
+            return Err(invalid(&self.staged, "could not preserve final output mode"));
+        }
+        Ok(())
+    }
+    fn set_overwrite_access(&self, source: &File, source_path: &Path, expected: Stamp) -> Result<(), WorkflowError> {
+        let original = access_metadata(source, source_path)?;
+        if metadata_stamp(&original) != expected { return Err(WorkflowError::DestinationChanged(source_path.to_owned())); }
+        let stage = self.open_entry(&self.staged)?;
+        let pinned = self.stage_stamp("inspect overwrite stage")?;
+        let stage_meta = access_metadata(&stage, &self.staged)?;
+        if !same_identity(pinned, metadata_stamp(&stage_meta)) { return Err(WorkflowError::SourceChanged(self.staged.clone())); }
+        if (stage_meta.uid(), stage_meta.gid()) != (original.uid(), original.gid())
+            && unsafe { libc::fchown(stage.as_raw_fd(), original.uid() as libc::uid_t, original.gid() as libc::gid_t) } != 0 {
+            return Err(io_error("preserve overwritten output owner and group", &self.staged, io::Error::last_os_error()));
+        }
+        self.set_stage_mode(original.mode() & 0o7777)?;
+        #[cfg(target_os = "macos")]
+        {
+            let wanted = acl_bytes(source, source_path)?;
+            if wanted != acl_bytes(&stage, &self.staged)?
+                && unsafe { fcopyfile(source.as_raw_fd(), stage.as_raw_fd(), std::ptr::null_mut(), 1) } != 0 {
+                return Err(io_error("preserve overwritten output ACL", &self.staged, io::Error::last_os_error()));
+            }
+            if wanted != acl_bytes(&stage, &self.staged)? { return Err(invalid(&self.staged, "overwritten output ACL could not be preserved")); }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let name = CString::new("system.posix_acl_access").unwrap();
+            let source_has = xattr_names(source, source_path)?.binary_search(&name).is_ok();
+            let stage_has = xattr_names(&stage, &self.staged)?.binary_search(&name).is_ok();
+            if source_has {
+                let size = xattr_size(source, source_path, &name)?;
+                let mut value = vec![0u8; size];
+                if size != 0 { read_xattr(source, source_path, &name, &mut value, 0)?; }
+                set_xattr(&stage, &self.staged, &name, &value, 0)?;
+            } else if stage_has { remove_xattr(&stage, &self.staged, &name)?; }
+            let actual_has = xattr_names(&stage, &self.staged)?.binary_search(&name).is_ok();
+            if source_has != actual_has || (source_has && !xattr_values_equal(source, &stage, source_path, &self.staged, &name)?) {
+                return Err(invalid(&self.staged, "overwritten output ACL could not be preserved"));
+            }
+        }
+        let actual = access_metadata(&stage, &self.staged)?;
+        let after = access_metadata(source, source_path)?;
+        if metadata_stamp(&after) != expected || (after.uid(), after.gid(), after.mode()) != (original.uid(), original.gid(), original.mode()) {
+            return Err(WorkflowError::DestinationChanged(source_path.to_owned()));
+        }
+        if (actual.uid(), actual.gid(), actual.mode() & 0o7777) != (original.uid(), original.gid(), original.mode() & 0o7777) {
+            return Err(invalid(&self.staged, "overwritten output owner, group or mode could not be preserved"));
+        }
+        Ok(())
+    }
+    fn unlink_owned(&self, path: &Path, expected: (u64, u64)) -> io::Result<()> {
+        let (dir, name) = self.argument(path).map_err(io::Error::other)?;
+        let mut meta = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(dir, name.as_ptr(), meta.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let meta = unsafe { meta.assume_init() };
+        if meta.st_mode & libc::S_IFMT != libc::S_IFREG || (meta.st_dev as u64, meta.st_ino as u64) != expected {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "workspace entry was replaced; retained"));
+        }
+        if unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
+        Ok(())
+    }
+    fn recovery_path(&self, path: &Path) -> PathBuf {
+        if path.parent() != Some(self.alias.as_path()) { return path.to_owned(); }
+        directory_fd_path(&self.file).unwrap_or_else(|| self.directory.clone()).join(path.file_name().unwrap())
+    }
+    pub(crate) fn actual_destination(&self, destination: &Path) -> Option<PathBuf> {
+        let name = destination.file_name()?;
+        Some(directory_fd_path(&self.parent)?.join(name))
+    }
+    pub(crate) fn validate_parent(&self, destination: &Path) -> Result<(), WorkflowError> {
+        let parent_path = self.directory.parent().ok_or_else(|| invalid(&self.directory, "workspace parent has no path"))?;
+        let held = self.parent.metadata().map_err(|e| io_error("inspect pinned output parent", parent_path, e))?;
+        let matches = fs::symlink_metadata(parent_path).is_ok_and(|named| named.file_type().is_dir()
+            && (named.dev(), named.ino()) == (held.dev(), held.ino()));
+        if matches { return Ok(()); }
+        let actual = self.actual_destination(destination);
+        Err(invalid(actual.as_deref().unwrap_or(destination),
+            if actual.is_some() { "output parent changed; path shows the pinned parent's current location" }
+            else { "output parent changed; current location is unavailable" }))
+    }
+    pub(crate) fn cleanup(&self, retain_displaced: bool) -> Vec<CleanupFailure> {
         let mut errors = Vec::new();
-        cleanup_private_file(&self.staged, &mut errors);
+        let owned = self.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        let cleanup = match owned.as_ref() {
+            Some(file) => file.metadata().and_then(|meta| self.unlink_owned(&self.staged, (meta.dev(), meta.ino()))),
+            None => match self.open_entry(&self.staged) {
+                Err(WorkflowError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "unproven private stage retained")),
+            },
+        };
+        if let Err(source) = cleanup {
+            if source.kind() != io::ErrorKind::NotFound {
+                errors.push(CleanupFailure { operation: "remove private file", path: self.recovery_path(&self.staged), source });
+            }
+        }
         if !retain_displaced {
-            match fs::remove_dir(&self.directory) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(source) => errors.push(CleanupFailure { operation: "remove private workspace", path: self.directory.clone(), source }),
+            if let Err(source) = remove_pinned_directory(&self.parent, &self.name, self.identity) {
+                if source.kind() != io::ErrorKind::NotFound {
+                    errors.push(CleanupFailure { operation: "remove private workspace",
+                        path: directory_fd_path(&self.file).unwrap_or_else(|| self.directory.clone()), source });
+                }
             }
         }
         errors
     }
 }
-fn cleanup_private_file(path: &Path, errors: &mut Vec<CleanupFailure>) {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(source) => errors.push(CleanupFailure { operation: "inspect private file", path: path.to_owned(), source }),
-        Ok(meta) if meta.file_type().is_file() => {
-            if let Err(source) = fs::remove_file(path) { errors.push(CleanupFailure { operation: "remove private file", path: path.to_owned(), source }); }
-        }
-        Ok(_) => errors.push(CleanupFailure { operation: "remove private file", path: path.to_owned(), source: io::Error::new(io::ErrorKind::InvalidData, "unexpected non-regular workspace entry retained") }),
-    }
-}
 
-struct Reservation { path: PathBuf, identity: Stamp }
+struct Reservation { path: PathBuf, name: CString, quarantine: Workspace }
 impl Reservation {
     fn acquire(target: &Path) -> Result<Self, WorkflowError> {
         let parent = target.parent().ok_or_else(|| invalid(target, "target has no parent"))?;
-        let name = target.file_name().ok_or_else(|| invalid(target, "target has no filename"))?;
-        let mut lock = OsString::from("."); lock.push(name); lock.push(".pn-reservation");
-        let mut path = parent.join(lock);
-        let file = match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
-            Ok(file) => file,
-            // Darwin ENAMETOOLONG: keep legal near-NAME_MAX output names
-            // usable without truncating the target-derived reservation name.
-            Err(e) if e.raw_os_error() == Some(63) => {
-                let mut a = 0xcbf29ce484222325u64;
-                let mut b = 0x84222325cbf29ce4u64;
-                for byte in name.as_bytes() {
-                    let byte = u64::from(byte.to_ascii_lowercase());
-                    a = (a ^ byte).wrapping_mul(0x100000001b3);
-                    b = (b ^ byte).wrapping_mul(0x100000001b3);
+        let filename = target.file_name().ok_or_else(|| invalid(target, "target has no filename"))?;
+        // Allocate cleanup quarantine before the reservation exists, so a later
+        // workspace-creation failure never requires creating another directory.
+        let quarantine = Workspace::create(parent, "reservation")?;
+        let result = (|| {
+            let mut lock = OsString::from("."); lock.push(filename); lock.push(".pn-reservation");
+            let open_lock = |lock: &OsStr| -> io::Result<File> {
+                let name = CString::new(lock.as_bytes()).map_err(io::Error::other)?;
+                let fd = unsafe { libc::openat(quarantine.parent.as_raw_fd(), name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
+                if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+            };
+            let file = match open_lock(&lock) {
+                Ok(file) => file,
+                Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                    let mut a = 0xcbf29ce484222325u64;
+                    let mut b = 0x84222325cbf29ce4u64;
+                    for byte in filename.as_bytes() {
+                        let byte = u64::from(byte.to_ascii_lowercase());
+                        a = (a ^ byte).wrapping_mul(0x100000001b3);
+                        b = (b ^ byte).wrapping_mul(0x100000001b3);
+                    }
+                    lock = OsString::from(format!(".pn-reservation-{a:016x}{b:016x}"));
+                    match open_lock(&lock) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(WorkflowError::ReservationExists(parent.join(&lock))),
+                        Err(e) => return Err(io_error("reserve output", &parent.join(&lock), e)),
+                    }
                 }
-                path = parent.join(format!(".pn-reservation-{a:016x}{b:016x}"));
-                match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
-                    Ok(file) => file,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(WorkflowError::ReservationExists(path)),
-                    Err(e) => return Err(io_error("reserve output", &path, e)),
-                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(WorkflowError::ReservationExists(parent.join(&lock))),
+                Err(e) => return Err(io_error("reserve output", &parent.join(&lock), e)),
+            };
+            let path = parent.join(&lock);
+            let name = CString::new(lock.as_bytes()).map_err(|_| invalid(&path, "path contains NUL"))?;
+            Ok((path, name, file))
+        })();
+        match result {
+            Ok((path, name, file)) => {
+                quarantine.set_stage_file(file);
+                Ok(Self { path, name, quarantine })
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(WorkflowError::ReservationExists(path)),
-            Err(e) => return Err(io_error("reserve output", &path, e)),
-        };
-        let meta = file.metadata().map_err(|e| io_error("inspect reservation", &path, e))?;
-        let identity = Stamp { dev: meta.dev(), ino: meta.ino(), len: meta.len(), mtime: meta.mtime(), mtime_nsec: meta.mtime_nsec(), ctime: meta.ctime(), ctime_nsec: meta.ctime_nsec() };
-        Ok(Self { path, identity })
-    }
-    fn release(&self) -> Result<(), io::Error> {
-        let meta = fs::symlink_metadata(&self.path)?;
-        if !meta.file_type().is_file() || meta.dev() != self.identity.dev || meta.ino() != self.identity.ino {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "reservation was replaced; retained"));
+            Err(cause) => {
+                let cleanup = quarantine.cleanup(false);
+                Err(if cleanup.is_empty() { cause } else { transaction_error(cause, None, None, None, cleanup, false) })
+            }
         }
-        fs::remove_file(&self.path)
+    }
+    fn current_path(&self) -> PathBuf {
+        directory_fd_path(&self.quarantine.parent).map(|parent| parent.join(OsStr::from_bytes(self.name.as_bytes())))
+            .unwrap_or_else(|| self.path.clone())
+    }
+    fn release(&self) -> Result<(), io::Error> { self.release_impl(#[cfg(test)] None) }
+    fn release_impl(&self, #[cfg(test)] before_move: Option<Box<dyn FnOnce()>>) -> Result<(), io::Error> {
+        let work = &self.quarantine;
+        let source = self.path.clone();
+        #[cfg(test)] if let Some(hook) = before_move { hook(); }
+        if let Err(error) = move_no_replace(&work, &source, &work.staged) {
+            let cleanup = work.cleanup(false);
+            return if cleanup.is_empty() { Err(io::Error::other(error)) }
+                else { Err(io::Error::other(format!("{error}; reservation quarantine cleanup failed: {cleanup:?}"))) };
+        }
+        if let Err(error) = work.stage_stamp("verify quarantined reservation") {
+            if let Err(rollback) = move_no_replace(&work, &work.staged, &source) {
+                return Err(io::Error::other(format!("{error}; unexpected reservation retained at {}: {rollback}",
+                    work.recovery_path(&work.staged).display())));
+            }
+            let cleanup = work.cleanup(false);
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                format!("reservation was replaced and returned; cleanup: {cleanup:?}")));
+        }
+        let cleanup = work.cleanup(false);
+        if cleanup.is_empty() { Ok(()) } else { Err(io::Error::other(format!("reservation quarantine cleanup failed: {cleanup:?}"))) }
+    }
+    fn same_parent(&self, other: &File) -> io::Result<bool> {
+        let left = self.quarantine.parent.metadata()?;
+        let right = other.metadata()?;
+        Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
     }
 }
 fn release_reservations(reservations: &mut Vec<Reservation>) -> Vec<CleanupFailure> {
     let mut errors = Vec::new();
     for reservation in reservations.drain(..) {
-        if let Err(source) = reservation.release() { errors.push(CleanupFailure { operation: "release reservation", path: reservation.path, source }); }
+        if let Err(source) = reservation.release() { errors.push(CleanupFailure { operation: "release reservation", path: reservation.current_path(), source }); }
     }
     errors
 }
@@ -1217,10 +2048,11 @@ fn create_backup(source: &Path, expected: &Stamp, directory: &Path,
     #[cfg(test)] after_publish: Option<Box<dyn FnOnce(&Workspace)>>) -> Result<PathBuf, WorkflowError> {
     let work = Workspace::create(directory, "backup")?;
     let result = (|| {
-        copy_new_verified(source, &work.staged, *expected)?;
+        copy_new_verified(source, &work.staged, *expected, Some(&work))?;
         let mut index = 0u64;
         loop {
             let candidate = backup_candidate(source, directory, index)?;
+            work.validate_parent(&candidate)?;
             let reservation = match Reservation::acquire(&candidate) {
                 Ok(reservation) => reservation,
                 Err(WorkflowError::ReservationExists(_)) => {
@@ -1229,7 +2061,19 @@ fn create_backup(source: &Path, expected: &Stamp, directory: &Path,
                 }
                 Err(error) => return Err(error),
             };
-            let linked = fs::hard_link(&work.staged, &candidate);
+            match reservation.same_parent(&work.parent) {
+                Ok(true) => (),
+                result => {
+                    let cause = match result {
+                        Ok(false) => invalid(&candidate, "reservation and backup workspace have different parents"),
+                        Err(error) => io_error("inspect backup reservation parent", &candidate, error),
+                        Ok(true) => unreachable!(),
+                    };
+                    let mut reservations = vec![reservation];
+                    return Err(transaction_error(cause, None, None, None, release_reservations(&mut reservations), false));
+                }
+            }
+            let linked = link_at(&work, &work.staged, &candidate);
             let mut reservations = vec![reservation];
             let cleanup = release_reservations(&mut reservations);
             if !cleanup.is_empty() {
@@ -1242,6 +2086,10 @@ fn create_backup(source: &Path, expected: &Stamp, directory: &Path,
             match linked {
                 Ok(()) => {
                     #[cfg(test)] if let Some(hook) = after_publish { hook(&work); }
+                    if let Err(error) = work.validate_parent(&candidate) {
+                        let actual = work.actual_destination(&candidate);
+                        return Err(transaction_error(error, actual, None, None, Vec::new(), false));
+                    }
                     return Ok(candidate);
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1259,25 +2107,67 @@ fn create_backup(source: &Path, expected: &Stamp, directory: &Path,
         (Err(error), false) => Err(transaction_error(error, None, None, None, cleanup, false)),
     }
 }
+fn sync_backup_directory(backup: &Path) -> Result<(), WorkflowError> {
+    let parent = backup.parent().ok_or_else(|| invalid(backup, "backup has no parent"))?;
+    let directory = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent).map_err(|e| io_error("open backup directory for sync", parent, e))?;
+    directory.sync_all().map_err(|e| io_error("sync verified backup directory", parent, e))
+}
 
-#[link(name = "System")]
-unsafe extern "C" { fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> i32; }
-fn move_no_replace(from: &Path, to: &Path) -> Result<(), WorkflowError> {
-    let from_c = CString::new(from.as_os_str().as_bytes()).map_err(|_| invalid(from, "path contains NUL"))?;
-    let to_c = CString::new(to.as_os_str().as_bytes()).map_err(|_| invalid(to, "path contains NUL"))?;
-    // SAFETY: both paths are NUL-terminated and live for this system call.
-    if unsafe { renamex_np(from_c.as_ptr(), to_c.as_ptr(), 0x00000004) } == 0 { Ok(()) }
-    else { Err(WorkflowError::Move { from: from.to_owned(), to: to.to_owned(), source: io::Error::last_os_error() }) }
+fn move_no_replace(workspace: &Workspace, from: &Path, to: &Path) -> Result<(), WorkflowError> {
+    let (from_fd, from_c) = workspace.argument(from)?;
+    let (to_fd, to_c) = workspace.argument(to)?;
+    // SAFETY: descriptors and path strings remain live throughout the call.
+    #[cfg(target_os = "macos")]
+    let status = unsafe { libc::renameatx_np(from_fd, from_c.as_ptr(), to_fd, to_c.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let status = unsafe { libc::renameat2(from_fd, from_c.as_ptr(), to_fd, to_c.as_ptr(), libc::RENAME_NOREPLACE) };
+    if status == 0 { return Ok(()); }
+    let source = io::Error::last_os_error();
+    #[cfg(target_os = "linux")]
+    if matches!(source.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)) {
+        return Err(WorkflowError::AtomicRenameUnsupported { operation: "rename without replacement", path: to.to_owned(), source });
+    }
+    Err(WorkflowError::Move { from: from.to_owned(), to: to.to_owned(), source })
 }
-fn swap_paths(first: &Path, second: &Path) -> Result<(), WorkflowError> {
-    let first_c = CString::new(first.as_os_str().as_bytes()).map_err(|_| invalid(first, "path contains NUL"))?;
-    let second_c = CString::new(second.as_os_str().as_bytes()).map_err(|_| invalid(second, "path contains NUL"))?;
-    // RENAME_SWAP exchanges both entries atomically, even when they are symlinks.
-    if unsafe { renamex_np(first_c.as_ptr(), second_c.as_ptr(), 0x00000002) } == 0 { Ok(()) }
-    else { Err(io_error("atomically swap output", second, io::Error::last_os_error())) }
+fn swap_paths(workspace: &Workspace, first: &Path, second: &Path) -> Result<(), WorkflowError> {
+    let (first_fd, first_c) = workspace.argument(first)?;
+    let (second_fd, second_c) = workspace.argument(second)?;
+    // Exchange remains atomic and preserves the displaced entry.
+    #[cfg(target_os = "macos")]
+    let status = unsafe { libc::renameatx_np(first_fd, first_c.as_ptr(), second_fd, second_c.as_ptr(), libc::RENAME_SWAP) };
+    #[cfg(target_os = "linux")]
+    let status = unsafe { libc::renameat2(first_fd, first_c.as_ptr(), second_fd, second_c.as_ptr(), libc::RENAME_EXCHANGE) };
+    if status == 0 { return Ok(()); }
+    let source = io::Error::last_os_error();
+    #[cfg(target_os = "linux")]
+    if matches!(source.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)) {
+        return Err(WorkflowError::AtomicRenameUnsupported { operation: "atomic exchange", path: second.to_owned(), source });
+    }
+    Err(io_error("atomically swap output", second, source))
 }
-fn link_no_replace(source: &Path, destination: &Path) -> Result<(), WorkflowError> {
-    match fs::hard_link(source, destination) {
+fn link_at(workspace: &Workspace, source: &Path, destination: &Path) -> io::Result<()> {
+    let (source_fd, source_c) = workspace.argument(source).map_err(io::Error::other)?;
+    let (dest_fd, dest_c) = workspace.argument(destination).map_err(io::Error::other)?;
+    if source == workspace.staged {
+        let owned = workspace.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        let identity = owned.as_ref().map(|file| file.metadata()).transpose()?
+            .map(|meta| (meta.dev(), meta.ino()));
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(source_fd, source_c.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || identity != Some((stat.st_dev as u64, stat.st_ino as u64)) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "stage identity changed before publication"));
+        }
+    }
+    // Flags 0 never dereferences a symlink in the final source component.
+    if unsafe { libc::linkat(source_fd, source_c.as_ptr(), dest_fd, dest_c.as_ptr(), 0) } == 0 { Ok(()) }
+    else { Err(io::Error::last_os_error()) }
+}
+fn link_no_replace(workspace: &Workspace, source: &Path, destination: &Path) -> Result<(), WorkflowError> {
+    match link_at(workspace, source, destination) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(WorkflowError::DestinationExists(destination.to_owned())),
         Err(e) => Err(io_error("publish without overwrite", destination, e)),
@@ -1288,14 +2178,14 @@ struct CommitFailure { cause: WorkflowError, rollback: Option<WorkflowError>, re
 impl From<WorkflowError> for CommitFailure {
     fn from(cause: WorkflowError) -> Self { Self { cause, rollback: None, recovery: None, published: false } }
 }
-fn rollback_move(cause: WorkflowError, displaced: &Path, source: &Path) -> CommitFailure {
-    match move_no_replace(displaced, source) {
+fn rollback_move(workspace: &Workspace, cause: WorkflowError, displaced: &Path, source: &Path) -> CommitFailure {
+    match move_no_replace(workspace, displaced, source) {
         Ok(()) => CommitFailure { cause, rollback: None, recovery: None, published: false },
         Err(rollback) => CommitFailure { cause, rollback: Some(rollback), recovery: Some(displaced.to_owned()), published: false },
     }
 }
 
-fn commit_overwriting(destination: &Path, staged: &Path, expected: Stamp, staged_expected: Stamp,
+fn commit_overwriting(workspace: &Workspace, destination: &Path, staged: &Path, expected: Stamp, staged_expected: Stamp,
     #[cfg(test)] after_check: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)] after_swap: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)] before_rollback: Option<Box<dyn FnOnce() + Send>>) -> Result<(), CommitFailure> {
@@ -1306,7 +2196,7 @@ fn commit_overwriting(destination: &Path, staged: &Path, expected: Stamp, staged
     let digest = content_digest(&pinned, destination).map_err(CommitFailure::from)?;
     let opened = pinned.metadata().map_err(|e| CommitFailure::from(io_error("reinspect open overwrite destination", destination, e)))?;
     if metadata_stamp(&opened) != expected { return Err(WorkflowError::DestinationChanged(destination.to_owned()).into()); }
-    let pinned_stage = open_read(staged).map_err(CommitFailure::from)?;
+    let pinned_stage = workspace.open_entry(staged).map_err(CommitFailure::from)?;
     let stage_opened = pinned_stage.metadata().map_err(|e| CommitFailure::from(io_error("inspect open staging file", staged, e)))?;
     if metadata_stamp(&stage_opened) != staged_expected { return Err(WorkflowError::SourceChanged(staged.to_owned()).into()); }
     let staged_metadata = overwrite_metadata(&pinned_stage, staged).map_err(CommitFailure::from)?;
@@ -1314,8 +2204,11 @@ fn commit_overwriting(destination: &Path, staged: &Path, expected: Stamp, staged
     let stage_opened = pinned_stage.metadata().map_err(|e| CommitFailure::from(io_error("reinspect open staging file", staged, e)))?;
     if metadata_stamp(&stage_opened) != staged_expected { return Err(WorkflowError::SourceChanged(staged.to_owned()).into()); }
     #[cfg(test)] if let Some(hook) = after_check { hook(); }
-    swap_paths(staged, destination).map_err(CommitFailure::from)?;
+    swap_paths(workspace, staged, destination).map_err(CommitFailure::from)?;
     #[cfg(test)] if let Some(hook) = after_swap { hook(); }
+    if let Err(cause) = workspace.validate_parent(destination) {
+        return Err(CommitFailure { cause, rollback: None, recovery: Some(staged.to_owned()), published: true });
+    }
     // Darwin updates ctime during rename. Compare the complete original stamp
     // before the swap, then bind the moved entry to that open inode and require
     // its post-swap path and descriptor stamps to agree exactly.
@@ -1328,11 +2221,18 @@ fn commit_overwriting(destination: &Path, staged: &Path, expected: Stamp, staged
     };
     let published_matches = stamp(destination, "inspect swapped-in output")
         .is_ok_and(|new| same_moved_file(new, staged_expected));
-    if old_matches && published_matches { return Ok(()); }
+    if old_matches && published_matches {
+        if let Err(e) = workspace.sync_parent() {
+            return Err(CommitFailure { cause: io_error("sync published output directory", destination, e),
+                rollback: None, recovery: Some(staged.to_owned()), published: true });
+        }
+        workspace.set_stage_file(pinned);
+        return Ok(());
+    }
     let cause = WorkflowError::DestinationChanged(destination.to_owned());
     let rollback = if published_matches {
         #[cfg(test)] if let Some(hook) = before_rollback { hook(); }
-        swap_paths(staged, destination)
+        swap_paths(workspace, staged, destination)
     } else {
         Err(WorkflowError::DestinationChanged(destination.to_owned()))
     };
@@ -1360,21 +2260,21 @@ fn commit_overwriting(destination: &Path, staged: &Path, expected: Stamp, staged
 /// Commit a previously verified copy using only bounded identity checks.
 /// Any failure before publication rolls the displaced file back.
 fn commit_replacing(
-    source: &Path, destination: &Path, staged: &Path, displaced: &Path, expected: Stamp, staged_expected: Stamp,
+    workspace: &Workspace, source: &Path, destination: &Path, staged: &Path, displaced: &Path, expected: Stamp, staged_expected: Stamp,
     original_backup: Option<(&Path, Stamp)>, staged_backup: Option<(&Path, Stamp)>, retain_displaced: bool,
     #[cfg(test)] after_move: Option<Box<dyn FnOnce(&Path) + Send>>,
 ) -> Result<(), CommitFailure> {
-    if let Err(cause) = move_no_replace(source, displaced) { return Err(CommitFailure { cause, rollback: None, recovery: None, published: false }); }
+    if let Err(cause) = move_no_replace(workspace, source, displaced) { return Err(CommitFailure { cause, rollback: None, recovery: None, published: false }); }
     let moved_on_arrival = match stamp(displaced, "inspect newly displaced original") {
         Ok(moved) if same_moved_file(moved, expected) => moved,
-        Ok(_) => return Err(rollback_move(WorkflowError::SourceChanged(source.to_owned()), displaced, source)),
-        Err(cause) => return Err(rollback_move(cause, displaced, source)),
+        Ok(_) => return Err(rollback_move(workspace, WorkflowError::SourceChanged(source.to_owned()), displaced, source)),
+        Err(cause) => return Err(rollback_move(workspace, cause, displaced, source)),
     };
     #[cfg(test)] if let Some(hook) = after_move { hook(source); }
     let verification = (|| {
         let moved = stamp(displaced, "inspect displaced original")?;
         if moved != moved_on_arrival { return Err(WorkflowError::SourceChanged(source.to_owned())); }
-        if stamp(staged, "inspect verified staging file")? != staged_expected {
+        if workspace.stage_stamp("inspect verified staging file")? != staged_expected {
             return Err(WorkflowError::SourceChanged(staged.to_owned()));
         }
         for (backup, expected) in original_backup.into_iter().chain(staged_backup) {
@@ -1384,22 +2284,29 @@ fn commit_replacing(
     })();
     let moved_before_link = match verification {
         Ok(moved) => moved,
-        Err(cause) => return Err(rollback_move(cause, displaced, source)),
+        Err(cause) => return Err(rollback_move(workspace, cause, displaced, source)),
     };
-    if let Err(cause) = link_no_replace(staged, destination) { return Err(rollback_move(cause, displaced, source)); }
+    if let Err(cause) = link_no_replace(workspace, staged, destination) { return Err(rollback_move(workspace, cause, displaced, source)); }
+    if let Err(cause) = workspace.validate_parent(destination) {
+        return Err(CommitFailure { cause, rollback: None, recovery: Some(displaced.to_owned()), published: true });
+    }
     let verification = (|| {
         for (backup, expected) in original_backup.into_iter().chain(staged_backup) {
             if stamp(backup, "reinspect verified backup")? != expected { return Err(WorkflowError::BackupChanged(backup.to_owned())); }
         }
         let moved = stamp(displaced, "reinspect displaced original")?;
         if moved != moved_before_link { return Err(WorkflowError::SourceChanged(source.to_owned())); }
-        let stage = stamp(staged, "reinspect published staging file")?;
+        let stage = workspace.stage_stamp("reinspect published staging file")?;
         if !same_moved_file(stage, staged_expected) { return Err(WorkflowError::SourceChanged(staged.to_owned())); }
         Ok(())
     })();
     if let Err(cause) = verification { return Err(CommitFailure { cause, rollback: None, recovery: Some(displaced.to_owned()), published: true }); }
+    if let Err(e) = workspace.sync_parent() {
+        return Err(CommitFailure { cause: io_error("sync published output directory", destination, e),
+            rollback: None, recovery: Some(displaced.to_owned()), published: true });
+    }
     if !retain_displaced {
-        if let Err(e) = fs::remove_file(displaced) {
+        if let Err(e) = workspace.unlink_owned(displaced, (expected.dev, expected.ino)) {
             return Err(CommitFailure { cause: io_error("remove displaced original after publication", displaced, e), rollback: None, recovery: Some(displaced.to_owned()), published: true });
         }
     }
@@ -1415,14 +2322,30 @@ fn commit_replacing(
 pub struct StagedOutput {
     plan: OutputPlan, workspace: Workspace, reservations: Vec<Reservation>, source_stamp: Stamp,
     destination_stamp: Option<Stamp>, backup: Option<PathBuf>, backup_stamp: Option<Stamp>,
+    new_mp3_mode: Option<u32>,
     #[cfg(test)] after_move: Option<Box<dyn FnOnce(&Path) + Send>>,
     #[cfg(test)] before_commit: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)] after_publish: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)] after_overwrite_check: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)] after_overwrite_swap: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)] before_overwrite_rollback: Option<Box<dyn FnOnce() + Send>>,
 }
 impl StagedOutput {
     pub fn staging_path(&self) -> &Path { &self.workspace.staged }
+    pub(crate) fn create_stage(&self) -> Result<File, WorkflowError> { self.workspace.create_stage() }
+    #[cfg(test)]
+    pub(crate) fn workspace_directory(&self) -> &Path { &self.workspace.directory }
+    /// Register the codec-owned inode before it is linked at the stage name.
+    pub(crate) fn register_codec_stage(&self, file: &File) -> io::Result<()> {
+        let mut owned = self.workspace.stage_file.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_some() { return Err(io::Error::new(io::ErrorKind::AlreadyExists, "stage already recorded")); }
+        *owned = Some(file.try_clone()?);
+        Ok(())
+    }
+    /// Record a successfully created stage before other fallible work. An
+    /// unrecorded partial file is retained rather than unlinked on abort.
+    pub fn remember_staging_file(&self) -> Result<(), WorkflowError> { self.workspace.remember_stage().map(|_| ()) }
+    pub(crate) fn accept_tag_rewrite(&self) -> Result<(), WorkflowError> { self.workspace.accept_rewritten_stage() }
     pub fn backup_path(&self) -> Option<&Path> { self.backup.as_deref() }
     fn cleanup(&mut self, retain_displaced: bool) -> Vec<CleanupFailure> {
         let mut errors = self.workspace.cleanup(retain_displaced);
@@ -1433,6 +2356,7 @@ impl StagedOutput {
         let cleanup = if recovery.as_deref() == Some(self.workspace.staged.as_path()) {
             release_reservations(&mut self.reservations)
         } else { self.cleanup(recovery.is_some()) };
+        let recovery = recovery.map(|path| self.workspace.recovery_path(&path));
         transaction_error(cause, self.backup.clone(), recovery, rollback, cleanup, published)
     }
     pub fn abort(mut self) -> Result<AbortReport, WorkflowError> {
@@ -1444,19 +2368,34 @@ impl StagedOutput {
         }
     }
     pub fn finish(mut self, cancel: &Cancellation) -> Result<Publication, WorkflowError> {
-        let staged = match stamp(&self.workspace.staged, "inspect completed staging file") {
+        if let Err(e) = self.workspace.remember_stage() { return Err(self.fail(e, None, None, false)); }
+        let _overwrite_pin = if let Some(expected) = self.destination_stamp {
+            let file = match open_read(&self.plan.destination) {
+                Ok(file) => file, Err(e) => return Err(self.fail(e, None, None, false)),
+            };
+            if let Err(e) = self.workspace.set_overwrite_access(&file, &self.plan.destination, expected) {
+                return Err(self.fail(e, None, None, false));
+            }
+            Some(file)
+        } else {
+            if let Some(mode) = self.new_mp3_mode {
+                if let Err(e) = self.workspace.set_stage_mode(mode) { return Err(self.fail(e, None, None, false)); }
+            }
+            None
+        };
+        let staged = match self.workspace.stage_stamp("inspect completed private stage") {
             Ok(s) => s, Err(e) => return Err(self.fail(e, None, None, false)),
         };
-        let sync = File::open(&self.workspace.staged).and_then(|f| f.sync_all());
-        if let Err(e) = sync {
-            let cause = io_error("sync completed staging file", &self.workspace.staged, e);
+        let sync = self.workspace.open_entry(&self.workspace.staged).and_then(|file| file.sync_all()
+            .map_err(|e| io_error("sync completed staging file", &self.workspace.staged, e)));
+        if let Err(cause) = sync {
             return Err(self.fail(cause, None, None, false));
         }
         if let Err(e) = check_stamp(&self.plan.source, self.source_stamp) { return Err(self.fail(e, None, None, false)); }
         if let (Some(backup), Some(expected)) = (&self.backup, self.backup_stamp) {
             if let Err(e) = verify_backup(&self.plan.source, backup, expected) { return Err(self.fail(e, None, None, false)); }
         }
-        match stamp(&self.workspace.staged, "reinspect completed staging file") {
+        match self.workspace.stage_stamp("reinspect completed staging file") {
             Ok(now) if now == staged => (),
             Ok(_) => {
                 let cause = WorkflowError::SourceChanged(self.workspace.staged.clone());
@@ -1469,33 +2408,47 @@ impl StagedOutput {
             let _guard = cancel.publication.lock().unwrap_or_else(|e| e.into_inner());
             if cancel.is_cancelled() {
                 Err(WorkflowError::Cancelled.into())
+            } else if let Err(error) = self.workspace.validate_parent(&self.plan.destination) {
+                Err(error.into())
             } else if let Err(error) = check_stamp(&self.plan.source, self.source_stamp) {
                 Err(error.into())
-            } else if let Err(error) = check_stamp(&self.workspace.staged, staged) {
+            } else if let Err(error) = self.workspace.check_stage_stamp(staged) {
                 Err(error.into())
             } else if self.plan.is_replacement() {
-                commit_replacing(&self.plan.source, &self.plan.destination, &self.workspace.staged,
+                commit_replacing(&self.workspace, &self.plan.source, &self.plan.destination, &self.workspace.staged,
                     &self.workspace.displaced(), self.source_stamp, staged, self.backup.as_deref().zip(self.backup_stamp), None, false,
                     #[cfg(test)] self.after_move.take())
             } else if let Some(guard) = &self.plan.overwrite {
                 match check_overwrite_destination(&self.plan.destination, guard) {
                     Ok(current) if current == self.destination_stamp => {
                         if let Some(expected) = current {
-                            commit_overwriting(&self.plan.destination, &self.workspace.staged, expected, staged,
+                            commit_overwriting(&self.workspace, &self.plan.destination, &self.workspace.staged, expected, staged,
                                 #[cfg(test)] self.after_overwrite_check.take(), #[cfg(test)] self.after_overwrite_swap.take(),
                                 #[cfg(test)] self.before_overwrite_rollback.take())
                         } else {
-                            link_no_replace(&self.workspace.staged, &self.plan.destination).map_err(CommitFailure::from)
+                            link_no_replace(&self.workspace, &self.workspace.staged, &self.plan.destination).map_err(CommitFailure::from)
                         }
                     }
                     Ok(_) => Err(WorkflowError::DestinationChanged(self.plan.destination.clone()).into()),
                     Err(error) => Err(error.into()),
                 }
             } else {
-                link_no_replace(&self.workspace.staged, &self.plan.destination).map_err(CommitFailure::from)
+                link_no_replace(&self.workspace, &self.workspace.staged, &self.plan.destination).map_err(CommitFailure::from)
             }
         };
         if let Err(error) = commit { return Err(self.fail(error.cause, error.rollback, error.recovery, error.published)); }
+        #[cfg(test)] if let Some(hook) = self.after_publish.take() { hook(); }
+        if let Err(cause) = self.workspace.validate_parent(&self.plan.destination) {
+            let recovery = self.workspace.staged.clone();
+            return Err(self.fail(cause, None, Some(recovery), true));
+        }
+        if !self.plan.is_replacement() && self.destination_stamp.is_none() {
+            if let Err(error) = self.workspace.sync_parent() {
+                let cause = io_error("sync published output directory", &self.plan.destination, error);
+                let recovery = self.workspace.staged.clone();
+                return Err(self.fail(cause, None, Some(recovery), true));
+            }
+        }
         let publication = Publication { destination: self.plan.destination.clone(), backup: self.backup.clone(),
             replaced_existing_output: self.plan.overwrite.is_some() && self.destination_stamp.is_some() };
         let cleanup = self.cleanup(false);
@@ -1524,10 +2477,13 @@ fn sync_restored(current: &Path, expected: Stamp) -> Result<(), BackupRemovalErr
     if !same_moved_file(metadata_stamp(&opened), expected) {
         return Err(backup_removal_error("sync restored file", WorkflowError::SourceChanged(current.to_owned()), None));
     }
+    #[cfg(target_os = "macos")]
     // F_FULLFSYNC (51) asks the device to flush data, not merely the OS cache.
     if unsafe { fcntl(file.as_raw_fd(), 51) } != 0 {
         return Err(backup_removal_error("sync restored file", io::Error::last_os_error(), None));
     }
+    #[cfg(target_os = "linux")]
+    file.sync_all().map_err(|e| backup_removal_error("sync restored file", e, None))?;
     let current_stamp = stamp(current, "reinspect restored file before backup removal")
         .map_err(|e| backup_removal_error("sync restored file", e, None))?;
     if !same_moved_file(current_stamp, expected) {
@@ -1536,6 +2492,7 @@ fn sync_restored(current: &Path, expected: Stamp) -> Result<(), BackupRemovalErr
     let parent = current.parent().ok_or_else(|| backup_removal_error("sync restored directory", "restored file has no parent", None))?;
     let directory = File::open(parent).map_err(|e| backup_removal_error("sync restored directory", e, None))?;
     directory.sync_all().map_err(|e| backup_removal_error("sync restored directory", e, None))?;
+    #[cfg(target_os = "macos")]
     if unsafe { fcntl(directory.as_raw_fd(), 51) } != 0 {
         let error = io::Error::last_os_error();
         // A directory may not support F_FULLFSYNC; the required fsync succeeded.
@@ -1554,7 +2511,7 @@ fn quarantine_cleanup_error(workspace: &Workspace, mut error: BackupRemovalError
 }
 
 fn undo_quarantined_backup(workspace: &Workspace, backup: &Path, mut error: BackupRemovalError, entry_is_backup: bool) -> BackupRemovalError {
-    match move_no_replace(&workspace.staged, backup) {
+    match move_no_replace(workspace, &workspace.staged, backup) {
         Ok(()) => {
             if entry_is_backup { error.retained_path = Some(backup.to_owned()); }
             else { error.retained_path = None; error.unexpected_path = Some(backup.to_owned()); }
@@ -1562,8 +2519,8 @@ fn undo_quarantined_backup(workspace: &Workspace, backup: &Path, mut error: Back
         }
         Err(rollback) => {
             error.message.push_str(&format!("; unable to return quarantined entry: {rollback}"));
-            if entry_is_backup { error.retained_path = Some(workspace.staged.clone()); }
-            else { error.retained_path = None; error.unexpected_path = Some(workspace.staged.clone()); }
+            if entry_is_backup { error.retained_path = Some(workspace.recovery_path(&workspace.staged)); }
+            else { error.retained_path = None; error.unexpected_path = Some(workspace.recovery_path(&workspace.staged)); }
             error
         }
     }
@@ -1615,7 +2572,7 @@ fn remove_verified_backup_reserved(restored: &Path, backup: &Path, expected: Sta
             backup_path_error("reinspect verified backup", WorkflowError::BackupChanged(backup.to_owned()), backup, expected))));
     }
     #[cfg(test)] if let Some(hook) = before_move { hook(); }
-    if let Err(error) = move_no_replace(backup, &workspace.staged) {
+    if let Err(error) = move_no_replace(&workspace, backup, &workspace.staged) {
         return (false, Some(quarantine_cleanup_error(&workspace,
             backup_path_error("quarantine verified backup", error, backup, expected))));
     }
@@ -1632,7 +2589,7 @@ fn remove_verified_backup_reserved(restored: &Path, backup: &Path, expected: Sta
         let error = backup_removal_error("verify quarantined backup", cause, None);
         return (false, Some(undo_quarantined_backup(&workspace, backup, error, false)));
     }
-    if let Err(error) = fs::remove_file(&workspace.staged) {
+    if let Err(error) = workspace.unlink_owned(&workspace.staged, (moved.dev, moved.ino)) {
         let error = backup_removal_error("remove verified backup", error, retained());
         return (false, Some(undo_quarantined_backup(&workspace, backup, error, true)));
     }
@@ -1674,7 +2631,7 @@ struct HeldRestore {
 }
 impl HeldRestore {
     fn retain_failure(mut self, cause: WorkflowError, rollback: Option<WorkflowError>) -> WorkflowError {
-        let recovery = self.workspace.displaced();
+        let recovery = self.workspace.recovery_path(&self.workspace.displaced());
         let cleanup = release_reservations(&mut self.reservations);
         transaction_error(cause, None, Some(recovery), rollback, cleanup, true)
     }
@@ -1685,7 +2642,7 @@ impl HeldRestore {
             let cause = WorkflowError::SourceChanged(self.current.clone());
             return Err(self.retain_failure(cause, None));
         }
-        if let Err(error) = fs::remove_file(&displaced) {
+        if let Err(error) = self.workspace.unlink_owned(&displaced, (self.original.stamp.dev, self.original.stamp.ino)) {
             return Err(self.retain_failure(io_error("remove retained processed original", &displaced, error), None));
         }
         let mut cleanup = self.workspace.cleanup(false);
@@ -1700,7 +2657,7 @@ impl HeldRestore {
             let cause = invalid(&self.current, "restore rollback identity or contents changed");
             return Err(self.retain_failure(cause, None));
         }
-        if let Err(error) = swap_paths(&displaced, &self.current) {
+        if let Err(error) = swap_paths(&self.workspace, &displaced, &self.current) {
             let cause = invalid(&self.current, "restore rollback swap failed");
             return Err(self.retain_failure(cause, Some(error)));
         }
@@ -1708,7 +2665,7 @@ impl HeldRestore {
             let cause = invalid(&self.current, "restore rollback displaced an unexpected entry");
             return Err(self.retain_failure(cause, None));
         }
-        if let Err(error) = fs::remove_file(&displaced) {
+        if let Err(error) = self.workspace.unlink_owned(&displaced, (self.restored.stamp.dev, self.restored.stamp.ino)) {
             return Err(self.retain_failure(io_error("remove rolled-back restore copy", &displaced, error), None));
         }
         let mut cleanup = self.workspace.cleanup(false);
@@ -1788,9 +2745,9 @@ fn restore_impl(processed: &Path, backup: &Path, marker: Option<&Marker>, status
     let mut completed_cleanup = None;
     let mut saved_pins = None;
     let attempt = (|| {
-        copy_new_verified(&backup_real, &workspace.staged, backup_stamp)?;
+        copy_new_verified(&backup_real, &workspace.staged, backup_stamp, Some(&workspace))?;
         verify_backup(&workspace.staged, &backup_real, backup_stamp)?;
-        let staged_stamp = stamp(&workspace.staged, "inspect verified restore copy")?;
+        let staged_stamp = workspace.stage_stamp("inspect verified restore copy")?;
         check_stamp(&current, current_stamp)?;
         check_stamp(&backup_real, backup_stamp)?;
         if preserve_original {
@@ -1802,8 +2759,8 @@ fn restore_impl(processed: &Path, backup: &Path, marker: Option<&Marker>, status
         check_stamp(&current, current_stamp)?;
         check_stamp(&backup_real, backup_stamp)?;
         if let Some(frozen) = frozen_backup { frozen.verify(&backup_real)?; }
-        check_stamp(&workspace.staged, staged_stamp)?;
-        commit_replacing(&current, &current, &workspace.staged, &workspace.displaced(), current_stamp, staged_stamp,
+        workspace.check_stage_stamp(staged_stamp)?;
+        commit_replacing(&workspace, &current, &current, &workspace.staged, &workspace.displaced(), current_stamp, staged_stamp,
             None, Some((backup_real.as_path(), backup_stamp)), preserve_original, #[cfg(test)] None)?;
         verify_backup(&current, &backup_real, backup_stamp).map_err(|cause| CommitFailure {
             cause, rollback: None, recovery: preserve_original.then(|| workspace.displaced()), published: true,
@@ -1848,7 +2805,8 @@ fn restore_impl(processed: &Path, backup: &Path, marker: Option<&Marker>, status
                 let mut cleanup = workspace.cleanup(error.recovery.is_some());
                 cleanup.extend(release_reservations(&mut reservations)); cleanup
             });
-            Err(transaction_error(error.cause, Some(backup_real), error.recovery, error.rollback, cleanup, error.published))
+            let recovery = error.recovery.map(|path| workspace.recovery_path(&path));
+            Err(transaction_error(error.cause, Some(backup_real), recovery, error.rollback, cleanup, error.published))
         }
     }
 }
@@ -2065,6 +3023,7 @@ mod tests {
 
     // Test-only calls use the same declarations as sys/xattr.h, sys/acl.h,
     // membership.h and sys/stat.h in the macOS SDK.
+    #[cfg(target_os = "macos")]
     #[link(name = "System")]
     unsafe extern "C" {
         fn fsetxattr(fd: c_int, name: *const c_char, value: *const c_void, size: usize, position: u32, options: c_int) -> c_int;
@@ -2080,11 +3039,13 @@ mod tests {
         fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> c_int;
     }
 
+    #[cfg(target_os = "macos")]
     fn set_xattr(file: &File, name: &CString, value: &[u8]) {
         // SAFETY: name and value are live, and the descriptor is open.
         assert_eq!(unsafe { fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) }, 0);
     }
 
+    #[cfg(target_os = "macos")]
     fn set_resource_fork(file: &File, name: &CString, bytes: &[u8]) {
         for (index, chunk) in bytes.chunks(65536).enumerate() {
             // SAFETY: resource-fork writes support offsets; the chunk is live.
@@ -2092,12 +3053,14 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn read_resource_fork(file: &File, path: &Path, name: &CString, bytes: &mut [u8]) {
         for (index, chunk) in bytes.chunks_mut(65536).enumerate() {
             read_xattr(file, path, name, chunk, (index * 65536) as u32).unwrap();
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn add_test_acl(file: &File) {
         let mut uuid = [0u8; 16];
         let uid = file.metadata().unwrap().uid();
@@ -2156,6 +3119,614 @@ mod tests {
     impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
 
     #[test]
+    fn failed_alias_resolution_cleans_workspace_and_existing_reservation() {
+        let fixture = Fixture::new();
+        let reservation = Reservation::acquire(&fixture.0.join("song.wav")).unwrap();
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+        let error = Workspace::create_impl(&fixture.0, "wav", true, None).err().unwrap();
+        assert!(error.to_string().contains("injected workspace alias failure"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+        reservation.release().unwrap();
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn swapped_workspace_directory_never_changes_foreign_mode_or_acl() {
+        let fixture = Fixture::new();
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o770)).unwrap();
+        let foreign = fixture.0.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o750)).unwrap();
+        let foreign_file = File::open(&foreign).unwrap();
+        #[cfg(target_os = "macos")]
+        add_test_acl(&foreign_file);
+        #[cfg(target_os = "linux")]
+        {
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            for (tag, permissions, id) in [
+                (0x01u16, 0x07u16, u32::MAX), (0x02, 0x04, unsafe { libc::geteuid() }.wrapping_add(1)),
+                (0x04, 0x05, u32::MAX), (0x10, 0x05, u32::MAX), (0x20, 0x00, u32::MAX),
+            ] {
+                acl.extend_from_slice(&tag.to_le_bytes()); acl.extend_from_slice(&permissions.to_le_bytes());
+                acl.extend_from_slice(&id.to_le_bytes());
+            }
+            let status = unsafe { libc::fsetxattr(foreign_file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
+            if status != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EOPNOTSUPP) || std::env::var_os("PN_REQUIRE_TEST_ACL").is_some() {
+                    panic!("set synthetic foreign ACL: {error}");
+                }
+            }
+        }
+        let before_mode = foreign_file.metadata().unwrap().mode() & 0o7777;
+        #[cfg(target_os = "macos")]
+        let before_acl = acl_bytes(&foreign_file, &foreign).unwrap();
+        #[cfg(target_os = "linux")]
+        let before_acl = xattr_names(&foreign_file, &foreign).unwrap().into_iter()
+            .filter(|name| name.as_bytes() == b"system.posix_acl_access")
+            .map(|name| { let size = xattr_size(&foreign_file, &foreign, &name).unwrap(); let mut bytes = vec![0; size];
+                read_xattr(&foreign_file, &foreign, &name, &mut bytes, 0).unwrap(); bytes }).collect::<Vec<_>>();
+        let created_moved = fixture.0.join("created-workspace-moved");
+        let captured = Arc::new(Mutex::new(None));
+        let result_path = Arc::clone(&captured);
+        let error = Workspace::create_impl(&fixture.0, "wav", false, Some(Box::new(move |workspace| {
+            fs::rename(workspace, &created_moved).unwrap();
+            fs::rename(&foreign, workspace).unwrap();
+            *result_path.lock().unwrap() = Some(workspace.to_owned());
+        }))).err().unwrap();
+        assert!(error.to_string().contains("workspace changed before it could be pinned"));
+        let current = captured.lock().unwrap().clone().unwrap();
+        assert!(current.is_dir());
+        assert_eq!(foreign_file.metadata().unwrap().mode() & 0o7777, before_mode);
+        #[cfg(target_os = "macos")]
+        assert_eq!(acl_bytes(&foreign_file, &current).unwrap(), before_acl);
+        #[cfg(target_os = "linux")]
+        {
+            let after_acl = xattr_names(&foreign_file, &current).unwrap().into_iter()
+                .filter(|name| name.as_bytes() == b"system.posix_acl_access")
+                .map(|name| { let size = xattr_size(&foreign_file, &current, &name).unwrap(); let mut bytes = vec![0; size];
+                    read_xattr(&foreign_file, &current, &name, &mut bytes, 0).unwrap(); bytes }).collect::<Vec<_>>();
+            assert_eq!(after_acl, before_acl);
+        }
+    }
+
+    #[test]
+    fn restrictive_umask_refuses_without_stranding_a_reservation() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "PN_TEST_WORKSPACE_UMASK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let error = Reservation::acquire(&path.join("song.wav")).err().unwrap();
+            assert!(error.to_string().contains("workspace"));
+            assert!(!path.join(".song.wav.pn-reservation").exists());
+            return;
+        }
+        let fixture = Fixture::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg("--exact").arg("file_workflow::tests::restrictive_umask_refuses_without_stranding_a_reservation")
+            .arg("--nocapture").env(CHILD, &fixture.0);
+        unsafe { child.pre_exec(|| { libc::umask(0o400); Ok(()) }); }
+        assert!(child.status().unwrap().success());
+        for entry in fs::read_dir(&fixture.0).unwrap() {
+            fs::set_permissions(entry.unwrap().path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_macos_acl_is_refused_without_stranding_a_reservation() {
+        let fixture = Fixture::new();
+        let status = std::process::Command::new("/bin/chmod").args(["+a",
+            "everyone allow list,add_file,search,add_subdirectory,delete_child,file_inherit,directory_inherit"])
+            .arg(&fixture.0).status().unwrap();
+        assert!(status.success());
+        let error = Reservation::acquire(&fixture.0.join("song.wav")).err().unwrap();
+        assert!(error.to_string().contains("extended ACL"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_mp3_preserves_destination_default_acl_and_mode() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav");
+        fs::write(&source, b"source").unwrap();
+        let parent = File::open(&fixture.0).unwrap();
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01u16, 0x07u16, u32::MAX), (0x02, 0x06, unsafe { libc::geteuid() }.wrapping_add(1)),
+            (0x04, 0x06, u32::MAX), (0x10, 0x06, u32::MAX), (0x20, 0x00, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes()); acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let status = unsafe { libc::fsetxattr(parent.as_raw_fd(), c"system.posix_acl_default".as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
+        if status != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) && std::env::var_os("PN_REQUIRE_TEST_ACL").is_none() { return; }
+            panic!("set synthetic default ACL: {error}");
+        }
+        let reference = fixture.0.join("ordinary.mp3");
+        let reference_file = OpenOptions::new().write(true).create_new(true).mode(0o666).open(&reference).unwrap();
+        let get_acl = |file: &File| {
+            let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+            assert!(size > 0);
+            let mut bytes = vec![0u8; size as usize];
+            assert_eq!(unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), bytes.as_mut_ptr().cast(), bytes.len()) }, size);
+            bytes
+        };
+        let expected_acl = get_acl(&reference_file);
+        let expected_mode = reference_file.metadata().unwrap().mode() & 0o7777;
+        assert_eq!(expected_mode, 0o660);
+        let files = discover_inputs(&[source]).unwrap();
+        let plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Mp3 }, None).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&files[0].path).unwrap()).unwrap();
+        let mut stage = tx.create_stage().unwrap();
+        stage.write_all(b"synthetic mp3").unwrap();
+        let output = tx.finish(&Cancellation::new()).unwrap().destination;
+        let output_file = File::open(&output).unwrap();
+        assert_eq!(output_file.metadata().unwrap().mode() & 0o7777, expected_mode);
+        assert_eq!(get_acl(&output_file), expected_acl);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_state_refuses_extended_acl_even_with_safe_mode_bits() {
+        let fixture = Fixture::new();
+        let state = fixture.0.join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(&state).unwrap();
+        add_test_acl(&directory);
+        assert!(require_no_extended_acl(&directory, &state).is_err());
+        let settings = crate::settings::SettingsStore::new(&state, &fixture.0, 1);
+        assert!(settings.load().is_err());
+        let statistics = crate::statistics::StatisticsStore::new(&state);
+        assert!(statistics.show(&Cancellation::new()).is_err());
+        assert!(!state.join("settings.lock").exists());
+        assert!(!state.join("statistics.lock").exists());
+    }
+
+    #[test]
+    fn workspace_symlink_swap_never_redirects_stage_or_cleanup() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source.wav");
+        let output = fixture.0.join("output"); let victim = fixture.0.join("victim");
+        fs::create_dir(&output).unwrap(); fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::write(&source, b"original").unwrap();
+        fs::write(victim.join("output.wav"), b"victim").unwrap();
+        let selected = discover_inputs(&[source.clone()]).unwrap();
+        let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: output.clone(), mirror: false }, format: AudioFormat::Wav };
+        let plan = OutputPlan::new(&selected[0], SourceCodec::Lpcm, &settings, None).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        let original_name = tx.workspace.directory.clone();
+        let moved = output.join("moved-workspace");
+        fs::rename(&original_name, &moved).unwrap();
+        symlink(&victim, &original_name).unwrap();
+        fs::write(tx.staging_path(), b"private candidate").unwrap();
+        tx.remember_staging_file().unwrap();
+        let error = tx.abort().unwrap_err();
+        assert!(matches!(error, WorkflowError::Transaction { published: false, .. }));
+        assert_eq!(fs::read(victim.join("output.wav")).unwrap(), b"victim");
+        assert!(fs::symlink_metadata(&original_name).unwrap().file_type().is_symlink());
+        assert!(!moved.join("output.wav").exists());
+    }
+
+    #[test]
+    fn reservation_swap_is_quarantined_without_deleting_an_unowned_file() {
+        let fixture = Fixture::new();
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o770)).unwrap();
+        let reservation = Reservation::acquire(&fixture.0.join("song.wav")).unwrap();
+        let path = reservation.path.clone();
+        let saved = fixture.0.join("saved-reservation");
+        let changed = path.clone(); let saved_for_hook = saved.clone();
+        let error = reservation.release_impl(Some(Box::new(move || {
+            fs::rename(&changed, &saved_for_hook).unwrap();
+            fs::write(&changed, b"unowned file").unwrap();
+        }))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(path).unwrap(), b"unowned file");
+        assert!(saved.exists());
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn rewritten_stage_remains_pinned_across_fd_churn() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav"); fs::write(&source, b"source").unwrap();
+        let selected = discover_inputs(&[source.clone()]).unwrap();
+        let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
+        let plan = OutputPlan::new(&selected[0], SourceCodec::Lpcm, &settings, None).unwrap();
+        let iterations = std::env::var("PN_WORKFLOW_PIN_STRESS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+        for _ in 0..iterations {
+            let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+            fs::write(tx.staging_path(), b"before").unwrap();
+            tx.remember_staging_file().unwrap();
+            let rewrite = tx.workspace.alias.join("output.wav_");
+            fs::write(&rewrite, b"tagged").unwrap();
+            fs::rename(&rewrite, tx.staging_path()).unwrap();
+            tx.accept_tag_rewrite().unwrap();
+            let expected = tx.workspace.stage_stamp("capture rewritten stage").unwrap();
+            for _ in 0..3 {
+                let other = Workspace::create(&fixture.0, "caf").unwrap();
+                assert!(other.cleanup(false).is_empty());
+                let open = tx.workspace.open_entry(tx.staging_path()).unwrap();
+                assert_eq!(metadata_stamp(&open.metadata().unwrap()), expected);
+                drop(open);
+            }
+            assert_eq!(tx.workspace.stage_stamp("reinspect rewritten stage").unwrap(), expected);
+            let publication = tx.finish(&Cancellation::new()).unwrap();
+            assert_eq!(fs::read(&publication.destination).unwrap(), b"tagged");
+            fs::remove_file(publication.destination).unwrap();
+        }
+    }
+
+    #[test]
+    fn renamed_output_parent_is_detected_before_and_after_publication() {
+        for after_publish in [false, true] {
+            let fixture = Fixture::new();
+            let source = fixture.0.join("song.wav"); fs::write(&source, b"source").unwrap();
+            let out = fixture.0.join("out"); fs::create_dir(&out).unwrap();
+            let selected = discover_inputs(&[source.clone()]).unwrap();
+            let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: out, mirror: false }, format: AudioFormat::Wav };
+            let plan = OutputPlan::new(&selected[0], SourceCodec::Lpcm, &settings, None).unwrap();
+            let mut tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+            fs::write(tx.staging_path(), b"encoded").unwrap();
+            let parent = plan.destination().parent().unwrap().to_owned();
+            let moved = parent.parent().unwrap().join("moved-output");
+            let old = parent.clone(); let new = moved.clone();
+            let hook = Box::new(move || {
+                fs::rename(&old, &new).unwrap();
+                fs::create_dir(&old).unwrap();
+                fs::write(old.join(".song_PN.wav.pn-reservation"), b"unrelated").unwrap();
+            });
+            if after_publish { tx.after_publish = Some(hook); } else { tx.before_commit = Some(hook); }
+            let error = tx.finish(&Cancellation::new()).unwrap_err();
+            let moved_output = moved.join("song_PN.wav");
+            match error {
+                WorkflowError::Transaction { cause, recovery, published, .. } => {
+                    assert_eq!(published, after_publish);
+                    assert!(matches!(*cause, WorkflowError::InvalidPath { path, .. } if path == moved_output));
+                    if after_publish {
+                        assert_eq!(fs::read(&moved_output).unwrap(), b"encoded");
+                        assert_eq!(fs::read(recovery.unwrap()).unwrap(), b"encoded");
+                    } else { assert!(recovery.is_none()); assert!(!moved_output.exists()); }
+                }
+                e => panic!("{e}"),
+            }
+            assert_eq!(fs::read(parent.join(".song_PN.wav.pn-reservation")).unwrap(), b"unrelated");
+            assert!(!moved.join(".song_PN.wav.pn-reservation").exists());
+            assert_eq!(fs::read(source).unwrap(), b"source");
+        }
+    }
+
+    #[test]
+    fn unrecorded_and_replaced_stages_are_not_deleted() {
+        let fixture = Fixture::new();
+        for replace in [false, true] {
+            let source = fixture.0.join(if replace { "second.wav" } else { "first.wav" });
+            fs::write(&source, b"source").unwrap();
+            let selected = discover_inputs(&[source.clone()]).unwrap();
+            let plan = OutputPlan::new(&selected[0], SourceCodec::Lpcm,
+                &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+            let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+            let stage = tx.workspace.directory.join("output.wav");
+            fs::write(tx.staging_path(), b"first").unwrap();
+            if replace {
+                tx.remember_staging_file().unwrap();
+                fs::rename(tx.staging_path(), tx.workspace.alias.join("saved")).unwrap();
+                fs::write(tx.staging_path(), b"foreign").unwrap();
+            }
+            assert!(tx.abort().is_err());
+            assert_eq!(fs::read(stage).unwrap(), if replace { b"foreign".as_slice() } else { b"first".as_slice() });
+        }
+    }
+
+    #[test]
+    fn unknown_sensitivity_refuses_batch_collisions() {
+        let fixture = Fixture::new();
+        let a = fixture.0.join("a"); let b = fixture.0.join("b"); let out = fixture.0.join("out");
+        fs::create_dir(&a).unwrap(); fs::create_dir(&b).unwrap(); fs::create_dir(&out).unwrap();
+        let upper = a.join("Song.wav"); let lower = b.join("song.wav");
+        fs::write(&upper, b"a").unwrap(); fs::write(&lower, b"b").unwrap();
+        let selected = discover_inputs(&[upper, lower]).unwrap();
+        let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: out, mirror: false }, format: AudioFormat::Wav };
+        let plans = selected.iter().map(|file| OutputPlan::new(file, SourceCodec::Lpcm, &settings, None).unwrap()).collect::<Vec<_>>();
+        let unknown = |_: &Path| Ok(policy_for_fs_type(b"other", pathconf_case_sensitive(-1)));
+        assert!(matches!(validate_batch_with_policy(&plans, &selected, &unknown), Err(WorkflowError::DestinationConflict { .. })));
+        assert!(!pathconf_case_sensitive(0)); assert!(pathconf_case_sensitive(1));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!linux_case_sensitive(None));
+            assert!(linux_case_sensitive(Some(0)));
+            assert!(!linux_case_sensitive(Some(0x4000_0000)));
+            let unknown_linux = |_: &Path| Ok(NamePolicy { normalization: NameNormalization::Bytes,
+                case_sensitive: linux_case_sensitive(None) });
+            assert!(matches!(validate_batch_with_policy(&plans, &selected, &unknown_linux), Err(WorkflowError::DestinationConflict { .. })));
+        }
+    }
+
+    #[test]
+    fn mp3_final_mode_matches_create_and_overwrite_preserves_mode() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav"); fs::write(&source, b"source").unwrap();
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Mp3 };
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        let mode = tx.new_mp3_mode.unwrap();
+        let probe = tx.workspace.alias.join("ordinary");
+        OpenOptions::new().write(true).create_new(true).mode(0o666).open(&probe).unwrap();
+        assert_eq!(fs::metadata(&probe).unwrap().mode() & 0o7777, mode);
+        fs::remove_file(probe).unwrap();
+        OpenOptions::new().write(true).create_new(true).mode(0o600).open(tx.staging_path()).unwrap();
+        assert_eq!(fs::metadata(tx.staging_path()).unwrap().mode() & 0o077, 0);
+        let result = tx.finish(&Cancellation::new()).unwrap();
+        assert_eq!(fs::metadata(&result.destination).unwrap().mode() & 0o7777, mode);
+        fs::set_permissions(&result.destination, fs::Permissions::from_mode(0o640)).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        OpenOptions::new().write(true).create_new(true).mode(0o600).open(tx.staging_path()).unwrap();
+        let result = tx.finish(&Cancellation::new()).unwrap();
+        assert!(result.replaced_existing_output);
+        assert_eq!(fs::metadata(result.destination).unwrap().mode() & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn overwrite_preserves_group_and_effective_acl() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav"); let destination = fixture.0.join("song_PN.wav");
+        fs::write(&source, b"source").unwrap(); fs::write(&destination, b"old output").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+        let original = OpenOptions::new().read(true).write(true).open(&destination).unwrap();
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        if count > 0 { assert_eq!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) }, count); }
+        if let Some(group) = groups.into_iter().find(|group| u64::from(*group) != u64::from(original.metadata().unwrap().gid())) {
+            assert_eq!(unsafe { libc::fchown(original.as_raw_fd(), !0 as libc::uid_t, group) }, 0);
+        }
+        #[cfg(target_os = "macos")]
+        add_test_acl(&original);
+        #[cfg(target_os = "linux")]
+        let acl_supported = {
+            let name = CString::new("system.posix_acl_access").unwrap();
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            for (tag, permissions, id) in [
+                (0x01u16, 0x06u16, u32::MAX), (0x02, 0x04, unsafe { libc::geteuid() }.wrapping_add(1)),
+                (0x04, 0x04, u32::MAX), (0x10, 0x04, u32::MAX), (0x20, 0x00, u32::MAX),
+            ] {
+                acl.extend_from_slice(&tag.to_le_bytes()); acl.extend_from_slice(&permissions.to_le_bytes());
+                acl.extend_from_slice(&id.to_le_bytes());
+            }
+            let status = unsafe { libc::fsetxattr(original.as_raw_fd(), name.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
+            if status != 0 {
+                let error = io::Error::last_os_error();
+                assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "set ACL: {error}");
+                false
+            } else { true }
+        };
+        let before = original.metadata().unwrap();
+        #[cfg(target_os = "macos")]
+        let before_acl = acl_bytes(&original, &destination).unwrap();
+        #[cfg(target_os = "linux")]
+        let acl_name = CString::new("system.posix_acl_access").unwrap();
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        fs::write(tx.staging_path(), b"new output").unwrap();
+        tx.finish(&Cancellation::new()).unwrap();
+        let result = open_read(&destination).unwrap();
+        let after = result.metadata().unwrap();
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
+        #[cfg(target_os = "macos")]
+        assert_eq!(acl_bytes(&result, &destination).unwrap(), before_acl);
+        #[cfg(target_os = "linux")]
+        if acl_supported { assert!(xattr_values_equal(&original, &result, &destination, &destination, &acl_name).unwrap()); }
+        assert_eq!(fs::read(destination).unwrap(), b"new output");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a synthetic externally prepared non-member group fixture"]
+    fn overwrite_refuses_when_existing_group_cannot_be_preserved() {
+        let directory = PathBuf::from(std::env::var_os("PN_GROUP_DENIED_FIXTURE").unwrap());
+        let source = directory.join("song.wav"); let destination = directory.join("song_PN.wav");
+        let before = fs::metadata(&destination).unwrap();
+        assert_eq!(before.uid(), unsafe { libc::geteuid() });
+        assert_ne!(before.gid(), unsafe { libc::getegid() });
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        fs::write(tx.staging_path(), b"new output").unwrap();
+        let error = tx.finish(&Cancellation::new()).unwrap_err();
+        assert!(error.to_string().contains("preserve overwritten output owner and group"), "{error}");
+        assert_eq!(fs::read(destination).unwrap(), b"old output");
+        assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a synthetic externally prepared supplementary group fixture"]
+    fn overwrite_preserves_an_authorized_other_group() {
+        let directory = PathBuf::from(std::env::var_os("PN_GROUP_ALLOWED_FIXTURE").unwrap());
+        let source = directory.join("song.wav"); let destination = directory.join("song_PN.wav");
+        let before = fs::metadata(&destination).unwrap();
+        assert_eq!(before.uid(), unsafe { libc::geteuid() });
+        assert_ne!(before.gid(), unsafe { libc::getegid() });
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        fs::write(tx.staging_path(), b"new output").unwrap();
+        tx.finish(&Cancellation::new()).unwrap();
+        assert_eq!(fs::metadata(&destination).unwrap().gid(), before.gid());
+        assert_eq!(fs::read(destination).unwrap(), b"new output");
+        assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a synthetic root-owned workspace with another file owner"]
+    fn overwrite_preserves_another_owner_when_permitted() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let directory = PathBuf::from(std::env::var_os("PN_OWNER_ALLOWED_FIXTURE").unwrap());
+        let source = directory.join("song.wav"); let destination = directory.join("song_PN.wav");
+        let before = fs::metadata(&destination).unwrap();
+        assert_ne!(before.uid(), unsafe { libc::geteuid() });
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        fs::write(tx.staging_path(), b"new output").unwrap();
+        tx.finish(&Cancellation::new()).unwrap();
+        let after = fs::metadata(&destination).unwrap();
+        assert_eq!((after.uid(), after.gid(), after.mode() & 0o7777), (before.uid(), before.gid(), before.mode() & 0o7777));
+        assert_eq!(fs::read(destination).unwrap(), b"new output");
+    }
+
+    #[test]
+    fn new_output_sync_failures_report_publication_in_both_branches() {
+        for overwrite in [false, true] {
+            let fixture = Fixture::new();
+            let source = fixture.0.join("song.wav");
+            fs::write(&source, b"original").unwrap();
+            let files = discover_inputs(&[source.clone()]).unwrap();
+            let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+                &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+            if overwrite {
+                plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+            }
+            let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+            fs::write(tx.staging_path(), b"processed").unwrap();
+            *tx.workspace.sync_error.lock().unwrap() = Some(io::Error::other("injected output sync failure"));
+            let error = tx.finish(&Cancellation::new()).unwrap_err();
+            let recovery = match error {
+                WorkflowError::Transaction { recovery: Some(path), published: true, .. } => path,
+                error => panic!("overwrite={overwrite}: {error}"),
+            };
+            assert_eq!(fs::read(plan.destination()).unwrap(), b"processed");
+            assert_eq!(fs::read(recovery).unwrap(), b"processed");
+            assert_eq!(fs::read(source).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn sync_failures_keep_verified_backup_and_displaced_original() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav"); let backups = fixture.0.join("backups");
+        fs::create_dir(&backups).unwrap(); fs::write(&source, b"original").unwrap();
+        let selected = discover_inputs(&[source.clone()]).unwrap();
+        let settings = OutputSettings { mode: OutputMode::Replace { backup_directory: backups }, format: AudioFormat::Wav };
+        let plan = OutputPlan::new(&selected[0], SourceCodec::Lpcm, &settings, None).unwrap();
+        let identity = FileIdentity::capture(&source).unwrap();
+        let error = plan.begin_impl(&identity, Some(Box::new(|backup| {
+            Err(io_error("sync verified backup directory", backup, io::Error::other("injected")))
+        }))).err().unwrap();
+        let backup = match error { WorkflowError::Transaction { backup: Some(path), published: false, .. } => path, e => panic!("{e}") };
+        assert_eq!(fs::read(&source).unwrap(), b"original"); assert_eq!(fs::read(backup).unwrap(), b"original");
+        let tx = plan.begin(&identity).unwrap();
+        let backup = tx.backup_path().unwrap().to_owned();
+        fs::write(tx.staging_path(), b"processed").unwrap();
+        *tx.workspace.sync_error.lock().unwrap() = Some(io::Error::other("injected output sync failure"));
+        let error = tx.finish(&Cancellation::new()).unwrap_err();
+        let recovery = match error { WorkflowError::Transaction { recovery: Some(path), published: true, .. } => path, e => panic!("{e}") };
+        assert_eq!(fs::read(source).unwrap(), b"processed");
+        assert_eq!(fs::read(backup).unwrap(), b"original");
+        assert_eq!(fs::read(recovery).unwrap(), b"original");
+    }
+
+    #[test]
+    fn overwrite_sync_failure_retains_the_displaced_output() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("song.wav"); let destination = fixture.0.join("song_PN.wav");
+        fs::write(&source, b"source").unwrap(); fs::write(&destination, b"old").unwrap();
+        let files = discover_inputs(&[source.clone()]).unwrap();
+        let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm,
+            &OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav }, None).unwrap();
+        plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
+        let tx = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+        fs::write(tx.staging_path(), b"new").unwrap();
+        *tx.workspace.sync_error.lock().unwrap() = Some(io::Error::other("injected output sync failure"));
+        let error = tx.finish(&Cancellation::new()).unwrap_err();
+        let recovery = match error { WorkflowError::Transaction { recovery: Some(path), published: true, .. } => path, e => panic!("{e}") };
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+        assert_eq!(fs::read(recovery).unwrap(), b"old");
+        assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_comparison_excludes_only_uncopyable_provenance() {
+        let source_names = [b"com.apple.provenance".as_slice(), b"com.apple.macl", b"com.apple.quarantine", b"com.example.test"];
+        let copy_names = [b"com.apple.macl".as_slice(), b"com.apple.quarantine", b"com.example.test"];
+        fn filtered(names: &[&'static [u8]]) -> Vec<&'static [u8]> {
+            names.iter().copied().filter(|name| comparable_xattr(name)).collect()
+        }
+        assert_eq!(filtered(&source_names), filtered(&copy_names));
+        assert!(!comparable_xattr(b"com.apple.provenance"));
+        assert!(comparable_xattr(b"com.apple.macl"));
+        assert!(comparable_xattr(b"com.apple.quarantine"));
+        assert!(comparable_xattr(b"com.apple.root.installed"));
+        assert!(comparable_xattr(b"com.apple.provenance#extra"));
+
+        let fixture = Fixture::new();
+        let original_path = fixture.0.join("original");
+        let copy_path = fixture.0.join("copy");
+        fs::write(&original_path, b"same").unwrap(); fs::write(&copy_path, b"same").unwrap();
+        let original = OpenOptions::new().read(true).write(true).open(&original_path).unwrap();
+        let copy = OpenOptions::new().read(true).write(true).open(&copy_path).unwrap();
+        let name = CString::new("com.example.test").unwrap();
+        set_xattr(&original, &name, b"original"); set_xattr(&copy, &name, b"different");
+        assert!(!xattrs_equal(&original, &copy, &original_path, &copy_path).unwrap());
+        set_xattr(&copy, &name, b"original");
+        assert!(xattrs_equal(&original, &copy, &original_path, &copy_path).unwrap());
+        let before = overwrite_metadata(&original, &original_path).unwrap();
+        set_xattr(&original, &name, b"modified");
+        let after = overwrite_metadata(&original, &original_path).unwrap();
+        assert!(before != after);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copied_xattrs_restore_quarantine_and_other_differences_exactly() {
+        let fixture = Fixture::new();
+        let source_path = fixture.0.join("source");
+        let copied_path = fixture.0.join("copied");
+        let verified_path = fixture.0.join("verified");
+        fs::write(&source_path, b"same data").unwrap(); fs::write(&copied_path, b"same data").unwrap();
+        let source = OpenOptions::new().read(true).write(true).open(&source_path).unwrap();
+        let copied = OpenOptions::new().read(true).write(true).open(&copied_path).unwrap();
+        let quarantine = CString::new("com.apple.quarantine").unwrap();
+        let custom = CString::new("com.example.metadata").unwrap();
+        let extra = CString::new("com.example.extra").unwrap();
+        set_xattr(&source, &quarantine, b"0081;12345678;platinum-unit;https://example.invalid/");
+        set_xattr(&source, &custom, b"source value");
+        assert_eq!(unsafe { fcopyfile(source.as_raw_fd(), copied.as_raw_fd(), std::ptr::null_mut(), COPYFILE_METADATA) }, 0);
+        set_xattr(&copied, &quarantine, b"0083;87654321;other;https://example.invalid/");
+        set_xattr(&copied, &custom, b"different");
+        set_xattr(&copied, &extra, b"extra");
+        assert!(!xattrs_equal(&source, &copied, &source_path, &copied_path).unwrap());
+        reconcile_copied_xattrs(&source, &copied, &source_path, &copied_path, None).unwrap();
+        assert!(xattrs_equal(&source, &copied, &source_path, &copied_path).unwrap());
+        assert!(!xattr_names(&copied, &copied_path).unwrap().contains(&extra));
+        let source_stamp = stamp(&source_path, "capture source").unwrap();
+        copy_new_verified(&source_path, &verified_path, source_stamp, None).unwrap();
+        let verified = open_read(&verified_path).unwrap();
+        assert!(xattrs_equal(&source, &verified, &source_path, &verified_path).unwrap());
+    }
+
+    #[test]
     fn overwrite_swapped_entry_is_verified_and_races_are_rolled_back() {
         use std::os::unix::fs::symlink;
         for mode in 0..3 {
@@ -2169,7 +3740,7 @@ mod tests {
             let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
             let guard = Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap());
             plan.enable_overwrite(guard).unwrap();
-            validate_batch(&[&plan]).unwrap();
+            validate_batch(&[&plan], &files).unwrap();
             let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
             fs::write(transaction.staging_path(), b"candidate").unwrap();
             let target = plan.destination().to_owned(); let changed = target.clone();
@@ -2207,7 +3778,7 @@ mod tests {
         let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
         let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
         plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-        validate_batch(&[&plan]).unwrap();
+        validate_batch(&[&plan], &files).unwrap();
         let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
         fs::write(transaction.staging_path(), b"candidate").unwrap();
         let target = plan.destination().to_owned();
@@ -2243,7 +3814,7 @@ mod tests {
         let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
         let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
         plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-        validate_batch(&[&plan]).unwrap();
+        validate_batch(&[&plan], &files).unwrap();
         let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
         fs::write(transaction.staging_path(), b"candidate").unwrap();
         let target = plan.destination().to_owned(); let changed = target.clone();
@@ -2271,7 +3842,7 @@ mod tests {
         let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
         let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
         plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-        validate_batch(&[&plan]).unwrap();
+        validate_batch(&[&plan], &files).unwrap();
         let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
         fs::write(transaction.staging_path(), b"candidate").unwrap();
         let target = plan.destination().to_owned();
@@ -2309,7 +3880,7 @@ mod tests {
         let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
         let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
         plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-        validate_batch(&[&plan]).unwrap();
+        validate_batch(&[&plan], &files).unwrap();
         let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
         fs::write(transaction.staging_path(), b"candidate").unwrap();
         let target = plan.destination().to_owned(); let changed = target.clone();
@@ -2331,7 +3902,7 @@ mod tests {
         let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
         let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
         plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-        validate_batch(&[&plan]).unwrap();
+        validate_batch(&[&plan], &files).unwrap();
         let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
         fs::write(transaction.staging_path(), b"candidate").unwrap();
         let target = plan.destination().to_owned(); let first = target.clone();
@@ -2462,6 +4033,7 @@ mod tests {
         assert_eq!(fs::read(backup).unwrap(), b"tampered");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn overwrite_rejects_metadata_changes_after_the_pin() {
         for change in 0..2 {
@@ -2476,7 +4048,7 @@ mod tests {
             let settings = OutputSettings { mode: OutputMode::SameFolder, format: AudioFormat::Wav };
             let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
             plan.enable_overwrite(Arc::new(OverwriteGuard::new(&files, &[plan.destination().to_owned()]).unwrap())).unwrap();
-            validate_batch(&[&plan]).unwrap();
+            validate_batch(&[&plan], &files).unwrap();
             let mut transaction = plan.begin(&FileIdentity::capture(plan.source()).unwrap()).unwrap();
             fs::write(transaction.staging_path(), b"candidate").unwrap();
             let target = plan.destination().to_owned(); let changed = target.clone();
@@ -2501,19 +4073,34 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn destination_comparison_respects_parent_identity_and_missing_components() {
-        let left = DestinationParent { dev: 1, ino: 11, missing: vec![], case_sensitive: false };
-        let other_mount = DestinationParent { dev: 2, ino: 11, missing: vec![], case_sensitive: true };
+        let parent = |dev, ino, missing: Vec<OsString>| DestinationParent {
+            dev, ino, missing, ancestor: "/nonexistent-policy-probe".into(),
+        };
+        let left = parent(1, 11, vec![]);
+        let other_mount = parent(2, 11, vec![]);
+        // Different directory identities must not probe even an unsupported parent.
         assert!(!same_destination(Path::new("/mnt/A/Song_PN.wav"), &left,
             Path::new("/mnt/a/song_PN.wav"), &other_mount).unwrap());
-        let same = DestinationParent { dev: 1, ino: 11, missing: vec![], case_sensitive: false };
-        assert!(same_destination(Path::new("/mnt/A/Song_PN.wav"), &left,
-            Path::new("/alias/song_PN.wav"), &same).unwrap());
-        let missing_a = DestinationParent { dev: 1, ino: 11, missing: vec!["Album".into()], case_sensitive: false };
-        let missing_b = DestinationParent { dev: 1, ino: 11, missing: vec!["album".into()], case_sensitive: false };
-        assert!(same_destination(Path::new("/x/Album/Song.wav"), &missing_a,
-            Path::new("/x/album/song.wav"), &missing_b).unwrap());
+        let same = parent(1, 11, vec![]);
+        let insensitive = policy_for_fs_type(b"apfs", false);
+        let sensitive = policy_for_fs_type(b"apfs", true);
+        assert!(same_destination_with_policy(OsStr::new("Song_PN.wav"), &left,
+            OsStr::new("song_PN.wav"), &same, insensitive).unwrap());
+        let missing_a = parent(1, 11, vec!["Album".into()]);
+        let missing_b = parent(1, 11, vec!["album".into()]);
+        assert!(same_destination_with_policy(OsStr::new("Song.wav"), &missing_a,
+            OsStr::new("song.wav"), &missing_b, insensitive).unwrap());
+        assert!(same_destination_with_policy(OsStr::new("café_PN.wav"), &left,
+            OsStr::new("cafe\u{301}_PN.wav"), &same, sensitive).unwrap());
+        assert!(!same_destination_with_policy(OsStr::new("Café_PN.wav"), &left,
+            OsStr::new("cafe\u{301}_PN.wav"), &same, sensitive).unwrap());
+        let nfc_parent = parent(1, 11, vec!["café".into()]);
+        let nfd_parent = parent(1, 11, vec!["cafe\u{301}".into()]);
+        assert!(same_destination_with_policy(OsStr::new("song.wav"), &nfc_parent,
+            OsStr::new("song.wav"), &nfd_parent, sensitive).unwrap());
     }
 
     #[test]
@@ -2567,10 +4154,82 @@ mod tests {
         assert_eq!(fs::read(&backup).unwrap(), b"original");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn casefold_comparison_handles_unicode_normalization() {
-        assert!(casefold_paths_equal(Path::new("/Music/É_PN.wav"), Path::new("/music/e\u{301}_pn.WAV")).unwrap());
-        assert!(!casefold_paths_equal(Path::new("/Music/É_PN.wav"), Path::new("/music/f_PN.wav")).unwrap());
+    fn name_comparison_uses_filesystem_policy_and_handles_invalid_bytes() {
+        let apfs_sensitive = policy_for_fs_type(b"apfs", true);
+        let apfs_insensitive = policy_for_fs_type(b"apfs", false);
+        let hfs_sensitive = policy_for_fs_type(b"hfs", true);
+        let hfs_insensitive = policy_for_fs_type(b"hfsx", false);
+        let byte_sensitive = policy_for_fs_type(b"nfs", true);
+        let byte_insensitive = policy_for_fs_type(b"smbfs", false);
+        assert!(names_equal(OsStr::new("café"), OsStr::new("cafe\u{301}"), apfs_sensitive).unwrap());
+        assert!(names_equal(OsStr::new("Café"), OsStr::new("cafe\u{301}"), apfs_insensitive).unwrap());
+        assert!(names_equal(OsStr::new("café"), OsStr::new("cafe\u{301}"), hfs_sensitive).unwrap());
+        assert!(names_equal(OsStr::new("Café"), OsStr::new("cafe\u{301}"), hfs_insensitive).unwrap());
+        for (excluded, decomposed) in [("Å", "A\u{30a}"), ("\u{f900}", "\u{8c48}"), ("\u{2f800}", "\u{4e3d}")] {
+            assert!(!names_equal(OsStr::new(excluded), OsStr::new(decomposed), hfs_sensitive).unwrap());
+            assert!(!names_equal(OsStr::new(excluded), OsStr::new(decomposed), hfs_insensitive).unwrap());
+        }
+        assert!(!names_equal(OsStr::new("café"), OsStr::new("cafe\u{301}"), byte_sensitive).unwrap());
+        assert!(!names_equal(OsStr::new("café"), OsStr::new("cafe\u{301}"), byte_insensitive).unwrap());
+        assert!(names_equal(OsStr::new("Café"), OsStr::new("café"), byte_insensitive).unwrap());
+        let invalid_a = OsStr::from_bytes(b"bad\xffA.wav");
+        let invalid_b = OsStr::from_bytes(b"bad\xfeA.wav");
+        assert!(!names_equal(invalid_a, invalid_b, apfs_sensitive).unwrap());
+        assert!(!names_equal(invalid_a, invalid_b, byte_insensitive).unwrap());
+        assert!(names_equal(invalid_a, OsStr::from_bytes(b"bad\xffa.wav"), byte_insensitive).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_byte_policy_casefolds_without_unicode_normalization() {
+        let sensitive = NamePolicy { normalization: NameNormalization::Bytes, case_sensitive: true };
+        let folded = NamePolicy { normalization: NameNormalization::Bytes, case_sensitive: false };
+        assert!(!names_equal(OsStr::new("Song"), OsStr::new("song"), sensitive).unwrap());
+        assert!(names_equal(OsStr::new("Café"), OsStr::new("café"), folded).unwrap());
+        assert!(!names_equal(OsStr::new("café"), OsStr::new("cafe\u{301}"), folded).unwrap());
+        assert!(!names_equal(OsStr::from_bytes(b"bad\xffA"), OsStr::from_bytes(b"bad\xfeA"), folded).unwrap());
+        assert!(names_equal(OsStr::from_bytes(b"bad\xffA"), OsStr::from_bytes(b"bad\xffa"), folded).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_copy_preserves_posix_metadata_and_extended_attributes() {
+        let fixture = Fixture::new();
+        let source_path = fixture.0.join("source"); let dest_path = fixture.0.join("dest");
+        fs::write(&source_path, b"original data").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let source = OpenOptions::new().read(true).write(true).open(&source_path).unwrap();
+        let name = CString::new("user.platinum-test").unwrap();
+        super::set_xattr(&source, &source_path, &name, b"preserved", 0).unwrap();
+        let acl_name = CString::new("system.posix_acl_access").unwrap();
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01u16, 0x06u16, u32::MAX), (0x02, 0x04, unsafe { libc::geteuid() }.wrapping_add(1)),
+            (0x04, 0x04, u32::MAX), (0x10, 0x04, u32::MAX), (0x20, 0x00, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes()); acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let acl_status = unsafe { libc::fsetxattr(source.as_raw_fd(), acl_name.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
+        if acl_status != 0 {
+            let error = io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "set POSIX ACL: {error}");
+        }
+        let expected = stamp(&source_path, "capture source").unwrap();
+        copy_new_verified(&source_path, &dest_path, expected, None).unwrap();
+        let dest = open_read(&dest_path).unwrap();
+        assert!(metadata_equal(&source, &dest, &source_path, &dest_path, false).unwrap());
+        assert_eq!(fs::read(&dest_path).unwrap(), b"original data");
+        let mut value = [0u8; 9]; read_xattr(&dest, &dest_path, &name, &mut value, 0).unwrap();
+        assert_eq!(&value, b"preserved");
+        if acl_status == 0 {
+            assert_eq!(xattr_size(&dest, &dest_path, &acl_name).unwrap(), acl.len());
+            let mut copied_acl = vec![0u8; acl.len()];
+            read_xattr(&dest, &dest_path, &acl_name, &mut copied_acl, 0).unwrap();
+            assert_eq!(copied_acl, acl);
+        }
     }
 
     #[test]
@@ -2640,10 +4299,10 @@ mod tests {
         let current_stamp = stamp(&current, "inspect test current").unwrap();
         let backup_stamp = stamp(&backup, "inspect test backup").unwrap();
         let workspace = Workspace::create(&fixture.0, "restore").unwrap();
-        copy_new_verified(&backup, &workspace.staged, backup_stamp).unwrap();
+        copy_new_verified(&backup, &workspace.staged, backup_stamp, Some(&workspace)).unwrap();
         let staged_stamp = stamp(&workspace.staged, "inspect test restore copy").unwrap();
         let stage = workspace.staged.clone();
-        let error = commit_replacing(&current, &current, &workspace.staged, &workspace.displaced(),
+        let error = commit_replacing(&workspace, &current, &current, &workspace.staged, &workspace.displaced(),
             current_stamp, staged_stamp, None, Some((&backup, backup_stamp)), false,
             Some(Box::new(move |_| fs::remove_file(stage).unwrap()))).err().unwrap();
         assert!(error.rollback.is_none()); assert!(error.recovery.is_none()); assert!(!error.published);
@@ -2652,6 +4311,7 @@ mod tests {
         assert!(workspace.cleanup(false).is_empty());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn backup_and_restore_preserve_resource_fork_xattrs_acl_and_stat() {
         use crate::metadata::ProcessingMarker;
@@ -2676,8 +4336,8 @@ mod tests {
         let mut attrs = AttrList::common(ATTR_CMN_CRTIME);
         // SAFETY: the buffer is a Darwin 64-bit timespec for ATTR_CMN_CRTIME.
         assert_eq!(unsafe { fsetattrlist(original.as_raw_fd(), &mut attrs, creation.as_ptr().cast(), creation.len(), 0) }, 0);
-        assert_eq!(creation_time(&original, &source).unwrap(), creation);
-        assert_eq!(file_flags(&original, &source).unwrap() & 1, 1);
+        assert_eq!(creation_time(&original, &source).unwrap(), Some(creation));
+        assert_eq!(file_flags(&original, &source).unwrap().unwrap() & 1, 1);
         assert!(acl_bytes(&original, &source).unwrap().is_some());
 
         let selected = discover_inputs(&[source.clone()]).unwrap().remove(0);
@@ -2712,12 +4372,13 @@ mod tests {
         let restored = open_read(&report.destination).unwrap();
         assert!(metadata_equal(&original, &restored, &source, &report.destination, false).unwrap());
         assert_eq!(acl_bytes(&original, &source).unwrap(), acl_bytes(&restored, &report.destination).unwrap());
-        assert_eq!(creation_time(&restored, &report.destination).unwrap(), creation);
-        assert_eq!(file_flags(&restored, &report.destination).unwrap() & 1, 1);
+        assert_eq!(creation_time(&restored, &report.destination).unwrap(), Some(creation));
+        assert_eq!(file_flags(&restored, &report.destination).unwrap().unwrap() & 1, 1);
         read_resource_fork(&restored, &report.destination, &resource, &mut got_fork);
         assert_eq!(got_fork, fork);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn changed_backup_metadata_is_rejected_even_with_a_fresh_backup_stamp() {
         let fixture = Fixture::new();

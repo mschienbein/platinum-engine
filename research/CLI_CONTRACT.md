@@ -1,12 +1,45 @@
 # Platinum Engine CLI contract
 
-Status: the Rust CLI implements this command surface on macOS arm64. Two Platinum Notes 10.5.0.1256 reference exports and Rust debug/release outputs matched complete bytes for one generated 16-second, 48 kHz, stereo 16-bit input using the Official template and WAV output. The common SHA-256 was `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`. Commands and options do not establish equivalence for other inputs, settings or execution contexts.
+Status: the Rust CLI implements this command surface on macOS arm64 and Linux aarch64/x86_64, subject to the restrictions below. Two Platinum Notes 10.5.0.1256 reference exports and Rust debug/release outputs matched complete bytes for one generated 16-second, 48 kHz, stereo 16-bit Official-template WAV case, SHA-256 `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`. Commands and options do not establish equivalence for other inputs, settings or execution contexts.
 
 ## Product boundary
 
 The project targets the current application's audio and file-workflow capabilities in a headless engine, not a recreation of its windows. It does not claim complete feature parity. Pitch scratch alignment, a native-state-dependent MP3 header path, process-sensitive AAC decoding and MP4 timestamps remain bounded or unresolved. Static reference evidence excludes Ogg extensions from its normal input filter despite vendor advertising.
 
-Production processing uses Rust DSP, macOS AudioToolbox/Accelerate and explicitly configured public native libraries. It does not call the original application or its proprietary components; those are reference-only and optional. macOS arm64 is the current supported build/runtime scope, not a portability claim. The [build guide](../docs/BUILD.md) covers the bridge, optional codecs and isolated configuration.
+Production processing uses Rust DSP and explicitly configured public native libraries; macOS uses AudioToolbox/Accelerate, while Linux uses portable implementations. It does not call the original application or its proprietary components; those are reference-only and optional. The [build guide](../docs/BUILD.md) and [Linux guide](../docs/LINUX.md) cover libraries, installation and platform boundaries.
+
+### Linux capability and error boundary
+
+Linux refuses MP3 and AAC decoding, AAC encoding, unequal-rate sample-rate
+conversion, artwork conversion that requires Apple's transcoder, unverified
+codec and container variants (including unverified GSM masks), and ALAC packet
+conditions known to lose native audio. Portable ALAC output admits only finite
+22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit depths in its supported
+layout. Processing that requires an unavailable conversion is refused before
+publication; analysis of non-MP3 inputs at or below 22,050 Hz is refused. A
+non-44.1 kHz waveform is unavailable rather than approximated; an otherwise
+supported analysis can still succeed.
+
+The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
+`UnsupportedSampleRateConversion` variants; artwork uses
+`ArtworkTranscodeUnavailable`. Linux bridge/FLAC/LAME loads also enforce the
+architecture-specific `LibraryPolicyError::Unapproved` digest in
+`src/linux_libraries.rs`, plus user-configured FLAC/LAME hashes. Configuring
+the digest of an unapproved library does not bypass that policy. CLI per-item
+errors serialize `stage`, a human-readable `message`, `cancelled`, recovery
+paths and `partial_publication`; the underlying Rust enum is not exposed as a
+stable machine-readable error code. See [LINUX.md](../docs/LINUX.md) for
+approved identities and residual x86 floating-point differences.
+
+The loader retains a descriptor and handle for each library identity, checks
+the digest after loading and verifies a mapped entry point. Failed post-load
+hash or mapped-symbol checks quarantine the descriptor and handle for the
+process lifetime and prevent reuse of that identity. This does not
+prevent a writer with permission on the same inode from changing it while it is
+being loaded; an initializer may already have run before the post-load check.
+Use libraries on trusted storage not writable by concurrent adversaries.
+Docker Desktop has reported identity mismatches for a bind-mounted bridge;
+use in-image libraries and container-volume/tmpfs state.
 
 ## Commands and capability mapping
 
@@ -31,6 +64,14 @@ subcommand. `--help`, `COMMAND --help`, `--version`, `version`, and
 `provenance` describe the interface and target; no vendor activation or
 account is involved. `--state-dir` is the complete state directory, useful for
 isolated runs. `HOME` supplies the default output path even with `--state-dir`.
+Existing settings and statistics directories must be non-symlink directories
+owned by the effective user, with neither group nor world write permission.
+Their state and lock files must be owned by that user, singly linked regular
+files, also without group/world write permission; symlinks are refused.
+On macOS, extended ACLs on these private directories or files are refused
+because their effective access cannot be established from mode bits alone.
+Directory and file identities are pinned and checked across operations; an
+unsafe or replaced object is reported rather than followed or overwritten.
 
 ```text
 platinum process INPUT... [--jobs N] [--template-index N | --template-id ID]
@@ -66,6 +107,9 @@ booleans, numbers, `null`, arrays and objects are also JSON values.
 The output settings, codec library locations and digests, and selected
 template are configurable using the field paths below. Import and export
 report ignored fields and losses; export never replaces an existing file.
+Template exports stage in a private descriptor-pinned workspace in the destination
+directory, publish without replacement, and sync that directory. A failure after
+publication reports that the export exists and whether cleanup or sync failed.
 
 Process flags override the loaded settings for that invocation only. The
 dedicated default output folder is created if needed; any other selected
@@ -74,16 +118,45 @@ specific output folder. Replacement always
 requires **both** `--replace-originals` and an explicit existing `--backup-dir`
 on every invocation, even if replacement is persisted in the configuration.
 Replacement forces match-input; a conflicting explicit format is rejected.
-Each backup is copied and verified before publication and retained afterward.
+Each backup is copied and verified, and its directory is synced before any
+source replacement. After publication the output directory is synced before
+the displaced original is removed; a sync failure reports the retained
+backup and recovery path rather than discarding the displaced file.
+New separate outputs also sync the pinned output directory after linking; a
+sync failure is reported as published with durability uncertain.
+On macOS, metadata verification excludes only the kernel-managed
+`com.apple.provenance` extended attribute: a newly created copy receives the
+creator's provenance rather than a reproducible copy of the source value.
+The attribute is not removed or forged. Other attributes, including
+`com.apple.macl` and `com.apple.quarantine`, remain subject to comparison, as
+do file bytes, identity, permissions, ACLs and other preserved metadata.
+After a metadata copy, differing copyable extended attributes are reapplied
+from the source and unexpected attributes removed before strict verification;
+any failed reapplication aborts the transaction.
+On Linux, copy verification covers bytes, owner/group, mode, access and
+modification times, and extended attributes (including POSIX ACL attributes).
+Linux birth time and filesystem flags are not copied or compared across
+different inodes; when available, they remain part of same-inode identity
+checks. Linux atomic swap and no-replace publication require kernel and
+filesystem support for the corresponding `renameat2` flags; unsupported
+operations fail rather than falling back to a non-atomic replacement.
 Separate outputs refuse an existing destination by default. `--overwrite`
 explicitly permits atomic replacement of a regular, non-symlink output file;
 it is invocation-only and cannot be combined with `--replace-originals`. It
 never authorizes overwriting a selected input, a hard link to a selected input,
 a directory, a symlink, or another batch destination. Batch destination and
 selected-source conflicts are checked before starting workers, including
-case-equivalent names on case-insensitive volumes and selected files whose own
-preflight failed. Each destination's absent/present identity is captured at
-batch preflight and must still match at staging and commit. Existing outputs
+selected files whose own preflight failed. APFS names use canonical Unicode
+decomposition; HFS+/HFSX use the filesystem's Unicode 3.2 decomposition and
+excluded ranges. Other and unknown filesystems use byte comparison, applying
+case folding when lookup is case-insensitive or sensitivity is indeterminate.
+On Linux, `FS_CASEFOLD_FL` absence is treated as case-sensitive only when its
+query succeeds; casefolded or unknown directories use Rust Unicode lowercase
+mappings without normalization, with ASCII folding for invalid UTF-8 bytes.
+Kernel casefold equivalences this approximation misses can still fail at
+no-replace or identity-checked publication rather than clobbering output.
+Each destination's absent/present identity is captured at batch preflight and
+must still match at staging and commit. Existing outputs
 are atomically swapped with the completed stage, then the displaced entry is
 identity-, metadata-, and SHA-256-checked; an unexpected entry is swapped back
 instead of discarded. A rollback's displaced stage is checked against its
@@ -95,12 +168,30 @@ preflight is rejected rather than inspected and planned again.
 Process JSON includes `details.overwrite`,
 `details.effective_config.overwrite` and per-item
 `report.replaced_existing_output` (false for new output or source replacement).
+MP3 staging files are private (0600 subject to umask). New MP3 outputs receive
+the mode of an ordinary 0666 creation, including inherited Linux default ACLs;
+explicitly overwritten outputs preserve the existing output's owner, group, mode
+and effective ACL, or refuse if those permissions cannot be reproduced. Workflow
+and CAF staging directories and created stage files are pinned by descriptor,
+including when their original directory entry is moved or replaced. If the
+platform cannot resolve a safe descriptor/inode alias for a path-only codec,
+processing refuses. A partial or replaced stage whose ownership is unproven is
+retained and reported. A renamed output parent is detected before publication
+and rechecked afterward; errors report its current pinned location when known.
+New private workspaces are validated without changing their permissions or ACLs.
+On macOS, an inherited extended ACL causes refusal. Initialization failures
+clean up a pinned workspace or report any directory that cannot be safely removed.
+Reservation cleanup uses a private quarantine allocated before the reservation
+exists; it first moves the entry into that quarantine and verifies
+its pinned identity; unexpected entries are returned or retained, never deleted.
 These checks detect ordinary concurrent writers; a same-user process that
 deliberately modifies the private workspace during a transaction can defeat
-them. On case-sensitive APFS, which is normalization-insensitive, canonically
-equivalent Unicode names are compared lexically, so such a batch can fail after
-an earlier job publishes;
-the no-replace or identity-checked publication still prevents clobbering.
+them.
+Workspace creation compares the observed directory identity with the
+no-follow opened descriptor but cannot atomically prove the `mkdir` result
+against a rename before the first observation. Unsuitable restrictive umasks
+can leave an unpinnable directory whose path is reported rather than removing
+an unverified entry.
 
 Before reading markers or publishing any file, restore snapshots every target
 and backup, freezes each backup's identity and SHA-256, and rejects the whole
@@ -109,9 +200,10 @@ each file with the correspondingly ordered explicit `--backup` argument and
 verifies it against the marker read from that file. The source identity captured
 before marker inspection must still match under the restore reservation.
 Marker-only restore requires the tag bridge, not an audio decoder; supplied
-backup paths must be absolute. After publication, the restored bytes
-and metadata are verified, the restored file receives `F_FULLFSYNC`, and its
-parent directory is synced before consuming the backup. Backup consumption
+backup paths must be absolute. After publication, the restored bytes and
+metadata are verified; the restored file receives `F_FULLFSYNC` on macOS or
+`fsync` on Linux, and its parent directory is synced before consuming the backup.
+Backup consumption
 honours the same path reservations as source-replacement jobs. The verified
 backup is exclusively moved into a private sibling quarantine, rechecked, then
 unlinked. Requests sharing a backup path or inode are restored as a group:
@@ -141,6 +233,65 @@ chunks and suspicious trailing marker bytes remain refused. An ambiguous
 override also refuses any bytes beyond the declared RIFF. Analysis, inspection
 and restore keep their strict marker rules. This is an explicit user-selected
 safety policy, not default admission parity with the original.
+
+The engine sniffs the source container before deciding marker state, even when
+the extension-selected tag reader succeeds. Leading ID3v2 headers are validated
+and skipped, including their synchsafe lengths and optional footers, before the
+following container is classified. Additional nonempty ID3v2 tags are refused
+because the bridge does not inspect their marker frames; an ID3-prefixed Ogg
+source is also refused. An unknown signature is refused even if a permissive
+extension-selected reader accepts it. MP4 detection walks bounded top-level
+atoms, validates their declared sizes and a movie child, and requires both
+`moov` and `mdat`; leading `free`, `wide` and `skip` atoms are permitted.
+An atom name in an MPEG frame alone is not evidence of an MP4 container.
+If the direct header does not identify a container, the weaker MPEG scan is
+used only for an MP3-selected extension or after a valid ID3 prefix. It scans
+at most 64 KiB from the post-prefix position for three complete consecutive
+frames with matching version, layer and sample rate; bitrate and padding may
+vary. Recognized WAV, AIFF, FLAC and Ogg headers take precedence over
+incidental embedded MPEG frame bytes.
+
+When the detected PN-writable family differs from the extension, its marker
+is read through the bridge; a read error is a refusal, and a processed or
+ambiguous marker follows the normal safeguards. Tag inspection and copying
+still use the extension-selected family. If that reader returns ABI-5
+source-unavailable status 3, no source tags are copied. A positively identified
+Ogg source without an ID3 prefix may continue.
+
+For a matching WAV or AIFF/AIFC whose tag container is unavailable, a bounded
+physical chunk walk may establish marker absence. It requires format and audio
+chunks, clamps a truncated final audio payload to the file, and refuses partial
+headers, truncated non-audio chunks, trailing bytes and unwalkable or excessive
+chunks. Any `PLTN`, `ID3 ` or `id3 ` chunk is conservatively refused even with
+the ambiguous-marker override. Other matching PN-writable families are refused
+on status 3. When admission succeeds without source tags, inspection reports
+`tags: null` and `tags_unavailable` while reporting the marker state actually
+established; processing reports `source_tags_unavailable` and writes the output
+marker. Destination-container, file-open and I/O failures are not treated as
+absent tags. Restore still requires an inspectable authorizing marker. Older
+ABI-5 bridges report status 3 conditions as generic errors.
+
+AIFF/AIFC marker reads also walk the physically present chunks and refuse more
+than one `ID3 ` or `id3 ` chunk, even if the first has no marker. This applies
+to inspection, processing and restore; the ambiguous-marker override does not
+authorize duplicate AIFF tags.
+
+This physical AIFF-chunk safeguard does not inspect every conflicting marker
+within a single ID3 tag or duplicate MP4 freeform items, and FLAC's Xiph
+marker takes precedence over an ID3 GEOB. A valid unprocessed first marker
+could therefore hide a later processed marker. The leading-ID3 counter covers
+adjacent tags; sync-like junk before a tag, or tags separated by junk, could
+also hide one. These deliberately crafted scenarios are accepted limitations
+from source review; the reviewer did not execute the exact end-to-end examples
+or establish that their inputs decode. Do not treat this as proof of equivalent
+native admission or as complete processed-marker protection for untrusted,
+intentionally modified files.
+
+The WAV marker rewrite creates its exclusive sibling with no broader mode than
+the staging file, restores that file's mode after writing, and then renames it;
+a restrictive umask cannot silently change the final mode. On failure, cleanup
+unlinks only a dev/inode-verified sibling in a non-shared, ACL-checked parent.
+Otherwise it does not unlink and reports the cleanup failure and sibling path.
 
 For a first run, use a disposable copy of an input and an existing separate
 output directory. After following the build guide, set `INPUT` and `OUTPUT_DIR`
@@ -188,6 +339,26 @@ the reported backup path. Strict marker inspection treats a present empty WAV
 payload as malformed because it cannot distinguish that chunk from malformed
 input, and marker-authorized restore cannot use a nil marker.
 
+`ProcessReport.encoded_length_frames` is the encoded container's advertised
+frame length, distinct from the recorder's `input_frames`, `healed_frames`
+and `output_frames`. `source_tags_unavailable` is emitted only when a source
+tag container could not be inspected or copied; it is omitted otherwise.
+`InspectionReport.tags_unavailable` is likewise omitted when absent, while
+`tags` can be null and `processed`/`processing_state` describe the independently
+established marker/suffix state. `AnalysisReport.waveform` may be null with
+`waveform_unavailable` explaining why; that reason is omitted when absent.
+`original_waveform` and `original_waveform_unavailable` describe the recorded
+backup's waveform or error, and the latter may be null. The diagnostic-only
+`controlled_mp4_time_1904` field is the supplied second or null; it does not
+claim the original clock's sampling phase.
+
+On the portable path, MP3 postflight inspects the encoded output without
+enabling MP3 input decoding. For a CBR `Info` header, its frame estimate uses
+the observed AudioToolbox binary64 operation order and rounds the estimated
+packet count upward before accounting for encoder delay and padding; a `Xing`
+header uses its validated declared packet count. Thus encoded length is not
+necessarily the recorder's submitted-frame count.
+
 Jobs default to `processor_max`, clamped to available cores; `--jobs` is also
 clamped to that maximum. Ctrl-C stops starting queued work and signals active
 processing/analysis and restore. Cancellation and publication share a commit
@@ -199,6 +370,12 @@ command path is represented as an object containing display text and exact
 `unix_bytes_hex`. Exit status is 0 for success, 1 for failure or partial
 failure, 2 for command/usage errors, and 130 for cancellation. The status of
 each file remains visible when outcomes are mixed.
+
+On a render failure or cancellation, the live writer is explicitly aborted.
+If writer disposal/abort also fails, its error is appended to the original
+error message and the outcome is a failure rather than a clean cancellation.
+The transaction reports retained backup/recovery paths and any partial
+publication as applicable; callers must inspect those fields.
 
 ## Cumulative gauges
 
@@ -220,6 +397,8 @@ configuration reset and audio restore do not change the gauges.
 Cooperating processes serialize read/modify/write and reset under the permanent
 lock. First publication is no-replace; existing-state updates use identity checks
 and atomic rename. Malformed state is preserved and reported, not reset silently.
+Settings and statistics stages keep their creation descriptors through commit
+and cleanup, and are made owner-readable and writable (0600) before publication.
 Cancellation prevents a reset if it wins the shared publication boundary.
 After audio is published, accounting is attempted immediately; a cancelled wait
 on a contended statistics lock reports that the audio exists but was not counted.
@@ -247,9 +426,15 @@ The selected analyzer has been recovered statically as K-weighted integrated LUF
 
 ## Settings and template API
 
-`SettingsStore::in_home` uses `~/Library/Application Support/Platinum Engine/`
-(not Platinum Notes' preferences); `SettingsStore::new` accepts the complete
-state-directory path plus home and available-core count for isolated use.
+On macOS, `SettingsStore::in_home` uses
+`~/Library/Application Support/Platinum Engine/` (not Platinum Notes'
+preferences). On Linux, it uses `$XDG_CONFIG_HOME/platinum-engine/` when
+`XDG_CONFIG_HOME` is absolute, otherwise `~/.config/platinum-engine/`.
+Linux statistics use `$XDG_STATE_HOME/platinum-engine/` when absolute,
+otherwise `~/.local/state/platinum-engine/`. An explicit CLI `--state-dir`
+places both settings and statistics in that directory on either platform.
+`SettingsStore::new` accepts the complete state-directory path plus home and
+available-core count for isolated use.
 `load` returns a snapshot and `save` publishes that snapshot's settings. Missing
 state gets defaults; malformed, incompatible, or internally inconsistent state
 is an error. Saved custom templates contain the effective JSON representation,
@@ -283,6 +468,21 @@ deliberate Engine safety choice.
 | `libraries` | Object with `flac`, `flac_sha256`, `lame`, `lame_sha256`, `tag_bridge`; each is a string or `null`. Individual paths such as `libraries.flac_sha256` are also writable. A non-null digest is 64 hex digits; FLAC input/output and LAME output loading require caller-pinned digests. The ABI-5 tag bridge is required for processing, analysis, inspection and marker-only restore. Paths and digests are caller-supplied; settings alone does not load the libraries or establish their provenance. |
 | `selected_template` | `null`, `{"builtin":{"id":"..."}}`, or `{"custom":{"index":0,"id":"..."}}`; custom IDs can be `null` and must match the indexed object. Prefer `select_template` for validated selection. |
 | `effective_selected_template` | Read-only resolved selection; even when `selected_template` is `null`, this shows the first built-in's identity. |
+
+On Linux, the FLAC, LAME and TagLib bridge libraries must additionally match
+the exact architecture-specific SHA-256 identities in `src/linux_libraries.rs`.
+An unapproved library is refused even if the caller supplies its own matching
+digest; the typed policy error names the actual and expected identities. FLAC
+decoding uses the same approved, inode-pinned handle as encoding. On both
+platforms, codecs and bridge are hashed before and after loading through a
+retained file descriptor; the FLAC and LAME configured pins are checked on
+that descriptor before `dlopen`. `TagBridge::bridge_sha256()` reports the
+observed bridge digest. The loader verifies the resolved entry point's mapped
+file identity and caches each verified library handle and descriptor for the
+process lifetime, preventing descriptor-name reuse when a dynamic loader
+retains a previously closed image. The loader requires `/dev/fd` on macOS or
+`/proc/self/fd` on Linux and fails if the descriptor path is unavailable.
+The macOS default build retains its caller-selected codec and bridge policy.
 
 Resetting all preferences preserves custom templates; resetting one field uses
 its default subject to the same validation. The selected custom index in the
@@ -335,10 +535,19 @@ The CLI accepts `wav`, `aiff`, `alac`, `flac`, `mp3`, `aac`, and
 `match-input` output selections. AAC and ALAC use an M4A container. Input
 discovery recognizes WAV, AIFF/AIF, MP3, M4A and FLAC; protected M4P/WL.MP3
 and `.ogg` sources are rejected. The reference's recovered normal extension
-filter excludes `.ogg` and `.oga`; its lower-level decoder can open generated
-Ogg fixtures, which does not establish GUI admission. Actual decoding and
-encoding depend on the source and host codecs, and these options do not
-establish byte parity.
+filter excludes `.ogg` and `.oga`; on macOS AudioToolbox can decode Ogg content
+under a permitted extension, with source tags unavailable if TagLib cannot
+interpret that named container. Actual decoding and encoding depend on the
+source and host codecs, and these options do not establish byte parity.
+
+With `PLATINUM_DIAGNOSTIC_JOB_TRACE`, macOS records loaded-image callbacks
+with Mach-O UUIDs. Linux snapshots loaded ELF images at initialization and at
+each job boundary, recording a GNU build ID when present. This snapshot is not
+a loader callback: images loaded and unloaded between snapshots can be missed.
+The x86-64 DSP flush scope enables both MXCSR flush-to-zero and
+denormals-are-zero; its prior bits are restored afterward. ARM and x86 differ
+in when they detect underflow, so boundary values are not claimed to be
+cross-architecture byte-identical.
 
 `analyze` obtains waveform data in a separate read pass requesting 44.1 kHz
 interleaved float32. Each nonempty read of at most 512 frames produces one
@@ -351,6 +560,20 @@ with more than two channels currently fails closed: the native interleaved
 path can leave part of the returned buffer uninitialized, and deterministic
 waveform values for that suffix have not been established. No analysis
 report is returned for that unsupported path.
+On Linux and in the macOS `portable` feature, a non-MP3 source at or below
+22,050 Hz is refused because the reference processing-rate conversion has not
+been reproduced. For other non-44.1 kHz sources, analysis can proceed but the
+primary waveform is `null` with `waveform_unavailable` explaining the missing
+conversion. MP3/AAC decoding, AAC encoding and output sample-rate conversion
+fail before publication. Portable FLAC and MP3 output can use caller-pinned
+encoders; sampled patched Linux builds are documented separately and are not
+a proof of whole-pipeline parity. MP3 output is inspected without enabling MP3
+input decoding; the postflight validates MPEG frame structure and computes the
+gapless length using the observed AudioToolbox reporting rules. Portable pitch
+and warmth no longer have their provisional refusals; unsupported FFT
+shapes still fail when the portable setup cannot be created. The verified
+vector and scalar component comparisons do not by themselves establish
+whole-file or whole-graph parity.
 
 For a processed file, the primary waveform describes that file. An original
 waveform is available only when a readable backup is explicitly identified
@@ -365,6 +588,12 @@ MP3 output exposes `cbr320` and `vbr192`. The implementation derives bit depth,
 sample-rate adaptation and channel handling from the source and selected
 format, and transfers tags and artwork. Those paths have bounded comparisons,
 not a complete original-file parity claim.
+MP3 conversion accepts 1–64 source channels through the source-to-stereo PCM16
+converter; LAME receives mono for a mono source and stereo otherwise. A
+generated six-channel 24-bit WAV matched both pinned native MP3 captures.
+After macOS ALAC finalization, the private output is decoded and its valid
+frame count checked against submitted frames before publication. Valid empty
+ALAC containers remain accepted; a silently truncated stream is refused.
 
 Destination policy covers a selected directory, the input directory, mirrored input folders and replacement mode. Replacement forces match-input, retains the configured backup workflow, and exposes restoration. Ordinary outputs use the observed `_PN` naming convention. Already-processed tags and suffix checks must not disappear in the CLI.
 

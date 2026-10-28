@@ -2,8 +2,10 @@
 //! these calls are native reconstructions, not the proprietary application.
 //! Complete encoded-file identity is established only for a pinned reference case.
 
+use crate::apple_codec::{self, StreamDescription};
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 use crate::apple_codec::{
-    self, AudioBuffer, AudioBufferList, StereoBufferList, StreamDescription,
+    AudioBuffer, AudioBufferList, StereoBufferList,
     AudioConverterConvertComplexBuffer, AudioConverterDispose, AudioConverterNew,
     CFRelease, CFURLCreateFromFileSystemRepresentation, ExtAudioFileCreateWithURL,
     ExtAudioFileDispose, ExtAudioFileSetProperty, ExtAudioFileWrite,
@@ -27,11 +29,9 @@ use crate::templates::Template;
 use serde::Serialize;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const BLOCK: usize = controller::RENDER_BLOCK_FRAMES as usize;
 const VERSION: &str = "10.5.0.1256";
@@ -115,6 +115,9 @@ pub struct ProcessReport {
     pub processing_marker_status: &'static str,
     /// An explicitly authorized ambiguous input marker, if one was used.
     pub input_marker_override: Option<&'static str>,
+    /// A source tag container could not be inspected or copied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_tags_unavailable: Option<String>,
     /// Diagnostic only: the supplied second (since 1904) written to every MP4
     /// creation/modification header field instead of the AudioToolbox clock.
     pub controlled_mp4_time_1904: Option<u32>,
@@ -133,12 +136,15 @@ pub struct AnalysisReport {
     pub pitch_hz: f32,
     /// Previous repair count if the input has a processed marker, not a new repair measurement.
     pub clip_count: Option<u64>,
-    pub processed: bool,
+    /// None means the source tag container could not be inspected.
+    pub processed: Option<bool>,
     pub processing_marker: Option<serde_json::Value>,
     pub dynamics: Option<ReportedDynamics>,
     /// First-pass analysis does not run the repair/dynamics nodes.
     pub unavailable: Vec<String>,
-    pub waveform: Waveform,
+    pub waveform: Option<Waveform>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waveform_unavailable: Option<String>,
     /// Present when the current file's marker names a readable original.
     pub original_waveform: Option<Waveform>,
     pub original_waveform_unavailable: Option<String>,
@@ -183,8 +189,11 @@ pub struct InspectionReport {
     pub frames: u64,
     pub bitrate: Option<u32>,
     pub bitrate_error: Option<String>,
-    pub tags: tags::TagInspection,
-    pub processed: bool,
+    pub tags: Option<tags::TagInspection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_unavailable: Option<String>,
+    /// Successful inspection establishes marker or suffix state.
+    pub processed: Option<bool>,
     pub processing_state: &'static str,
     pub backup_path: Option<PathBuf>,
     pub backup_exists: Option<bool>,
@@ -216,6 +225,244 @@ fn source_tag_format(path: &Path) -> Result<tags::Format, EngineError> {
         _ => Err(EngineError::new("input", format!("unsupported source {}", path.display()))),
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SniffedContainer {
+    Writable(tags::Format),
+    Ogg,
+    Unknown,
+}
+
+// Sniff independently of the extension-selected tag parser: that parser can
+// succeed on another family if its payload happens to contain an MPEG frame.
+fn sniff_container(path: &Path, extension: tags::Format) -> Result<(SniffedContainer, usize, bool), EngineError> {
+    let map_io = |e| EngineError::new("sniff source container", e);
+    let mut input = fs::File::open(path).map_err(map_io)?;
+    let length = input.metadata().map_err(map_io)?.len();
+    let mut position = 0u64;
+    let mut id3_count = 0usize;
+    let mut additional_id3_nonempty = false;
+    loop {
+        input.seek(SeekFrom::Start(position)).map_err(map_io)?;
+        let mut prefix = [0u8; 12];
+        let mut len = 0usize;
+        let want = usize::try_from((length - position).min(prefix.len() as u64)).unwrap();
+        while len < want {
+            match input.read(&mut prefix[len..want]) {
+                Ok(0) => return Err(map_io(io::Error::new(io::ErrorKind::UnexpectedEof, "source shortened while sniffing"))),
+                Ok(n) => len += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(map_io(e)),
+            }
+        }
+        if !prefix[..len].starts_with(b"ID3") {
+            let detected = sniff_container_prefix(&prefix[..len]);
+            if matches!(detected, SniffedContainer::Unknown | SniffedContainer::Writable(tags::Format::Mp3))
+                && sniff_mp4_atoms(&mut input, position, length)? {
+                return Ok((SniffedContainer::Writable(tags::Format::Mp4), id3_count, additional_id3_nonempty));
+            }
+            if detected == SniffedContainer::Unknown && (extension == tags::Format::Mp3 || id3_count != 0)
+                && sniff_mpeg_frames(&mut input, position, length)? {
+                return Ok((SniffedContainer::Writable(tags::Format::Mp3), id3_count, additional_id3_nonempty));
+            }
+            return Ok((detected, id3_count, additional_id3_nonempty));
+        }
+        if len < 10 || id3_count == 1_000_000 { return Ok((SniffedContainer::Unknown, id3_count, additional_id3_nonempty)); }
+        let valid_flags = match prefix[3] {
+            2 => prefix[5] & 0x3f == 0,
+            3 => prefix[5] & 0x1f == 0,
+            4 => prefix[5] & 0x0f == 0,
+            _ => false,
+        };
+        if !valid_flags || prefix[4] == 0xff || prefix[6..10].iter().any(|b| b & 0x80 != 0) {
+            return Ok((SniffedContainer::Unknown, id3_count, additional_id3_nonempty));
+        }
+        let size = prefix[6..10].iter().fold(0u64, |n, b| (n << 7) | u64::from(*b));
+        if id3_count != 0 && size != 0 { additional_id3_nonempty = true; }
+        let footer = prefix[3] == 4 && prefix[5] & 0x10 != 0;
+        let Some(end) = position.checked_add(10 + size + if footer { 10 } else { 0 }).filter(|end| *end <= length) else {
+            return Ok((SniffedContainer::Unknown, id3_count, additional_id3_nonempty));
+        };
+        if footer {
+            input.seek(SeekFrom::Start(end - 10)).map_err(map_io)?;
+            let mut footer_bytes = [0u8; 10];
+            input.read_exact(&mut footer_bytes).map_err(map_io)?;
+            if &footer_bytes[..3] != b"3DI" || footer_bytes[3..] != prefix[3..10] {
+                return Ok((SniffedContainer::Unknown, id3_count, additional_id3_nonempty));
+            }
+        }
+        id3_count += 1;
+        position = end;
+    }
+}
+
+fn sniff_container_prefix(prefix: &[u8]) -> SniffedContainer {
+    use SniffedContainer::{Ogg, Unknown, Writable};
+    if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WAVE" {
+        Writable(tags::Format::Wav)
+    } else if prefix.len() >= 12 && &prefix[..4] == b"FORM" && matches!(&prefix[8..12], b"AIFF" | b"AIFC") {
+        Writable(tags::Format::Aiff)
+    } else if prefix.starts_with(b"fLaC") {
+        Writable(tags::Format::Flac)
+    } else if prefix.len() >= 2 && prefix[0] == 0xff && prefix[1] & 0xe0 == 0xe0 {
+        Writable(tags::Format::Mp3)
+    } else if prefix.starts_with(b"OggS") {
+        Ogg
+    } else {
+        Unknown
+    }
+}
+
+// Inspect top-level atom headers without loading atom payloads. MP4 need not
+// start with ftyp: free/wide/skip or other valid atoms may precede moov/mdat.
+fn sniff_mp4_atoms(input: &mut fs::File, mut position: u64, length: u64) -> Result<bool, EngineError> {
+    let map_io = |e| EngineError::new("sniff source container", e);
+    let mut movie = false;
+    let mut media = false;
+    for _ in 0..1_000_000 {
+        if position == length { return Ok(movie && media); }
+        if length - position < 8 { return Ok(false); }
+        input.seek(SeekFrom::Start(position)).map_err(map_io)?;
+        let mut header = [0u8; 16];
+        input.read_exact(&mut header[..8]).map_err(map_io)?;
+        let short = u32::from_be_bytes(header[..4].try_into().unwrap());
+        let (size, header_size) = match short {
+            0 => (length - position, 8),
+            1 if length - position >= 16 => {
+                input.read_exact(&mut header[8..]).map_err(map_io)?;
+                (u64::from_be_bytes(header[8..].try_into().unwrap()), 16)
+            }
+            1 => return Ok(false),
+            n => (u64::from(n), 8),
+        };
+        if size < header_size || size > length - position { return Ok(false); }
+        if &header[4..8] == b"moov" {
+            let payload_size = size - header_size;
+            if payload_size < 8 { return Ok(false); }
+            input.seek(SeekFrom::Start(position + header_size)).map_err(map_io)?;
+            let mut child = [0u8; 16];
+            input.read_exact(&mut child[..8]).map_err(map_io)?;
+            let (child_size, child_header) = match u32::from_be_bytes(child[..4].try_into().unwrap()) {
+                0 => (payload_size, 8),
+                1 if payload_size >= 16 => {
+                    input.read_exact(&mut child[8..]).map_err(map_io)?;
+                    (u64::from_be_bytes(child[8..].try_into().unwrap()), 16)
+                }
+                1 => return Ok(false),
+                n => (u64::from(n), 8),
+            };
+            if child_size < child_header || child_size > payload_size { return Ok(false); }
+            movie = true;
+        }
+        if &header[4..8] == b"mdat" { media = true; }
+        position += size;
+    }
+    Ok(false)
+}
+
+// Only use this weaker signature for an MP3 extension or after a validated
+// ID3 prefix. Three complete consecutive frames must agree on version, layer
+// and sample rate; bitrate and padding may vary.
+fn sniff_mpeg_frames(input: &mut fs::File, start: u64, length: u64) -> Result<bool, EngineError> {
+    const WINDOW: usize = 64 * 1024;
+    let map_io = |e| EngineError::new("sniff source container", e);
+    let count = usize::try_from((length - start).min(WINDOW as u64)).unwrap();
+    let mut bytes = [0u8; WINDOW];
+    input.seek(SeekFrom::Start(start)).map_err(map_io)?;
+    input.read_exact(&mut bytes[..count]).map_err(map_io)?;
+    for candidate in 0..count.saturating_sub(3) {
+        if bytes[candidate] != 0xff || bytes[candidate + 1] & 0xe0 != 0xe0 { continue; }
+        let mut position = candidate;
+        let mut signature = None;
+        let mut frames = 0;
+        while frames < 3 {
+            let Some(header) = bytes.get(position..position + 4).filter(|_| position + 4 <= count) else { break; };
+            let word = u32::from_be_bytes(header.try_into().unwrap());
+            if word >> 21 != 0x7ff || (word >> 19) & 3 == 1 || word & 3 == 2 { break; }
+            let current = word & 0x001e_0c00;
+            if signature.is_some_and(|expected| expected != current) { break; }
+            let size = crate::mp3::frame_size(word);
+            if size < 4 || size > count - position { break; }
+            signature = Some(current);
+            position += size;
+            frames += 1;
+        }
+        if frames == 3 { return Ok(true); }
+    }
+    Ok(false)
+}
+
+// The bridge can reject an otherwise decodable truncated RIFF/FORM. Only admit
+// it when a bounded walk of the physically present chunks proves that none
+// can be a PN marker. A truncated final audio payload is safe to clamp; a
+// truncated header/metadata chunk or trailing garbage is not.
+fn verify_unavailable_riff_marker_absent(path: &Path, family: tags::Format, reason: &str) -> Result<(), EngineError> {
+    let refuse = |detail: &str| EngineError::new("inspect tags",
+        tags::TagError::SourceContainerUnavailable(format!("{reason}; cannot establish marker absence: {detail}")));
+    let io_error = |source| EngineError::new("inspect tags", tags::TagError::Io { operation: "scan source marker", source });
+    let mut input = fs::File::open(path).map_err(io_error)?;
+    let physical_end = input.metadata().map_err(io_error)?.len();
+    let mut header = [0u8; 12];
+    input.read_exact(&mut header).map_err(io_error)?;
+    if sniff_container_prefix(&header) != SniffedContainer::Writable(family) {
+        return Err(refuse("container changed during inspection"));
+    }
+    let wav = family == tags::Format::Wav;
+    let declared_size = if wav { u32::from_le_bytes(header[4..8].try_into().unwrap()) }
+        else { u32::from_be_bytes(header[4..8].try_into().unwrap()) };
+    let declared_end = u64::from(declared_size) + 8;
+    if declared_end < 12 || declared_end < physical_end {
+        return Err(refuse("invalid container length or trailing bytes"));
+    }
+    let end = declared_end.min(physical_end);
+    let mut position = 12u64;
+    let mut chunks = 0usize;
+    let mut format_seen = false;
+    let mut audio_seen = false;
+    while position < end {
+        if chunks == 1_000_000 { return Err(refuse("chunk walk limit exceeded")); }
+        chunks += 1;
+        if end - position < 8 { return Err(refuse("truncated chunk header")); }
+        input.seek(SeekFrom::Start(position)).map_err(io_error)?;
+        let mut chunk = [0u8; 8];
+        input.read_exact(&mut chunk).map_err(io_error)?;
+        let id = &chunk[..4];
+        if !id.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+            return Err(refuse("invalid chunk identifier"));
+        }
+        if matches!(id, b"PLTN" | b"ID3 " | b"id3 ") {
+            return Err(refuse("a possible PLTN or ID3 processing marker is present"));
+        }
+        let size = if wav { u32::from_le_bytes(chunk[4..8].try_into().unwrap()) }
+            else { u32::from_be_bytes(chunk[4..8].try_into().unwrap()) } as u64;
+        let body = position + 8;
+        let available = end - body;
+        if (wav && id == b"fmt ") || (!wav && id == b"COMM") {
+            let minimum = if wav { 16 } else { 18 };
+            if size < minimum || available < minimum { return Err(refuse("truncated format chunk")); }
+            format_seen = true;
+        }
+        let audio = (wav && id == b"data") || (!wav && id == b"SSND");
+        if audio {
+            if !wav && (size < 8 || available < 8) { return Err(refuse("truncated sound header")); }
+            audio_seen = true;
+        }
+        if size > available {
+            if !audio { return Err(refuse("truncated non-audio chunk")); }
+            position = end;
+            break;
+        }
+        position = body + size;
+        if size & 1 != 0 {
+            if position == end { return Err(refuse("missing chunk padding")); }
+            position += 1;
+        }
+    }
+    if position != end || !format_seen || !audio_seen {
+        return Err(refuse("incomplete audio chunk walk"));
+    }
+    Ok(())
+}
 fn source_codec(path: &Path, stream: StreamDescription) -> SourceCodec {
     if matches!(file_workflow::source_type(path), Some(SourceType::Flac)) { return SourceCodec::Flac; }
     match stream.format_id {
@@ -238,8 +485,60 @@ fn format_label(path: &Path, codec: SourceCodec) -> String {
     };
     format!("{container}/{codec}")
 }
+
+// TagLib's AIFF parser selects the first ID3 chunk even if later chunks exist.
+// Walk the physical chunks, as TagLib does, before trusting that selection.
+fn refuse_duplicate_aiff_id3(path: &Path) -> Result<(), EngineError> {
+    let map_io = |e| EngineError::new("read marker", e);
+    let invalid = |reason| EngineError::new("read marker", reason);
+    let mut input = fs::File::open(path).map_err(map_io)?;
+    let length = input.metadata().map_err(map_io)?.len();
+    let mut header = [0u8; 12];
+    input.read_exact(&mut header).map_err(map_io)?;
+    if sniff_container_prefix(&header) != SniffedContainer::Writable(tags::Format::Aiff) {
+        return Err(invalid("AIFF container changed during marker inspection"));
+    }
+    let declared_end = u64::from(u32::from_be_bytes(header[4..8].try_into().unwrap())) + 8;
+    if declared_end < 12 || declared_end > length {
+        return Err(invalid("invalid or truncated AIFF FORM length"));
+    }
+    let mut position = 12u64;
+    let mut chunks = 0usize;
+    let mut id3_count = 0u8;
+    while position < length {
+        if chunks == 1_000_000 { return Err(invalid("AIFF chunk walk limit exceeded")); }
+        chunks += 1;
+        if length - position < 8 { return Err(invalid("truncated AIFF chunk header")); }
+        input.seek(SeekFrom::Start(position)).map_err(map_io)?;
+        let mut chunk = [0u8; 8];
+        input.read_exact(&mut chunk).map_err(map_io)?;
+        if matches!(&chunk[..4], b"ID3 " | b"id3 ") {
+            id3_count += 1;
+            if id3_count > 1 {
+                return Err(EngineError::new("decode marker", "multiple AIFF ID3 chunks are refused; a processed marker may be hidden"));
+            }
+        }
+        let size = u64::from(u32::from_be_bytes(chunk[4..].try_into().unwrap()));
+        let body = position + 8;
+        if size > length - body { return Err(invalid("truncated AIFF chunk")); }
+        position = body + size;
+        // TagLib advances over an odd-byte pad only when it is zero.
+        if position & 1 != 0 && position < length {
+            input.seek(SeekFrom::Start(position)).map_err(map_io)?;
+            let mut pad = [0u8; 1];
+            input.read_exact(&mut pad).map_err(map_io)?;
+            if pad[0] == 0 { position += 1; }
+        }
+    }
+    Ok(())
+}
+
+fn read_marker_payload(bridge: &TagBridge, path: &Path, format: tags::Format) -> Result<Option<Vec<u8>>, EngineError> {
+    if format == tags::Format::Aiff { refuse_duplicate_aiff_id3(path)?; }
+    bridge.read_processing_marker(path, format).map_err(|e| EngineError::new("read marker", e))
+}
 fn read_marker(bridge: &TagBridge, path: &Path, format: tags::Format) -> Result<Option<Marker>, EngineError> {
-    bridge.read_processing_marker(path, format).map_err(|e| EngineError::new("read marker", e))?
+    read_marker_payload(bridge, path, format)?
         .map(|payload| Marker::from_encoded_bytes(&payload).map_err(|e| EngineError::new("decode marker", e))).transpose()
 }
 
@@ -249,7 +548,7 @@ enum InspectedMarker {
 }
 
 fn read_process_marker(bridge: &TagBridge, path: &Path, format: tags::Format, allow: bool) -> Result<InspectedMarker, EngineError> {
-    let payload = bridge.read_processing_marker(path, format).map_err(|e| EngineError::new("read marker", e))?;
+    let payload = read_marker_payload(bridge, path, format)?;
     let layout = if format == tags::Format::Wav {
         let mut input = fs::File::open(path).map_err(|e| EngineError::new("read marker", e))?;
         Some(metadata::wav_marker_layout(&mut input).map_err(|e| EngineError::new("read marker", e))?)
@@ -333,7 +632,7 @@ fn marker_json(marker: Option<&Marker>) -> Result<Option<serde_json::Value>, Eng
 
 enum InspectionOutcome {
     Known(InspectionReport),
-    AuthorizedAmbiguous { kind: &'static str, source_codec: SourceCodec, input_format: String },
+    AuthorizedAmbiguous { kind: &'static str, source_codec: SourceCodec, input_format: String, tags_unavailable: Option<String> },
 }
 
 // `process_override` is None for strict inspection and Some for process
@@ -343,10 +642,45 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
     let identity = file_workflow::FileIdentity::capture(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
     let family = source_tag_format(path)?;
     let bridge = bridge(settings)?;
-    let tag_inspection = bridge.inspect(path, family).map_err(|e| EngineError::new("inspect tags", e))?;
-    let marker = match process_override {
-        Some(allow) => read_process_marker(&bridge, path, family, allow)?,
-        None => InspectedMarker::Known(read_marker(&bridge, path, family)?),
+    let (detected, id3_count, additional_id3_nonempty) = sniff_container(path, family)?;
+    if detected == SniffedContainer::Unknown {
+        return Err(EngineError::new("inspect tags",
+            tags::TagError::SourceContainerUnavailable("cannot establish marker absence for an unknown container".into())));
+    }
+    if additional_id3_nonempty {
+        return Err(EngineError::new("decode marker", "additional nonempty leading ID3 tags are refused; a processed marker may be hidden"));
+    }
+    if id3_count != 0 && detected == SniffedContainer::Ogg {
+        return Err(EngineError::new("decode marker", "an ID3 prefix on an Ogg source may hide a processed marker"));
+    }
+    let (tag_inspection, tags_unavailable, marker_family) = match bridge.inspect(path, family) {
+        Ok(tags) => {
+            let marker_family = match detected {
+                SniffedContainer::Writable(actual) => actual,
+                SniffedContainer::Ogg | SniffedContainer::Unknown => family,
+            };
+            (Some(tags), None, Some(marker_family))
+        }
+        Err(tags::TagError::SourceContainerUnavailable(reason)) => match detected {
+            SniffedContainer::Writable(actual) if actual == family && matches!(actual, tags::Format::Wav | tags::Format::Aiff) => {
+                verify_unavailable_riff_marker_absent(path, actual, &reason)?;
+                (None, Some(reason), None)
+            }
+            SniffedContainer::Writable(actual) if actual == family =>
+                return Err(EngineError::new("inspect tags", tags::TagError::SourceContainerUnavailable(reason))),
+            SniffedContainer::Writable(actual) => (None, Some(reason), Some(actual)),
+            SniffedContainer::Ogg => (None, Some(reason), None),
+            SniffedContainer::Unknown => return Err(EngineError::new("inspect tags",
+                tags::TagError::SourceContainerUnavailable(format!("{reason}; cannot establish marker absence for an unknown container")))),
+        },
+        Err(error) => return Err(EngineError::new("inspect tags", error)),
+    };
+    let marker = match marker_family {
+        Some(format) => match process_override {
+            Some(allow) => read_process_marker(&bridge, path, format, allow)?,
+            None => InspectedMarker::Known(read_marker(&bridge, path, format)?),
+        },
+        None => InspectedMarker::Known(None),
     };
     let state = match &marker {
         InspectedMarker::Known(marker) => Some(file_workflow::processed_state(path, marker.as_ref()).map_err(|e| EngineError::workflow("inspect marker", e))?),
@@ -379,14 +713,15 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
         InspectedMarker::Known(marker) => {
             let marker_json = marker_json(marker.as_ref())?;
             let state = state.expect("known marker has a processing state");
+            let processed = Some(state != ProcessingState::Unprocessed);
             Ok(InspectionOutcome::Known(InspectionReport { path: path.to_owned(), input_format, sample_rate: source.sample_rate,
                 channels: source.channels_per_frame, bit_depth: source.bits_per_channel, frames: frames as u64,
-                bitrate, bitrate_error, processed: state != ProcessingState::Unprocessed,
+                bitrate, bitrate_error, processed,
                 processing_state: processing_state.expect("known marker has a processing state"),
-                backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, marker, source_codec: codec }))
+                backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, tags_unavailable, marker, source_codec: codec }))
         }
         InspectedMarker::AuthorizedAmbiguous(kind) => Ok(InspectionOutcome::AuthorizedAmbiguous {
-            kind, source_codec: codec, input_format,
+            kind, source_codec: codec, input_format, tags_unavailable,
         }),
     }
 }
@@ -409,6 +744,7 @@ pub struct PreparedProcess {
     source_codec: SourceCodec,
     input_format: String,
     input_marker_override: Option<&'static str>,
+    source_tags_unavailable: Option<String>,
     controlled_mp4_time_1904: Option<u32>,
 }
 impl PreparedProcess {
@@ -434,23 +770,23 @@ pub fn prepare_file(input: &DiscoveredFile, settings: &Settings, allow_ambiguous
     let identity = FileIdentity::capture(&input.path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
     let inspection = inspect_file_with_policy(&input.path, settings, Some(allow_ambiguous_marker))?;
     identity.verify(&input.path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let (plan, source_codec, input_format, input_marker_override) = match inspection {
+    let (plan, source_codec, input_format, input_marker_override, source_tags_unavailable) = match inspection {
         InspectionOutcome::Known(inspection) => {
             let plan = OutputPlan::new(input, inspection.source_codec, &settings.output, inspection.marker.as_ref())
                 .map_err(|e| EngineError::workflow("plan output", e))?;
-            (plan, inspection.source_codec, inspection.input_format, None)
+            (plan, inspection.source_codec, inspection.input_format, None, inspection.tags_unavailable)
         }
-        InspectionOutcome::AuthorizedAmbiguous { kind, source_codec, input_format } => {
+        InspectionOutcome::AuthorizedAmbiguous { kind, source_codec, input_format, tags_unavailable } => {
             let plan = OutputPlan::for_authorized_ambiguous_marker(input, source_codec, &settings.output)
                 .map_err(|e| EngineError::workflow("plan output", e))?;
-            (plan, source_codec, input_format, Some(kind))
+            (plan, source_codec, input_format, Some(kind), tags_unavailable)
         }
     };
     identity.verify(&input.path).map_err(|e| EngineError::workflow("plan source identity", e))?;
     require_reportable_path(plan.source(), "plan output")?;
     require_reportable_path(plan.destination(), "plan output")?;
     if let Some(path) = plan.backup_directory() { require_reportable_path(path, "plan backup")?; }
-    Ok(PreparedProcess { plan, identity, source_codec, input_format, input_marker_override, controlled_mp4_time_1904: None })
+    Ok(PreparedProcess { plan, identity, source_codec, input_format, input_marker_override, source_tags_unavailable, controlled_mp4_time_1904: None })
 }
 
 struct Measured {
@@ -460,6 +796,7 @@ struct Measured {
     source: StreamDescription,
     codec: SourceCodec,
     waveform: Option<Waveform>,
+    waveform_unavailable: Option<String>,
 }
 
 struct WaveformBuilder {
@@ -540,6 +877,11 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     let codec = source_codec(path, source);
     let rate = controller::processing_sample_rate(source.sample_rate, codec == SourceCodec::Mp3);
     original.close().map_err(|e| EngineError::new("close analysis input", e))?;
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    if codec != SourceCodec::Mp3 && source.sample_rate <= 22_050.0 {
+        return Err(EngineError::new("analysis sample-rate conversion",
+            apple_codec::CodecError::UnsupportedSampleRateConversion { source_rate: source.sample_rate, client_rate: rate }));
+    }
     let mut reader = AudioReader::open(path, Some(rate), &libraries).map_err(|e| EngineError::new("open analysis input", e))?;
     reader.set_stereo_planar(rate).map_err(|e| EngineError::new("configure analysis input", e))?;
     let channels = source.channels_per_frame as usize;
@@ -564,9 +906,15 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     reader.close().map_err(|e| EngineError::new("close analysis input", e))?;
     converter.dispose()?;
     check_cancel(cancel, "analysis")?;
+    let waveform_unavailable = if capture_waveform && cfg!(any(target_os = "linux", feature = "portable"))
+        && source.sample_rate != 44_100.0 {
+        Some("portable waveform conversion is unavailable for non-44.1 kHz input".to_owned())
+    } else { None };
+    let waveform = if capture_waveform && waveform_unavailable.is_none() {
+        Some(analyze_waveform(path, settings, cancel)?)
+    } else { None };
     Ok(Measured { values: AnalysisValues::from_measurements(meter.integrated_loudness(), detector.tuning_hz()),
-        frames: accounting.actual_input_frames, processing_rate: rate, source, codec,
-        waveform: if capture_waveform { Some(analyze_waveform(path, settings, cancel)?) } else { None } })
+        frames: accounting.actual_input_frames, processing_rate: rate, source, codec, waveform, waveform_unavailable })
 }
 
 pub fn analyze_file(path: &Path, settings: &Settings, cancel: &Cancellation) -> Result<AnalysisReport, EngineError> {
@@ -594,7 +942,7 @@ fn analyze_file_with(
                 identity.verify(&path).map_err(|e| EngineError::workflow("analyze original identity", e))?;
                 Ok(original)
             }) {
-                Ok(original) => (original.waveform, None),
+                Ok(original) => (original.waveform, original.waveform_unavailable),
                 Err(error) if error.cancelled => return Err(error),
                 Err(error) => (None, Some(error.to_string())),
             },
@@ -610,7 +958,8 @@ fn analyze_file_with(
         pitch_hz: measured.values.input_tuning_hz, clip_count, processed: inspection.processed,
         processing_marker: inspection.marker_json, dynamics,
         unavailable,
-        waveform: measured.waveform.take().expect("requested waveform"), original_waveform, original_waveform_unavailable })
+        waveform: measured.waveform.take(), waveform_unavailable: measured.waveform_unavailable.take(),
+        original_waveform, original_waveform_unavailable })
 }
 
 /// One wrapper: model writes precede the first callback. The native 50 ms
@@ -767,48 +1116,49 @@ impl SourcePipeline {
 // The intermediate is an owned, mode-0700 temporary directory containing a
 // float32 CAF. AudioToolbox performs the same file and client format handling
 // as the observed PNCAFRecorder, without storing a track in memory.
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-struct TempCaf { directory: PathBuf, path: PathBuf }
+struct TempCaf {
+    workspace: file_workflow::Workspace,
+    path: PathBuf,
+    #[cfg(test)]
+    directory: PathBuf,
+}
 impl TempCaf {
     fn new() -> Result<Self, EngineError> {
-        for _ in 0..128 {
-            let name = format!("platinum-engine-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
-            let directory = std::env::temp_dir().join(name);
-            match fs::DirBuilder::new().mode(0o700).create(&directory) {
-                Ok(()) => return Ok(Self { path: directory.join("healed.caf"), directory }),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(EngineError::new("create intermediate directory", e)),
-            }
-        }
-        Err(EngineError::new("create intermediate directory", "could not reserve a unique private directory"))
+        let workspace = file_workflow::Workspace::create(&std::env::temp_dir(), "caf")
+            .map_err(|e| EngineError::workflow("create intermediate directory", e))?;
+        Ok(Self { path: workspace.staging_path().to_owned(),
+            #[cfg(test)] directory: workspace.directory_path().to_owned(),
+            workspace })
     }
     fn cleanup(&self) -> Result<(), EngineError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(EngineError::new("remove intermediate", format!("{}: {e}", self.path.display()))),
+        let failures = self.workspace.cleanup(false);
+        if failures.is_empty() { Ok(()) } else {
+            Err(EngineError::new("remove intermediate", failures.iter()
+                .map(|e| format!("{} {}: {}", e.operation, e.path.display(), e.source)).collect::<Vec<_>>().join("; ")))
         }
-        fs::remove_dir(&self.directory).map_err(|e| EngineError::new("remove intermediate directory", format!("{}: {e}", self.directory.display())))
     }
 }
-impl Drop for TempCaf {
-    fn drop(&mut self) { let _ = fs::remove_file(&self.path); let _ = fs::remove_dir(&self.directory); }
-}
+impl Drop for TempCaf { fn drop(&mut self) { let _ = self.workspace.cleanup(false); } }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 struct CafWriter { handle: Option<std::ptr::NonNull<std::ffi::c_void>>, channels: usize }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl CafWriter {
-    fn new(path: &Path, rate: f64, channels: usize) -> Result<Self, EngineError> {
+    fn new(temp: &TempCaf, rate: f64, channels: usize) -> Result<Self, EngineError> {
+        let _file = temp.workspace.create_stage().map_err(|e| EngineError::workflow("create intermediate", e))?;
+        let path = &temp.path;
+        let frame_bytes = u32::try_from(channels.checked_mul(4).ok_or_else(|| EngineError::new("create intermediate", "channel count overflows"))?)
+            .map_err(|e| EngineError::new("create intermediate", e))?;
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
         let url = unsafe { CFURLCreateFromFileSystemRepresentation(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize, 0) };
         if url.is_null() { return Err(EngineError::new("create intermediate", "CFURL creation failed")); }
-        let frame_bytes = u32::try_from(channels.checked_mul(4).ok_or_else(|| EngineError::new("create intermediate", "channel count overflows"))?)
-            .map_err(|e| EngineError::new("create intermediate", e))?;
         let format = StreamDescription { sample_rate: rate, format_id: u32::from_be_bytes(*b"lpcm"), format_flags: 9,
             bytes_per_packet: frame_bytes, frames_per_packet: 1, bytes_per_frame: frame_bytes,
             channels_per_frame: channels as u32, bits_per_channel: 32, reserved: 0 };
         let mut raw = std::ptr::null_mut();
-        let status = unsafe { ExtAudioFileCreateWithURL(url, u32::from_be_bytes(*b"caff"), &format, std::ptr::null(), 0, &mut raw) };
+        // Erase only the exclusively created file already pinned by TempCaf.
+        let status = unsafe { ExtAudioFileCreateWithURL(url, u32::from_be_bytes(*b"caff"), &format, std::ptr::null(), 1, &mut raw) };
         unsafe { CFRelease(url); }
         let handle = std::ptr::NonNull::new(raw);
         if status != 0 || handle.is_none() {
@@ -816,6 +1166,10 @@ impl CafWriter {
             return Err(EngineError::new("create intermediate", format!("ExtAudioFileCreateWithURL: OSStatus {status}")));
         }
         let mut writer = Self { handle, channels };
+        if let Err(error) = temp.workspace.mark_stage() {
+            let close = writer.dispose();
+            return Err(EngineError::new("pin intermediate", format!("{error}; close: {close:?}")));
+        }
         let status = unsafe { ExtAudioFileSetProperty(raw, u32::from_be_bytes(*b"cfmt"), std::mem::size_of::<StreamDescription>() as u32, (&format as *const StreamDescription).cast()) };
         if status != 0 {
             let close = writer.dispose();
@@ -842,8 +1196,27 @@ impl CafWriter {
         Ok(())
     }
     fn finish(mut self) -> Result<(), EngineError> { self.dispose() }
+    fn abort(mut self) -> Result<(), EngineError> { self.dispose() }
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl Drop for CafWriter { fn drop(&mut self) { let _ = self.dispose(); } }
+
+#[cfg(any(target_os = "linux", feature = "portable"))]
+struct CafWriter(apple_codec::CafWriter);
+#[cfg(any(target_os = "linux", feature = "portable"))]
+impl CafWriter {
+    fn new(temp: &TempCaf, rate: f64, channels: usize) -> Result<Self, EngineError> {
+        let file = temp.workspace.create_stage().map_err(|e| EngineError::workflow("create intermediate", e))?;
+        apple_codec::CafWriter::from_file(&temp.path, file, rate, channels).map(Self).map_err(|e| EngineError::new("create intermediate", e))
+    }
+    fn write(&mut self, samples: &[f32]) -> Result<(), EngineError> {
+        self.0.write(samples).map_err(|e| EngineError::new("write intermediate", e))
+    }
+    fn finish(self) -> Result<(), EngineError> {
+        self.0.finish().map_err(|e| EngineError::new("close intermediate", e))
+    }
+    fn abort(self) -> Result<(), EngineError> { drop(self); Ok(()) }
+}
 
 struct HealingResult {
     analyzer: GainAnalyzer,
@@ -901,11 +1274,11 @@ fn healing_pass(path: &Path, temp: &TempCaf, measured: &Measured, plan: &Healing
     }
     let mut analyzer = GainAnalyzer::new(rate, channels, plan.analyzer_release_seconds, true)
         .map_err(|e| EngineError::new("create healing meter", e))?;
-    let mut writer = CafWriter::new(&temp.path, rate, channels)?;
+    let mut channel_converter = ChannelConverter::new(rate, channels)?;
+    let mut writer = CafWriter::new(temp, rate, channels)?;
     let mut left = [0.0f32; BLOCK];
     let mut right = [0.0f32; BLOCK];
     let mut interleaved = vec![0.0f32; BLOCK * channels];
-    let mut channel_converter = ChannelConverter::new(rate, channels)?;
     let mut stages = Vec::new();
     if plan.clip.is_some() { stages.push("clip_repair".to_owned()); }
     if plan.pitch.is_some() { stages.push("pitch".to_owned()); }
@@ -913,49 +1286,56 @@ fn healing_pass(path: &Path, temp: &TempCaf, measured: &Measured, plan: &Healing
     if plan.expansion.is_some() { stages.push("expansion".to_owned()); }
     if plan.compression.is_some() { stages.push("compression".to_owned()); }
     if plan.gain.is_some() { stages.push("gain".to_owned()); }
-    loop {
-        check_cancel(cancel, "healing")?;
-        let source_silent = if let Some(unit) = &mut pitch {
-            let mut pull_error = None;
-            let mut pull = |_: f64, planes: &mut [&mut [f32]]| {
-                let count = planes[0].len();
-                match source.pull(planes) {
-                    Ok(_) => Ok(count),
-                    Err(e) => { pull_error = Some(e); Err(-1) }
-                }
+    let rendered = (|| -> Result<(u64, u64), EngineError> {
+        loop {
+            check_cancel(cancel, "healing")?;
+            let source_silent = if let Some(unit) = &mut pitch {
+                let mut pull_error = None;
+                let mut pull = |_: f64, planes: &mut [&mut [f32]]| {
+                    let count = planes[0].len();
+                    match source.pull(planes) {
+                        Ok(_) => Ok(count),
+                        Err(e) => { pull_error = Some(e); Err(-1) }
+                    }
+                };
+                let result = unit.render(&mut [&mut left, &mut right], &mut pull);
+                if let Some(e) = pull_error { return Err(e); }
+                result.map_err(|e| EngineError::new("render pitch", e))?
+            } else {
+                source.pull(&mut [&mut left, &mut right])?
             };
-            let result = unit.render(&mut [&mut left, &mut right], &mut pull);
-            if let Some(e) = pull_error { return Err(e); }
-            result.map_err(|e| EngineError::new("render pitch", e))?
-        } else {
-            source.pull(&mut [&mut left, &mut right])?
-        };
-        for unit in &mut units { unit.process(&mut left, &mut right)?; }
-        channel_converter.convert(&left, &right, &mut interleaved)?;
-        analyzer.process_interleaved(&interleaved).map_err(|e| EngineError::new("healing meter", e))?;
-        // With clip as the last effect, the first EOS-marked pull still has
-        // a full clip latency pending: the native clip-only graph reports
-        // flags=0 for that terminal render. Pitch supplies its own decision;
-        // each Kilohearts wrapper likewise returned flags=0 in EOF captures.
-        let silent = units.is_empty() && (pitch.is_some() || plan.clip.is_none()) && source_silent;
-        let flags = RENDER_POST | if silent { RENDER_SILENCE } else { 0 };
-        let recorder = source.accounting.recorder.as_mut().expect("healing recorder");
-        if let Some(span) = recorder.record_render(flags, true, BLOCK as u32) {
-            let start = usize::try_from(span.offset).map_err(|e| EngineError::new("healing recorder", e))?;
-            let end = start.checked_add(span.frames as usize).ok_or_else(|| EngineError::new("healing recorder", "span overflows"))?;
-            if end > BLOCK { return Err(EngineError::new("healing recorder", "native record span exceeds render buffer")); }
-            writer.write(&interleaved[start * channels..end * channels])?;
+            for unit in &mut units { unit.process(&mut left, &mut right)?; }
+            channel_converter.convert(&left, &right, &mut interleaved)?;
+            analyzer.process_interleaved(&interleaved).map_err(|e| EngineError::new("healing meter", e))?;
+            // With clip as the last effect, the first EOS-marked pull still has
+            // a full clip latency pending: the native clip-only graph reports
+            // flags=0 for that terminal render. Pitch supplies its own decision;
+            // each Kilohearts wrapper likewise returned flags=0 in EOF captures.
+            let silent = units.is_empty() && (pitch.is_some() || plan.clip.is_none()) && source_silent;
+            let flags = RENDER_POST | if silent { RENDER_SILENCE } else { 0 };
+            let recorder = source.accounting.recorder.as_mut().expect("healing recorder");
+            if let Some(span) = recorder.record_render(flags, true, BLOCK as u32) {
+                let start = usize::try_from(span.offset).map_err(|e| EngineError::new("healing recorder", e))?;
+                let end = start.checked_add(span.frames as usize).ok_or_else(|| EngineError::new("healing recorder", "span overflows"))?;
+                if end > BLOCK { return Err(EngineError::new("healing recorder", "native record span exceeds render buffer")); }
+                writer.write(&interleaved[start * channels..end * channels])?;
+            }
+            if source.accounting.finish_render(BLOCK as u32, flags, cancel.is_cancelled()) { break; }
         }
-        if source.accounting.finish_render(BLOCK as u32, flags, cancel.is_cancelled()) { break; }
-    }
-    check_cancel(cancel, "healing")?;
-    let frames = source.accounting.recorder.as_ref().expect("healing recorder").current_frames();
-    if frames < 0 { return Err(EngineError::new("healing recorder", "negative recorded frame count")); }
-    let clip_count = source.clip_count();
-    source.reader.close().map_err(|e| EngineError::new("close healing input", e))?;
-    channel_converter.dispose()?;
+        check_cancel(cancel, "healing")?;
+        let frames = source.accounting.recorder.as_ref().expect("healing recorder").current_frames();
+        if frames < 0 { return Err(EngineError::new("healing recorder", "negative recorded frame count")); }
+        let clip_count = source.clip_count();
+        source.reader.close().map_err(|e| EngineError::new("close healing input", e))?;
+        channel_converter.dispose()?;
+        Ok((frames as u64, clip_count))
+    })();
+    let (frames, clip_count) = match rendered {
+        Ok(result) => result,
+        Err(error) => return Err(merge_writer_abort(error, writer.abort())),
+    };
     writer.finish()?;
-    Ok(HealingResult { analyzer, frames: frames as u64, clip_count, tempo_factor: tempo, stages })
+    Ok(HealingResult { analyzer, frames, clip_count, tempo_factor: tempo, stages })
 }
 
 fn output_tag_format(format: AudioFormat) -> tags::Format {
@@ -977,12 +1357,7 @@ impl EncodingLibraries {
         if format == AudioFormat::Flac {
             let path = settings.libraries.flac.as_ref().ok_or_else(|| EngineError::new("load FLAC encoder", "trusted libFLAC path is required"))?;
             let expected = settings.libraries.flac_sha256.as_ref().ok_or_else(|| EngineError::new("load FLAC encoder", "libFLAC SHA-256 pin is required"))?;
-            let before = crate::mp3::file_sha256(path).map_err(|e| EngineError::new("hash FLAC encoder", e))?;
-            if !before.eq_ignore_ascii_case(expected) { return Err(EngineError::new("load FLAC encoder", "libFLAC SHA-256 pin mismatch")); }
-            let library = crate::flac::FlacLibrary::load(path).map_err(|e| EngineError::new("load FLAC encoder", e))?;
-            let loaded: String = library.identity().file_sha256.iter().map(|b| format!("{b:02x}")).collect();
-            if !loaded.eq_ignore_ascii_case(expected) { return Err(EngineError::new("load FLAC encoder", "libFLAC changed during loading")); }
-            result.flac = Some(library);
+            result.flac = Some(crate::flac::FlacLibrary::load(path, expected).map_err(|e| EngineError::new("load FLAC encoder", e))?);
         }
         if format == AudioFormat::Mp3 {
             let path = settings.libraries.lame.as_ref().ok_or_else(|| EngineError::new("load MP3 encoder", "trusted LAME path is required"))?;
@@ -997,21 +1372,30 @@ enum Encoder<'a> {
     Flac(crate::flac::FlacEncoder<'a>),
     Mp3 { encoder: crate::mp3::Mp3Encoder<'a>, converter: apple_codec::Pcm16StereoConverter, scratch: [i16; BLOCK * 2] },
 }
+
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+fn apple_finish_error(error: apple_codec::CodecError) -> EngineError {
+    match error {
+        apple_codec::CodecError::Cancelled => EngineError::cancelled("finish Apple output"),
+        error => EngineError::new("finish Apple output", error),
+    }
+}
 impl<'a> Encoder<'a> {
-    fn new(path: &Path, format: AudioFormat, rate: f64, channels: u32, depth: u32,
+    fn new(staged: &file_workflow::StagedOutput, format: AudioFormat, rate: f64, channels: u32, depth: u32,
            source_header: crate::mp3::SourceHeader, settings: &Settings, libraries: &'a EncodingLibraries) -> Result<Self, EngineError> {
         match format {
             AudioFormat::Mp3 => {
+                let source_channels = u8::try_from(channels).map_err(|_| EngineError::new("create MP3 encoder", "MP3 source channel count exceeds 64"))?;
                 let converter = apple_codec::Pcm16StereoConverter::new(rate, channels).map_err(|e| EngineError::new("create MP3 PCM converter", e))?;
-                let config = crate::mp3::Mp3Config { sample_rate: rate as u32, channels: channels as u8,
+                let config = crate::mp3::Mp3Config { sample_rate: rate as u32, channels: source_channels,
                     mode: settings.mp3_mode.into(), source: source_header, native_update_result_byte_3: None };
-                let encoder = crate::mp3::Mp3Encoder::create_new(libraries.lame.as_ref().expect("loaded LAME"), path, config)
+                let file = staged.create_stage().map_err(|e| EngineError::workflow("create MP3 staging file", e))?;
+                let encoder = crate::mp3::Mp3Encoder::from_file(libraries.lame.as_ref().expect("loaded LAME"), file, config)
                     .map_err(|e| EngineError::new("create MP3 encoder", e))?;
                 Ok(Self::Mp3 { encoder, converter, scratch: [0; BLOCK * 2] })
             }
             AudioFormat::Flac => {
-                let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)
-                    .map_err(|e| EngineError::new("create FLAC staging file", e))?;
+                let file = staged.create_stage().map_err(|e| EngineError::workflow("create FLAC staging file", e))?;
                 let encoder = crate::flac::FlacEncoder::new(libraries.flac.as_ref().expect("loaded FLAC"), file, rate, channels, depth)
                     .map_err(|e| EngineError::new("create FLAC encoder", e))?;
                 Ok(Self::Flac(encoder))
@@ -1022,7 +1406,7 @@ impl<'a> Encoder<'a> {
                     AudioFormat::Alac => apple_codec::OutputFormat::Alac, AudioFormat::Aac => apple_codec::OutputFormat::Aac,
                     _ => unreachable!("output plan resolves match input"),
                 };
-                let writer = apple_codec::Writer::create(path, apple_codec::WriterConfig { format, sample_rate: rate, channels, bit_depth: depth })
+                let writer = apple_codec::Writer::create(staged.staging_path(), apple_codec::WriterConfig { format, sample_rate: rate, channels, bit_depth: depth })
                     .map_err(|e| EngineError::new("create Apple encoder", e))?;
                 if !writer.warnings().is_empty() {
                     let warnings = format!("{:?}", writer.warnings());
@@ -1030,6 +1414,16 @@ impl<'a> Encoder<'a> {
                     return Err(EngineError::new("configure Apple encoder", format!("{warnings}; cleanup: {cleanup:?}")));
                 }
                 Ok(Self::Apple(writer))
+            }
+        }
+    }
+    fn abort(self) -> Result<(), EngineError> {
+        match self {
+            Self::Apple(writer) => writer.abort().map_err(|e| EngineError::new("abort Apple output", e)),
+            Self::Flac(writer) => { drop(writer); Ok(()) }
+            Self::Mp3 { encoder, converter, .. } => {
+                drop(encoder);
+                converter.close().map_err(|e| EngineError::new("abort MP3 PCM converter", e))
             }
         }
     }
@@ -1043,9 +1437,19 @@ impl<'a> Encoder<'a> {
             }
         }
     }
-    fn finish(self) -> Result<(), EngineError> {
+    fn finish(self, cancel: &Cancellation, staged: &file_workflow::StagedOutput) -> Result<(), EngineError> {
         match self {
-            Self::Apple(w) => w.finish().map_err(|e| EngineError::new("finish Apple output", e)),
+            Self::Apple(w) => {
+                #[cfg(all(target_os = "macos", not(feature = "portable")))]
+                {
+                    w.finish_cancellable_registered(|| cancel.is_cancelled(), |file| staged.register_codec_stage(file)).map_err(apple_finish_error)
+                }
+                #[cfg(any(target_os = "linux", feature = "portable"))]
+                {
+                    let _ = cancel;
+                    w.finish_registered(|file| staged.register_codec_stage(file)).map_err(|e| EngineError::new("finish Apple output", e))
+                }
+            }
             Self::Flac(w) => { let file = w.finish().map_err(|e| EngineError::new("finish FLAC output", e))?;
                 file.sync_all().map_err(|e| EngineError::new("sync FLAC output", e)) },
             Self::Mp3 { encoder, converter, .. } => {
@@ -1080,11 +1484,13 @@ impl FinalSource {
     }
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 fn stereo_planar_format(rate: f64) -> StreamDescription {
     StreamDescription { sample_rate: rate, format_id: u32::from_be_bytes(*b"lpcm"), format_flags: 0x29,
         bytes_per_packet: 4, frames_per_packet: 1, bytes_per_frame: 4,
         channels_per_frame: 2, bits_per_channel: 32, reserved: 0 }
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 fn interleaved_format(rate: f64, channels: usize) -> StreamDescription {
     StreamDescription { sample_rate: rate, format_id: u32::from_be_bytes(*b"lpcm"), format_flags: 9,
         bytes_per_packet: (channels * 4) as u32, frames_per_packet: 1, bytes_per_frame: (channels * 4) as u32,
@@ -1093,7 +1499,9 @@ fn interleaved_format(rate: f64, channels: usize) -> StreamDescription {
 
 /// GenericOutput's planar-stereo input to interleaved source-channel output.
 /// System AudioConverter owns channel mapping; no manual downmix is inferred.
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 struct ChannelConverter { handle: Option<std::ptr::NonNull<std::ffi::c_void>>, channels: usize }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl ChannelConverter {
     fn new(rate: f64, channels: usize) -> Result<Self, EngineError> {
         if channels == 2 { return Ok(Self { handle: None, channels }); }
@@ -1138,11 +1546,39 @@ impl ChannelConverter {
         Ok(())
     }
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl Drop for ChannelConverter { fn drop(&mut self) { let _ = self.dispose(); } }
+
+#[cfg(any(target_os = "linux", feature = "portable"))]
+struct ChannelConverter(apple_codec::ChannelConverter);
+#[cfg(any(target_os = "linux", feature = "portable"))]
+impl ChannelConverter {
+    fn new(rate: f64, channels: usize) -> Result<Self, EngineError> {
+        apple_codec::ChannelConverter::new(rate, channels).map(Self).map_err(|e| EngineError::new("create channel converter", e))
+    }
+    fn convert(&mut self, left: &[f32], right: &[f32], output: &mut [f32]) -> Result<(), EngineError> {
+        self.0.convert(left, right, output).map_err(|e| EngineError::new("convert channels", e))
+    }
+    fn dispose(&mut self) -> Result<(), EngineError> {
+        self.0.dispose().map_err(|e| EngineError::new("close channel converter", e))
+    }
+}
 
 
 struct EncodedInfo { format: String, stream: StreamDescription, frames: u64 }
 fn inspect_encoded(path: &Path, format: AudioFormat, settings: &Settings) -> Result<EncodedInfo, EngineError> {
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    if format == AudioFormat::Mp3 {
+        let info = crate::mp3::inspect_encoded_output(path).map_err(|e| EngineError::new("inspect encoded output", e))?;
+        let stream = StreamDescription {
+            sample_rate: f64::from(info.sample_rate),
+            format_id: u32::from_be_bytes(*b".mp3"),
+            frames_per_packet: info.frames_per_packet,
+            channels_per_frame: info.channels,
+            ..Default::default()
+        };
+        return Ok(EncodedInfo { format: format_label(path, SourceCodec::Mp3), stream, frames: info.frames });
+    }
     let reader = AudioReader::open(path, None, &input_libraries(settings)).map_err(|e| EngineError::new("inspect encoded output", e))?;
     let stream = reader.source_format();
     let codec = source_codec(path, stream);
@@ -1161,13 +1597,18 @@ fn inspect_encoded(path: &Path, format: AudioFormat, settings: &Settings) -> Res
     Ok(EncodedInfo { format: format_label(path, codec), stream, frames: frames as u64 })
 }
 struct FinalResult { frames: u64, output_volume: f32 }
-fn final_pass(temp: &TempCaf, staging: &Path, measured: &Measured, healed: &HealingResult, template: &Template,
+fn final_pass(temp: &TempCaf, staged: &file_workflow::StagedOutput, measured: &Measured, healed: &HealingResult, template: &Template,
               format: AudioFormat, source_header: crate::mp3::SourceHeader, settings: &Settings,
               libraries: &EncodingLibraries, cancel: &Cancellation) -> Result<FinalResult, EngineError> {
     let processing_rate = measured.processing_rate;
     let channels = measured.source.channels_per_frame as usize;
     let output_code = match format { AudioFormat::Mp3 => 1, AudioFormat::Aac => 6, _ => 0 };
     let output_rate = controller::final_sample_rate(processing_rate, output_code);
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    if output_rate != processing_rate {
+        return Err(EngineError::new("output sample-rate conversion",
+            apple_codec::CodecError::UnsupportedSampleRateConversion { source_rate: processing_rate, client_rate: output_rate }));
+    }
     let plan = FinalPlan::from_healed(template, &healed.analyzer);
     let limiter = FinalLimiter::new(processing_rate, &plan)?;
     let latency = controller::graph_latency_frames(Some(processing_rate), &[Some(limiter.dsp.latency_frames() as f64 / processing_rate)]);
@@ -1193,35 +1634,42 @@ fn final_pass(temp: &TempCaf, staging: &Path, measured: &Measured, healed: &Heal
         limiter, left: [0.0; BLOCK], right: [0.0; BLOCK] };
     let mut channel_converter = ChannelConverter::new(processing_rate, channels)?;
     let bit_depth = apple_codec::recorder_bit_depth(&measured.source);
-    let mut encoder = Encoder::new(staging, format, output_rate, channels as u32, bit_depth, source_header, settings, libraries)?;
     // The original attaches the meter to the output callback and retains its
     // processing-rate configuration even when the output rate differs.
     let mut meter = LoudnessMeter::new(processing_rate, channels).map_err(|e| EngineError::new("create output meter", e))?;
+    let mut encoder = Encoder::new(staged, format, output_rate, channels as u32, bit_depth, source_header, settings, libraries)?;
     let mut rendered = vec![0.0f32; BLOCK * channels];
-    loop {
-        check_cancel(cancel, "final render")?;
-        source.pull(BLOCK)?;
-        channel_converter.convert(&source.left, &source.right, &mut rendered)?;
-        meter.process_interleaved(&rendered).map_err(|e| EngineError::new("output meter", e))?;
-        // The final node is the same Kilohearts wrapper family as the
-        // reference captures; recorder POST remains set.
-        let flags = RENDER_POST;
-        let recorder = source.accounting.recorder.as_mut().expect("final recorder");
-        if let Some(span) = recorder.record_render(flags, true, BLOCK as u32) {
-            let start = usize::try_from(span.offset).map_err(|e| EngineError::new("final recorder", e))?;
-            let end = start.checked_add(span.frames as usize).ok_or_else(|| EngineError::new("final recorder", "span overflows"))?;
-            if end > BLOCK { return Err(EngineError::new("final recorder", "native record span exceeds render buffer")); }
-            encoder.write(&rendered[start * channels..end * channels])?;
+    let rendered_frames = (|| -> Result<u64, EngineError> {
+        loop {
+            check_cancel(cancel, "final render")?;
+            source.pull(BLOCK)?;
+            channel_converter.convert(&source.left, &source.right, &mut rendered)?;
+            meter.process_interleaved(&rendered).map_err(|e| EngineError::new("output meter", e))?;
+            // The final node is the same Kilohearts wrapper family as the
+            // reference captures; recorder POST remains set.
+            let flags = RENDER_POST;
+            let recorder = source.accounting.recorder.as_mut().expect("final recorder");
+            if let Some(span) = recorder.record_render(flags, true, BLOCK as u32) {
+                let start = usize::try_from(span.offset).map_err(|e| EngineError::new("final recorder", e))?;
+                let end = start.checked_add(span.frames as usize).ok_or_else(|| EngineError::new("final recorder", "span overflows"))?;
+                if end > BLOCK { return Err(EngineError::new("final recorder", "native record span exceeds render buffer")); }
+                encoder.write(&rendered[start * channels..end * channels])?;
+            }
+            if source.accounting.finish_render(BLOCK as u32, flags, cancel.is_cancelled()) { break; }
         }
-        if source.accounting.finish_render(BLOCK as u32, flags, cancel.is_cancelled()) { break; }
-    }
-    check_cancel(cancel, "final render")?;
-    let frames = source.accounting.recorder.as_ref().expect("final recorder").current_frames();
-    if frames < 0 { return Err(EngineError::new("final recorder", "negative output frame count")); }
-    channel_converter.dispose()?;
-    source.reader.close().map_err(|e| EngineError::new("close intermediate input", e))?;
-    encoder.finish()?;
-    Ok(FinalResult { frames: frames as u64, output_volume: meter.integrated_loudness() as f32 })
+        check_cancel(cancel, "final render")?;
+        let frames = source.accounting.recorder.as_ref().expect("final recorder").current_frames();
+        if frames < 0 { return Err(EngineError::new("final recorder", "negative output frame count")); }
+        channel_converter.dispose()?;
+        source.reader.close().map_err(|e| EngineError::new("close intermediate input", e))?;
+        Ok(frames as u64)
+    })();
+    let frames = match rendered_frames {
+        Ok(frames) => frames,
+        Err(error) => return Err(merge_writer_abort(error, encoder.abort())),
+    };
+    encoder.finish(cancel, staged)?;
+    Ok(FinalResult { frames, output_volume: meter.integrated_loudness() as f32 })
 }
 
 
@@ -1240,6 +1688,14 @@ fn abort_with(mut error: EngineError, staged: file_workflow::StagedOutput) -> En
         }
     }
     error
+}
+
+fn merge_writer_abort(mut primary: EngineError, cleanup: Result<(), EngineError>) -> EngineError {
+    if let Err(error) = cleanup {
+        primary.cancelled = false;
+        primary.message.push_str(&format!("; writer abort failed: {error}"));
+    }
+    primary
 }
 
 /// Analyze, heal, remeasure, limit/encode, copy source metadata and publish.
@@ -1276,7 +1732,8 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         let header = crate::mp3::inspect_mp3_header(input).map_err(|e| EngineError::new("inspect source MP3 header", e))?;
         let source_header = if measured.codec == SourceCodec::Mp3 { crate::mp3::SourceHeader::Mp3(header) }
             else { crate::mp3::SourceHeader::Other(header) };
-        let final_result = final_pass(&temp, staged.staging_path(), &measured, &healed, template, plan.format(), source_header, settings, &libraries, cancel)?;
+        let final_result = final_pass(&temp, &staged, &measured, &healed, template, plan.format(), source_header, settings, &libraries, cancel)?;
+        staged.remember_staging_file().map_err(|e| EngineError::workflow("pin output stage", e))?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after encoding", e))?;
         if let Some(seconds) = controlled_mp4_time {
             apple_codec::set_mp4_header_times(staged.staging_path(), seconds)
@@ -1299,11 +1756,13 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         let choice = if plan.requested_format() == AudioFormat::MatchInput { tags::OutputChoice::MatchInput } else { tags::OutputChoice::Explicit };
         let bridge = bridge(settings)?;
         let tag_source = staged.backup_path().unwrap_or(input);
+        staged.remember_staging_file().map_err(|e| EngineError::workflow("verify output stage", e))?;
         let report = bridge.transfer(tag_source, staged.staging_path(), source_tag_format(input)?,
             output_tag_format(plan.format()), choice, &marker).map_err(|e| EngineError::new("copy source tags", e))?;
         if !report.is_success() {
             return Err(EngineError::new("copy source tags", format!("copy error: {:?}; marker error: {:?}", report.copy_error, report.marker_error)));
         }
+        staged.accept_tag_rewrite().map_err(|e| EngineError::workflow("pin tagged output", e))?;
         let raw = bridge.read_processing_marker(staged.staging_path(), output_tag_format(plan.format()))
             .map_err(|e| EngineError::new("verify processing marker", e))?;
         let marker_status = if has_payload {
@@ -1349,13 +1808,326 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         output_frames: output.frames, input_volume: measured.values.input_level_db, healed_volume: healed.analyzer.integrated_loudness() as f32,
         output_volume: output.output_volume, input_pitch_hz: measured.values.input_tuning_hz, output_pitch_hz: output_pitch,
         tempo_factor: healed.tempo_factor, clip_count: healed.clip_count, applied_stages: stages, processing_marker_status: marker_status,
-        input_marker_override: prepared.input_marker_override, controlled_mp4_time_1904: controlled_mp4_time })
+        input_marker_override: prepared.input_marker_override, source_tags_unavailable: prepared.source_tags_unavailable.clone(),
+        controlled_mp4_time_1904: controlled_mp4_time })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn partial_caf_stage_is_owned_before_initialization_write_and_cancel_errors() {
+        for scenario in 0..3 {
+            let temp = TempCaf::new().unwrap();
+            let directory = temp.directory.clone();
+            if scenario == 0 {
+                assert!(CafWriter::new(&temp, 48_000.0, usize::MAX).is_err());
+            } else {
+                let mut writer = CafWriter::new(&temp, 48_000.0, 2).unwrap();
+                if scenario == 1 {
+                    assert!(writer.write(&[0.25]).is_err());
+                } else {
+                    writer.write(&[0.0; 1024]).unwrap();
+                    let token = Cancellation::new(); token.cancel();
+                    assert!(check_cancel(&token, "analysis").unwrap_err().cancelled);
+                }
+                writer.abort().unwrap();
+            }
+            temp.cleanup().unwrap();
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn writer_abort_failure_preserves_primary_error_and_breaks_clean_cancellation() {
+        let cancelled = EngineError::cancelled("healing");
+        let clean = merge_writer_abort(cancelled, Ok(()));
+        assert!(clean.cancelled);
+        let primary = EngineError::cancelled("final render");
+        let combined = merge_writer_abort(primary, Err(EngineError::new("close intermediate", "OSStatus -1")));
+        assert!(!combined.cancelled);
+        assert_eq!(combined.stage, "final render");
+        assert!(combined.message.contains("writer abort failed: close intermediate: OSStatus -1"));
+    }
+
+    #[test]
+    fn apple_writer_abort_removes_unpublished_output() {
+        let temp = TempCaf::new().unwrap();
+        let destination = temp.directory.join("output.wav");
+        let config = apple_codec::WriterConfig {
+            format: apple_codec::OutputFormat::Wav, sample_rate: 44_100.0, channels: 2, bit_depth: 16,
+        };
+        let mut writer = apple_codec::Writer::create(&destination, config).unwrap();
+        writer.write(&[0.0; 32]).unwrap();
+        Encoder::Apple(writer).abort().unwrap();
+        assert!(!destination.exists());
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires pinned public PN_LAME_LIB/PN_LAME_SHA256 and PN_FLAC_LIB/PN_FLAC_SHA256"]
+    fn partial_encoders_cleanup_after_errors_and_cancellation() {
+        let root = TempCaf::new().unwrap();
+        let source = root.directory.join("source.wav");
+        fs::write(&source, b"synthetic source").unwrap();
+        let files = file_workflow::discover_inputs(&[source.clone()]).unwrap();
+        let mut settings = Settings::defaults(&root.directory, 1);
+        settings.libraries.lame = Some(PathBuf::from(std::env::var_os("PN_LAME_LIB").unwrap()));
+        settings.libraries.lame_sha256 = Some(std::env::var("PN_LAME_SHA256").unwrap());
+        settings.libraries.flac = Some(PathBuf::from(std::env::var_os("PN_FLAC_LIB").unwrap()));
+        settings.libraries.flac_sha256 = Some(std::env::var("PN_FLAC_SHA256").unwrap());
+        let source_header = crate::mp3::SourceHeader::Other(crate::mp3::Mp3Header::default());
+        for format in [AudioFormat::Mp3, AudioFormat::Flac, AudioFormat::Wav, AudioFormat::Aiff, AudioFormat::Alac] {
+            for cancelled in [false, true] {
+                let output = file_workflow::OutputSettings { mode: file_workflow::OutputMode::SameFolder, format };
+                let plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &output, None).unwrap();
+                let staged = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+                let directory = staged.workspace_directory().to_owned();
+                let libraries = EncodingLibraries::load(format, &settings).unwrap();
+                let mut encoder = Encoder::new(&staged, format, 48_000.0, 2, 16, source_header.clone(), &settings, &libraries).unwrap();
+                let error = if cancelled {
+                    encoder.write(&[0.0; 1024]).unwrap();
+                    let token = Cancellation::new(); token.cancel();
+                    check_cancel(&token, "final render").unwrap_err()
+                } else {
+                    encoder.write(&[0.25]).unwrap_err()
+                };
+                drop(encoder);
+                let error = abort_with(error, staged);
+                assert_eq!(error.cancelled, cancelled, "format={format:?}: {error}");
+                assert!(!error.message.contains("cleanup failed"), "format={format:?}: {error}");
+                assert!(!directory.exists(), "format={format:?} left {}", directory.display());
+                assert!(!plan.destination().exists());
+            }
+        }
+        for format in [AudioFormat::Mp3, AudioFormat::Flac] {
+            let output = file_workflow::OutputSettings { mode: file_workflow::OutputMode::SameFolder, format };
+            let plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &output, None).unwrap();
+            let staged = plan.begin(&FileIdentity::capture(&source).unwrap()).unwrap();
+            let directory = staged.workspace_directory().to_owned();
+            let libraries = EncodingLibraries::load(format, &settings).unwrap();
+            let file = staged.create_stage().unwrap();
+            if format == AudioFormat::Mp3 {
+                let invalid = crate::mp3::Mp3Config { sample_rate: 1, channels: 2, mode: crate::mp3::Mp3Mode::Cbr320,
+                    source: source_header.clone(), native_update_result_byte_3: None };
+                assert!(crate::mp3::Mp3Encoder::from_file(libraries.lame.as_ref().unwrap(), file, invalid).is_err());
+            } else {
+                assert!(crate::flac::FlacEncoder::new(libraries.flac.as_ref().unwrap(), file, 48_000.0, 0, 16).is_err());
+            }
+            staged.abort().unwrap();
+            assert!(!directory.exists(), "initialization failure left {}", directory.display());
+        }
+        fs::remove_file(source).unwrap();
+        root.cleanup().unwrap();
+    }
+
+    #[test]
+    fn source_container_magic_classifies_all_policy_families() {
+        use SniffedContainer::{Ogg, Unknown, Writable};
+        for (bytes, expected) in [
+            (b"RIFF\xff\xff\xff\xffWAVE".as_slice(), Writable(tags::Format::Wav)),
+            (b"FORM\xff\xff\xff\xffAIFF".as_slice(), Writable(tags::Format::Aiff)),
+            (b"FORM\xff\xff\xff\xffAIFC".as_slice(), Writable(tags::Format::Aiff)),
+            (b"fLaC".as_slice(), Writable(tags::Format::Flac)),
+            (b"ID3".as_slice(), Unknown),
+            (b"\xff\xfb".as_slice(), Writable(tags::Format::Mp3)),
+            (b"\0\0\0\x18ftyp".as_slice(), Unknown),
+            (b"OggS".as_slice(), Ogg),
+            (b"RIFF".as_slice(), Unknown),
+            (b"FORM\0\0\0\x04WAVE".as_slice(), Unknown),
+            (b"Ogg".as_slice(), Unknown),
+            (b"\xff\x1b".as_slice(), Unknown),
+            (b"".as_slice(), Unknown),
+        ] {
+            assert_eq!(sniff_container_prefix(bytes), expected, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn mp4_sniff_walks_leading_atoms_and_rejects_incomplete_headers() {
+        let fixture = TempCaf::new().unwrap();
+        let path = fixture.directory.join("atom-walk");
+        for first in [b"ftyp", b"moov", b"mdat"] {
+            let mut bytes = if first == b"moov" { b"\0\0\0\x10moov\0\0\0\x08trak".to_vec() }
+                else { let mut bytes = 8u32.to_be_bytes().to_vec(); bytes.extend_from_slice(first); bytes };
+            if first != b"moov" { bytes.extend_from_slice(b"\0\0\0\x10moov\0\0\0\x08trak"); }
+            if first != b"mdat" { bytes.extend_from_slice(b"\0\0\0\x08mdat"); }
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap(), (SniffedContainer::Writable(tags::Format::Mp4), 0, false));
+        }
+        let mut leading = b"\0\0\0\x08free\0\0\0\x01wide\0\0\0\0\0\0\0\x10\0\0\0\x08skip".to_vec();
+        leading.extend_from_slice(b"\0\0\0\x08uuid\0\0\0\x10moov\0\0\0\x08trak\0\0\0\x08mdat");
+        fs::write(&path, &leading).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap(), (SniffedContainer::Writable(tags::Format::Mp4), 0, false));
+        for bytes in [
+            b"\0\0\0\0free\0\0\0\x08moov".as_slice(),
+            b"\0\0\0\x04free\0\0\0\x08moov".as_slice(),
+            b"\0\0\0\x40free\0\0\0\x08moov".as_slice(),
+            b"\0\0\0\x01wide\0\0\0\0".as_slice(),
+            b"\0\0\0\x08ftyp\0\0\0\x08moov\0\0\0\x08mdat".as_slice(),
+            b"\0\0\0\x10moov\0\0\0\x20trak\0\0\0\x08mdat".as_slice(),
+            b"unknown garbage".as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap(), (SniffedContainer::Unknown, 0, false), "{bytes:?}");
+        }
+        fs::remove_file(path).unwrap();
+        fixture.cleanup().unwrap();
+    }
+
+    #[test]
+    fn id3_prefix_sniff_validates_sizes_flags_footer_and_following_family() {
+        let fixture = TempCaf::new().unwrap();
+        let path = fixture.directory.join("id3-prefix");
+        let empty = b"ID3\x04\0\0\0\0\0\0";
+        let footer_header = b"ID3\x04\0\x10\0\0\0\0";
+        let footer = b"3DI\x04\0\x10\0\0\0\0";
+        for (after, expected) in [
+            (b"fLaC".as_slice(), SniffedContainer::Writable(tags::Format::Flac)),
+            (b"\xff\xfb\x90\x64".as_slice(), SniffedContainer::Writable(tags::Format::Mp3)),
+            (b"RIFF\0\0\0\0WAVE".as_slice(), SniffedContainer::Writable(tags::Format::Wav)),
+            (b"FORM\0\0\0\0AIFC".as_slice(), SniffedContainer::Writable(tags::Format::Aiff)),
+            (b"\0\0\0\x08free\0\0\0\x10moov\0\0\0\x08trak\0\0\0\x08mdat".as_slice(), SniffedContainer::Writable(tags::Format::Mp4)),
+            (b"OggS".as_slice(), SniffedContainer::Ogg),
+            (b"other".as_slice(), SniffedContainer::Unknown),
+        ] {
+            let mut bytes = empty.to_vec(); bytes.extend_from_slice(footer_header); bytes.extend_from_slice(footer); bytes.extend_from_slice(after);
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap(), (expected, 2, false), "{after:?}");
+        }
+        for bytes in [
+            b"ID3".as_slice(),
+            b"ID3\x04\0\0\x80\0\0\0fLaC".as_slice(),
+            b"ID3\x05\0\0\0\0\0\0fLaC".as_slice(),
+            b"ID3\x03\0\x10\0\0\0\0fLaC".as_slice(),
+            b"ID3\x04\0\0\0\0\0\x7ffLaC".as_slice(),
+            b"ID3\x04\0\x10\0\0\0\0fLaC".as_slice(),
+            b"ID3\x04\0\x10\0\0\0\0bad-footerfLaC".as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap().0, SniffedContainer::Unknown, "{bytes:?}");
+        }
+        fs::remove_file(path).unwrap();
+        fixture.cleanup().unwrap();
+    }
+
+    #[test]
+    fn mpeg_sniff_requires_three_bounded_consistent_frames_and_respects_magic() {
+        let fixture = TempCaf::new().unwrap();
+        let path = fixture.directory.join("mpeg-scan");
+        let mut frames = Vec::new();
+        for _ in 0..3 { frames.extend_from_slice(&[0xff, 0xfb, 0x90, 0x64]); frames.extend_from_slice(&[0; 413]); }
+        for prefix in [vec![0; 23], b"junk-before-audio".to_vec()] {
+            let mut bytes = prefix.clone(); bytes.extend_from_slice(&frames);
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Writable(tags::Format::Mp3));
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap().0, SniffedContainer::Unknown);
+            let mut id3 = b"ID3\x04\0\0\0\0\0\0".to_vec(); id3.extend_from_slice(&bytes);
+            fs::write(&path, id3).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Wav).unwrap().0, SniffedContainer::Writable(tags::Format::Mp3));
+        }
+        let mut two = b"junk".to_vec(); two.extend_from_slice(&frames[..834]);
+        fs::write(&path, two).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Unknown);
+        let mut inconsistent = b"junk".to_vec(); inconsistent.extend_from_slice(&frames); inconsistent[4 + 417 + 2] = 0x94;
+        fs::write(&path, inconsistent).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Unknown);
+        let mut reserved = b"junk".to_vec(); reserved.extend_from_slice(&frames); reserved[4 + 417 + 1] = 0xeb;
+        fs::write(&path, reserved).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Unknown);
+        let mut reserved_emphasis = b"junk".to_vec(); reserved_emphasis.extend_from_slice(&frames); reserved_emphasis[4 + 417 + 3] = 0x66;
+        fs::write(&path, reserved_emphasis).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Unknown);
+        let mut beyond = vec![0; 64 * 1024]; beyond.extend_from_slice(&frames);
+        fs::write(&path, beyond).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Unknown);
+        for (prefix, expected) in [
+            (b"RIFF\0\0\0\0WAVE".as_slice(), SniffedContainer::Writable(tags::Format::Wav)),
+            (b"FORM\0\0\0\0AIFF".as_slice(), SniffedContainer::Writable(tags::Format::Aiff)),
+            (b"fLaC".as_slice(), SniffedContainer::Writable(tags::Format::Flac)),
+            (b"OggS".as_slice(), SniffedContainer::Ogg),
+        ] {
+            let mut bytes = prefix.to_vec(); bytes.extend_from_slice(&frames);
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, expected);
+        }
+        let mut mp4 = b"\0\0\0\x10ftypM4A \0\0\0\0\0\0\0\x10moov\0\0\0\x08trak".to_vec();
+        mp4.extend_from_slice(&u32::try_from(frames.len() + 8).unwrap().to_be_bytes());
+        mp4.extend_from_slice(b"mdat"); mp4.extend_from_slice(&frames);
+        fs::write(&path, mp4).unwrap();
+        assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Writable(tags::Format::Mp4));
+        for name in [b"ftyp", b"moov", b"mdat"] {
+            let mut collision = frames.clone(); collision[4..8].copy_from_slice(name);
+            fs::write(&path, collision).unwrap();
+            assert_eq!(sniff_container(&path, tags::Format::Mp3).unwrap().0, SniffedContainer::Writable(tags::Format::Mp3));
+        }
+        fs::remove_file(path).unwrap();
+        fixture.cleanup().unwrap();
+    }
+
+    #[test]
+    fn unavailable_riff_chunk_walk_clamps_audio_and_refuses_marker_or_garbage() {
+        fn chunk(bytes: &mut Vec<u8>, id: &[u8; 4], size: u32, payload: &[u8], wav: bool) {
+            bytes.extend_from_slice(id);
+            bytes.extend_from_slice(&if wav { size.to_le_bytes() } else { size.to_be_bytes() });
+            bytes.extend_from_slice(payload);
+        }
+        fn prefix(wav: bool) -> Vec<u8> {
+            let mut bytes = if wav { b"RIFF\xff\xff\xff\xffWAVE".to_vec() } else { b"FORM\xff\xff\xff\xffAIFF".to_vec() };
+            if wav { chunk(&mut bytes, b"fmt ", 16, &[0; 16], true); }
+            else { chunk(&mut bytes, b"COMM", 18, &[0; 18], false); }
+            bytes
+        }
+        let fixture = TempCaf::new().unwrap();
+        let path = fixture.directory.join("chunk-walk");
+        for (wav, format) in [(true, tags::Format::Wav), (false, tags::Format::Aiff)] {
+            for marker in [b"PLTN", b"ID3 ", b"id3 "] {
+                let mut bytes = prefix(wav);
+                chunk(&mut bytes, marker, 0, &[], wav);
+                if wav { chunk(&mut bytes, b"data", 4, &[0; 4], true); }
+                else { chunk(&mut bytes, b"SSND", 8, &[0; 8], false); }
+                fs::write(&path, bytes).unwrap();
+                assert!(verify_unavailable_riff_marker_absent(&path, format, "fixture").unwrap_err().message.contains("possible PLTN or ID3"));
+            }
+            let mut bytes = prefix(wav);
+            if wav { chunk(&mut bytes, b"data", 100, b"PLTN", true); }
+            else { chunk(&mut bytes, b"SSND", 100, b"\0\0\0\0\0\0\0\0PLTN", false); }
+            fs::write(&path, &bytes).unwrap();
+            verify_unavailable_riff_marker_absent(&path, format, "fixture").unwrap();
+
+            let mut partial_header = prefix(wav);
+            partial_header.extend_from_slice(b"PLT");
+            fs::write(&path, partial_header).unwrap();
+            assert!(verify_unavailable_riff_marker_absent(&path, format, "fixture").is_err());
+            let mut truncated_metadata = prefix(wav);
+            chunk(&mut truncated_metadata, b"JUNK", 100, b"XX", wav);
+            fs::write(&path, truncated_metadata).unwrap();
+            assert!(verify_unavailable_riff_marker_absent(&path, format, "fixture").is_err());
+            let mut garbage = prefix(wav);
+            garbage.extend_from_slice(&[0xff; 8]);
+            fs::write(&path, garbage).unwrap();
+            assert!(verify_unavailable_riff_marker_absent(&path, format, "fixture").is_err());
+        }
+        fs::remove_file(path).unwrap();
+        fixture.cleanup().unwrap();
+    }
+
+
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
+    #[test]
+    fn apple_finish_only_marks_unwrapped_cancellation_as_cancelled() {
+        let cancelled = apple_finish_error(apple_codec::CodecError::Cancelled);
+        assert!(cancelled.cancelled);
+        let cleanup = apple_finish_error(apple_codec::CodecError::Cleanup {
+            primary: Box::new(apple_codec::CodecError::Cancelled),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cleanup denied"),
+        });
+        assert!(!cleanup.cancelled);
+        assert!(cleanup.message.contains("cleanup denied"));
+    }
 
     #[test]
     fn marker_report_retains_exact_decoded_pitch_number() {

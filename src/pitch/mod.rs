@@ -1592,6 +1592,7 @@ mod tests {
     /// Compare state after actual original and Rust 512-frame adapter calls.
     /// Each run must identify one controlled native splitter scratch profile;
     /// this does not infer the original GUI's allocator or claim file parity.
+    #[cfg(target_arch = "aarch64")]
     #[test]
     #[ignore = "requires PITCH_SCHEDULER_ORACLE from state-oracle.cpp"]
     fn scheduler_checkpoints_match_original_component() {

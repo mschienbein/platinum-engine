@@ -5,7 +5,6 @@
 //! `NSJSONSerialization` options 0. This is not a promise that another macOS
 //! build will emit the same bytes. Full-container and whole-file parity require
 //! the tag writer and an original-file oracle as well.
-#![cfg(target_os = "macos")]
 
 use std::error::Error;
 use std::ffi::{c_char, c_void, CStr};
@@ -574,6 +573,10 @@ pub const ID3_GEOB_MIME: &str = "application/json";
 pub const MP4_FREEFORM_KEY: &str = "----:com.mixedinkey.platinumnotes:data";
 pub const FLAC_XIPH_KEY: &str = "PLATINUMNOTES";
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+mod native {
+use super::*;
+
 const KEYS: [&str; 20] = [
     "osType", "softwareVersion", "backupFileName", "isProcessed",
     "appliedVolumeAdjustment", "appliedClipRepair", "appliedPitchCorrection",
@@ -686,7 +689,7 @@ fn number_double(class: Id, value: f64) -> Result<Id, MarkerError> {
     if result.is_null() { Err(MarkerError::FoundationObjectNil("NSNumber numberWithDouble:")) } else { Ok(result) }
 }
 
-fn marker_from_json(bytes: &[u8]) -> Result<Marker, MarkerError> {
+pub(super) fn marker_from_json(bytes: &[u8]) -> Result<Marker, MarkerError> {
     if bytes.is_empty() { return Err(MarkerError::InvalidMarker("empty decoded payload")); }
     let _pool = Pool::new();
     let string_class = unsafe { objc_getClass(c"NSString".as_ptr()) };
@@ -798,7 +801,7 @@ fn marker_text(object: Id, string_class: Id, null_class: Id, key: &'static str)
     }))
 }
 
-fn with_foundation_json<T>(marker: &Marker, use_bytes: impl FnOnce(&[u8]) -> Result<T, MarkerError>) -> Result<Option<T>, MarkerError> {
+pub(super) fn with_foundation_json<T>(marker: &Marker, use_bytes: impl FnOnce(&[u8]) -> Result<T, MarkerError>) -> Result<Option<T>, MarkerError> {
     let _pool = Pool::new();
     // SAFETY: NSString is loaded from the linked Foundation framework; class
     // and all autoreleased values are only used on the current thread.
@@ -866,6 +869,17 @@ fn with_foundation_json<T>(marker: &Marker, use_bytes: impl FnOnce(&[u8]) -> Res
         unsafe { slice::from_raw_parts(ptr, len) }
     };
     use_bytes(bytes).map(Some)
+}
+}
+
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+use native::{marker_from_json, with_foundation_json};
+
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::foundation::marker_from_json;
+#[cfg(any(target_os = "linux", feature = "portable"))]
+fn with_foundation_json<T>(marker: &Marker, use_bytes: impl FnOnce(&[u8]) -> Result<T, MarkerError>) -> Result<Option<T>, MarkerError> {
+    crate::portable::foundation::marker_json_bytes(marker)?.map(|bytes| use_bytes(&bytes)).transpose()
 }
 
 #[cfg(test)]

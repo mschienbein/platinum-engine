@@ -123,6 +123,8 @@ fn expected_split(rate: u32, n: usize, mode: usize) -> SplitCapture {
     capture
 }
 
+// This native-oracle comparator verifies the complete ARM FPCR register.
+#[cfg(target_arch = "aarch64")]
 #[test]
 #[ignore = "requires PITCH_SPECTRAL_ORACLE_OUTPUT from the identity-guarded native oracle"]
 fn original_fft_and_splitter_match_generated_signals() {

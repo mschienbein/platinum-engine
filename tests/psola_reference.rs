@@ -1,5 +1,6 @@
 //! Native PSOLA oracle comparisons and source-independent boundary checks.
 //! The ignored oracle test requires outputs produced by psola-oracle.cpp.
+use platinum_engine::portable;
 
 #[path = "../src/pitch/fft.rs"]
 mod fft;

@@ -1,0 +1,5 @@
+52761fad8dd008ce0f8fc1e996b63925195b9b4142928a8f5e2ddbec9b0f98d2  src/portable/math.rs
+834c57dbd37eb30c86a53bc4a3b182537fcb987a2e2f328fc7c142073ec99dfc  tools/portable/math/shim/src/lib.rs
+9a5d27670ec9d5afb48ea9ced980d41176637028d3e7a6f19180122b4c1649d9  tools/portable/math/shim/pn_codec_math.h
+e3d53edfd9c8848cbb05a90bd4979589fdb9d5ad63d106fa49c4c4acc38ef2fb  tools/portable/math/shim/Cargo.toml
+1862dd5d3e9839d3849f2ed790f68d0da720c51a24f5107e201d97c49ee4c6c6  tools/portable/math/shim/Cargo.lock

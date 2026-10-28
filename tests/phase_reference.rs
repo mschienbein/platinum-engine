@@ -3,6 +3,7 @@
 //! they are not bundled goldens and do not establish complete-file parity.
 
 use platinum_engine::phase::{HOP, OVERLAP, PhaseCorrection, WINDOW};
+use platinum_engine::portable::arm_scalar::ArmFloat;
 
 const PARAMETERS: [f32; 4] = [0.2, 0.5, 0.8, 1.0];
 const FRAMES: usize = WINDOW + 2 * HOP + 257;
@@ -40,11 +41,11 @@ fn reference_stream(input: &[f32], coefficients: &[[f64; 6]]) -> Vec<f32> {
             let (mut z0, mut z1) = (0.0_f64, 0.0_f64);
             for sample in window.iter_mut().rev() {
                 let x = f64::from(*sample);
-                let y = coeff[3].mul_add(x, z0);
+                let y = coeff[3].arm_mul_add(x, z0);
                 let term0 = y * -coeff[1];
-                z0 = z1 + coeff[4].mul_add(x, term0);
+                z0 = z1 + coeff[4].arm_mul_add(x, term0);
                 let term1 = y * -coeff[2];
-                z1 = coeff[5].mul_add(x, term1);
+                z1 = coeff[5].arm_mul_add(x, term1);
                 *sample = y as f32;
             }
         }

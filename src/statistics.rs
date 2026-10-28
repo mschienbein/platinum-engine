@@ -8,7 +8,7 @@
 
 use crate::engine::ProcessReport;
 use crate::file_workflow::Cancellation;
-use crate::settings::{SettingsError, sync_directory, write_stage};
+use crate::settings::{SecureSettingsDirectory, SettingsError, secure_file_metadata, secure_path_metadata, sync_directory, validate_private_acl, write_stage};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::error::Error;
 use std::ffi::{CString, c_char, c_int, c_uint};
@@ -17,16 +17,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATE_VERSION: u32 = 1;
 const STATE_FILE: &str = "statistics.json";
 const LOCK_FILE: &str = "statistics.lock";
-// Darwin sys/fcntl.h; the crate targets macOS arm64.
-const O_NOFOLLOW: c_int = 0x00000100;
-const O_NONBLOCK: c_int = 0x00000004;
+const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+const O_NONBLOCK: c_int = libc::O_NONBLOCK;
 
 // Option fields normally accept a missing key. This field must be present even
 // when null, so a truncated/older state is not silently treated as a baseline.
@@ -106,9 +106,10 @@ impl Error for StatisticsError {
     }
 }
 
-#[link(name = "System")]
+#[cfg_attr(target_os = "macos", link(name = "System"))]
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
+    #[cfg(target_os = "macos")]
     fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
 }
 
@@ -116,18 +117,22 @@ unsafe extern "C" {
 struct FileStamp {
     device: u64, inode: u64, size: u64,
     mtime: i64, mtime_nsec: i64, ctime: i64, ctime_nsec: i64,
+    mode: u32, uid: u32,
 }
 impl FileStamp {
     fn new(metadata: &fs::Metadata) -> Self {
         Self { device: metadata.dev(), inode: metadata.ino(), size: metadata.size(),
             mtime: metadata.mtime(), mtime_nsec: metadata.mtime_nsec(),
-            ctime: metadata.ctime(), ctime_nsec: metadata.ctime_nsec() }
+            ctime: metadata.ctime(), ctime_nsec: metadata.ctime_nsec(), mode: metadata.mode(), uid: metadata.uid() }
     }
 }
 
 fn validate_state_path(path: &Path, expected: Option<FileStamp>) -> Result<(), StatisticsError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 && Some(FileStamp::new(&metadata)) == expected => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 && expected.is_some() => {
+            let metadata = secure_path_metadata(path, false).map_err(StatisticsError::Storage)?;
+            if Some(FileStamp::new(&metadata)) == expected { Ok(()) } else { Err(StatisticsError::Changed(path.to_owned())) }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => Ok(()),
         Err(source) if source.kind() != io::ErrorKind::NotFound =>
             Err(StatisticsError::Io { operation: "inspect statistics identity", path: path.to_owned(), source }),
@@ -140,6 +145,20 @@ fn cleanup_stage(path: &Path, cause: StatisticsError) -> StatisticsError {
         Ok(()) => cause,
         Err(source) => StatisticsError::Cleanup { path: path.to_owned(), cause: Box::new(cause), source },
     }
+}
+fn cleanup_owned_stage(path: &Path, file: &File, cause: StatisticsError) -> StatisticsError {
+    let identity = file.metadata().and_then(|held| {
+        let named = fs::symlink_metadata(path)?;
+        if !held.file_type().is_file() || !named.file_type().is_file()
+            || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "statistics stage was replaced; retained"));
+        }
+        Ok(())
+    });
+    if let Err(source) = identity {
+        return StatisticsError::Cleanup { path: path.to_owned(), cause: Box::new(cause), source };
+    }
+    cleanup_stage(path, cause)
 }
 
 fn publish_stage(stage: &Path, path: &Path, expected: Option<FileStamp>) -> Result<(), StatisticsError> {
@@ -154,8 +173,12 @@ fn publish_stage(stage: &Path, path: &Path, expected: Option<FileStamp>) -> Resu
     let from = encode(stage)?;
     let to = encode(path)?;
     // SAFETY: both path strings are NUL-terminated and live for this call.
-    // Darwin RENAME_EXCL atomically refuses to replace an existing entry.
-    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x00000004) } == 0 { return Ok(()); }
+    // The no-replace flag prevents an existing state from being clobbered.
+    #[cfg(target_os = "macos")]
+    let status = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x00000004) };
+    #[cfg(target_os = "linux")]
+    let status = unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    if status == 0 { return Ok(()); }
     let source = io::Error::last_os_error();
     if source.kind() == io::ErrorKind::AlreadyExists { Err(StatisticsError::Changed(path.to_owned())) }
     else { Err(StatisticsError::Io { operation: "publish statistics", path: path.to_owned(), source }) }
@@ -163,19 +186,23 @@ fn publish_stage(stage: &Path, path: &Path, expected: Option<FileStamp>) -> Resu
 
 // Separate from the settings lock: this lock must not follow symlinks, be a
 // special file, or be hard-linked to the state file whose inode we replace.
-struct StatisticsLock { file: File, path: PathBuf, device: u64, inode: u64 }
+struct StatisticsLock { file: File, path: PathBuf, device: u64, inode: u64, directory: SecureSettingsDirectory, alias: PathBuf, state_pin: Mutex<Option<File>> }
 impl StatisticsLock {
     fn acquire(path: &Path, cancelled: impl Fn() -> bool) -> Result<Self, StatisticsError> {
+        let parent = path.parent().ok_or_else(|| StatisticsError::Corrupt("statistics lock has no parent".into()))?;
+        let directory = SecureSettingsDirectory::open(parent).map_err(StatisticsError::Storage)?;
+        let alias = directory.alias().map_err(StatisticsError::Storage)?;
+        let pinned_path = alias.join(LOCK_FILE);
         let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK).open(path)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK).open(&pinned_path)
             .map_err(|source| StatisticsError::Io { operation: "open statistics lock", path: path.to_owned(), source })?;
-        let metadata = file.metadata().map_err(|source| StatisticsError::Io {
-            operation: "inspect statistics lock", path: path.to_owned(), source,
-        })?;
-        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        let initial = file.metadata().map_err(|source| StatisticsError::Io { operation: "inspect statistics lock", path: path.to_owned(), source })?;
+        if !initial.file_type().is_file() || initial.nlink() != 1 {
             return Err(StatisticsError::Corrupt(format!("{} is not a singly linked regular lock file", path.display())));
         }
-        let lock = Self { file, path: path.to_owned(), device: metadata.dev(), inode: metadata.ino() };
+        let metadata = secure_file_metadata(&file, path, false).map_err(StatisticsError::Storage)?;
+        validate_private_acl(&file, path).map_err(StatisticsError::Storage)?;
+        let lock = Self { file, path: pinned_path, device: metadata.dev(), inode: metadata.ino(), directory, alias, state_pin: Mutex::new(None) };
         loop {
             lock.validate()?;
             // SAFETY: the descriptor remains owned by lock until this scope
@@ -195,6 +222,7 @@ impl StatisticsLock {
     }
 
     fn validate(&self) -> Result<(), StatisticsError> {
+        self.directory.validate().map_err(StatisticsError::Storage)?;
         let descriptor = self.file.metadata().map_err(|source| StatisticsError::Io {
             operation: "inspect held statistics lock", path: self.path.clone(), source,
         })?;
@@ -208,6 +236,9 @@ impl StatisticsLock {
             || path.dev() != self.device || path.ino() != self.inode {
             return Err(StatisticsError::Changed(self.path.clone()));
         }
+        secure_file_metadata(&self.file, &self.path, false).map_err(StatisticsError::Storage)?;
+        validate_private_acl(&self.file, &self.path).map_err(StatisticsError::Storage)?;
+        secure_path_metadata(&self.path, false).map_err(StatisticsError::Storage)?;
         Ok(())
     }
 }
@@ -221,6 +252,10 @@ pub struct StatisticsStore { directory: PathBuf }
 
 impl StatisticsStore {
     pub fn new(directory: impl Into<PathBuf>) -> Self { Self { directory: directory.into() } }
+    #[cfg(target_os = "linux")]
+    pub fn in_home(home: &Path) -> Self {
+        Self::new(crate::settings::xdg_directory("XDG_STATE_HOME", home.join(".local/state")).join("platinum-engine"))
+    }
     pub fn statistics_path(&self) -> PathBuf { self.directory.join(STATE_FILE) }
 
     /// Missing state is an empty Engine baseline; malformed state is an error.
@@ -268,26 +303,20 @@ impl StatisticsStore {
     }
 
     fn lock(&self, cancel: &Cancellation) -> Result<StatisticsLock, StatisticsError> {
-        self.create_directory()?;
+        if self.directory.as_os_str().is_empty() { return Err(StatisticsError::Corrupt("state directory cannot be empty".into())); }
         StatisticsLock::acquire(&self.directory.join(LOCK_FILE), || cancel.is_cancelled())
     }
 
-    fn create_directory(&self) -> Result<(), StatisticsError> {
-        if self.directory.as_os_str().is_empty() {
-            return Err(StatisticsError::Corrupt("state directory cannot be empty".into()));
-        }
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(&self.directory)
-            .map_err(|source| StatisticsError::Io { operation: "create statistics directory", path: self.directory.clone(), source })
-    }
 
     fn read_locked(&self, lock: &StatisticsLock) -> Result<(Statistics, Option<FileStamp>), StatisticsError> {
         lock.validate()?;
-        let path = self.statistics_path();
+        let path = lock.alias.join(STATE_FILE);
         let mut file = match OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 validate_state_path(&path, None)?;
                 lock.validate()?;
+                *lock.state_pin.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 return Ok((Statistics::default(), None));
             }
             Err(source) => {
@@ -297,14 +326,17 @@ impl StatisticsStore {
                 return Err(StatisticsError::Io { operation: "open statistics", path, source });
             }
         };
-        let metadata = file.metadata().map_err(|source| StatisticsError::Io { operation: "inspect opened statistics", path: path.clone(), source })?;
-        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        let initial = file.metadata().map_err(|source| StatisticsError::Io { operation: "inspect opened statistics", path: path.clone(), source })?;
+        if !initial.file_type().is_file() || initial.nlink() != 1 {
             return Err(StatisticsError::Corrupt(format!("{} is not a singly linked regular file", path.display())));
         }
+        let metadata = secure_file_metadata(&file, &path, false).map_err(StatisticsError::Storage)?;
+        validate_private_acl(&file, &path).map_err(StatisticsError::Storage)?;
         let stamp = FileStamp::new(&metadata);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|source| StatisticsError::Io { operation: "read statistics", path: path.clone(), source })?;
-        let after = file.metadata().map_err(|source| StatisticsError::Io { operation: "reinspect opened statistics", path: path.clone(), source })?;
+        let after = secure_file_metadata(&file, &path, false).map_err(StatisticsError::Storage)?;
+        validate_private_acl(&file, &path).map_err(StatisticsError::Storage)?;
         if !after.file_type().is_file() || after.nlink() != 1 || FileStamp::new(&after) != stamp { return Err(StatisticsError::Changed(path)); }
         validate_state_path(&path, Some(stamp))?;
         lock.validate()?;
@@ -317,6 +349,7 @@ impl StatisticsStore {
             && (state.processed_songs != 0 || state.clipped_peaks != 0 || state.decibel_adjustment != 0) {
             return Err(StatisticsError::Corrupt("nonzero totals without a first-recorded time".into()));
         }
+        *lock.state_pin.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
         Ok((state, Some(stamp)))
     }
 
@@ -324,10 +357,16 @@ impl StatisticsStore {
                       cancel: Option<&Cancellation>, sync: impl FnOnce(&Path) -> io::Result<()>) -> Result<(), StatisticsError> {
         let mut bytes = serde_json::to_vec_pretty(state).map_err(StatisticsError::Serialize)?;
         bytes.push(b'\n');
-        let stage = write_stage(&self.directory, "statistics", &bytes).map_err(StatisticsError::Storage)?;
-        let path = self.statistics_path();
+        let (stage, stage_pin) = write_stage(&lock.alias, "statistics", &bytes).map_err(StatisticsError::Storage)?;
+        let metadata = match secure_file_metadata(&stage_pin, &stage, false) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(cleanup_owned_stage(&stage, &stage_pin, StatisticsError::Storage(error))),
+        };
+        let stage_stamp = FileStamp::new(&metadata);
+        let path = lock.alias.join(STATE_FILE);
         let publish = || {
             lock.validate()?;
+            validate_state_path(&stage, Some(stage_stamp))?;
             validate_state_path(&path, expected)?;
             publish_stage(&stage, &path, expected)
         };
@@ -338,8 +377,8 @@ impl StatisticsStore {
             let _guard = cancel.publication_guard();
             if cancel.is_cancelled() { Err(StatisticsError::Cancelled) } else { publish() }
         } else { publish() };
-        if let Err(error) = result { return Err(cleanup_stage(&stage, error)); }
-        sync(&self.directory).map_err(|source| StatisticsError::AfterPublish { path, source })
+        if let Err(error) = result { return Err(cleanup_owned_stage(&stage, &stage_pin, error)); }
+        sync(&lock.alias).map_err(|source| StatisticsError::AfterPublish { path: self.statistics_path(), source })
     }
 }
 
@@ -367,9 +406,28 @@ mod tests {
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 
     #[test]
+    fn restrictive_umask_stage_cleanup_uses_creation_descriptor() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "PN_TEST_STATISTICS_UMASK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let (stage, file) = write_stage(Path::new(&path), "statistics", b"discard").unwrap();
+            assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+            assert!(matches!(cleanup_owned_stage(&stage, &file, StatisticsError::Cancelled), StatisticsError::Cancelled));
+            assert!(!stage.exists());
+            return;
+        }
+        let fixture = Fixture::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg("--exact").arg("statistics::tests::restrictive_umask_stage_cleanup_uses_creation_descriptor")
+            .arg("--nocapture").env(CHILD, &fixture.0);
+        unsafe { child.pre_exec(|| { libc::umask(0o400); Ok(()) }); }
+        assert!(child.status().unwrap().success());
+    }
+
+    #[test]
     fn absent_state_collision_does_not_replace_the_new_file() {
         let fixture = Fixture::new();
-        let stage = write_stage(&fixture.0, "statistics", b"our staged data").unwrap();
+        let (stage, _stage_pin) = write_stage(&fixture.0, "statistics", b"our staged data").unwrap();
         let destination = fixture.0.join(STATE_FILE);
         fs::write(&destination, b"independent writer").unwrap();
         let error = publish_stage(&stage, &destination, None).unwrap_err();

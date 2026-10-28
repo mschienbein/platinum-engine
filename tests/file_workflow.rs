@@ -48,6 +48,16 @@ fn replacement(dir: &Path, format: AudioFormat) -> OutputSettings {
 fn begin(plan: &OutputPlan) -> Result<StagedOutput, WorkflowError> {
     plan.begin(&FileIdentity::capture(plan.source())?)
 }
+fn workspace_directory(tx: &StagedOutput, parent: &Path) -> PathBuf {
+    let alias = fs::metadata(tx.staging_path().parent().unwrap()).unwrap();
+    let mut matching = fs::read_dir(parent).unwrap().map(|entry| entry.unwrap().path()).filter(|path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()
+            && (metadata.dev(), metadata.ino()) == (alias.dev(), alias.ino()))
+    });
+    let directory = matching.next().expect("workspace inode must have a directory entry");
+    assert!(matching.next().is_none(), "workspace inode has multiple directory entries");
+    directory
+}
 fn authorize_overwrite(plans: &mut [OutputPlan], inputs: &[file_workflow::DiscoveredFile]) {
     let destinations: Vec<_> = plans.iter().map(|plan| plan.destination().to_owned()).collect();
     let guard = Arc::new(file_workflow::OverwriteGuard::new(inputs, &destinations).unwrap());
@@ -171,12 +181,12 @@ fn mirrored_paths_follow_selection_root_and_batch_collisions_are_rejected() {
     let files = file_workflow::discover_inputs(&[album]).unwrap();
     let flat = OutputSettings { mode: OutputMode::SpecificFolder { directory: out.clone(), mirror: false }, format: AudioFormat::Wav };
     let plans: Vec<_> = files.iter().map(|x| OutputPlan::new(x, SourceCodec::Lpcm, &flat, None).unwrap()).collect();
-    assert!(matches!(file_workflow::validate_batch(&plans), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&plans, &files), Err(WorkflowError::DestinationConflict { .. })));
     let mirror = OutputSettings { mode: OutputMode::SpecificFolder { directory: out.clone(), mirror: true }, format: AudioFormat::Wav };
     let plans: Vec<_> = files.iter().map(|x| OutputPlan::new(x, SourceCodec::Lpcm, &mirror, None).unwrap()).collect();
-    file_workflow::validate_batch(&plans).unwrap();
+    file_workflow::validate_batch(&plans, &files).unwrap();
     let borrowed: Vec<_> = plans.iter().collect();
-    file_workflow::validate_batch(&borrowed).unwrap();
+    file_workflow::validate_batch(&borrowed, &files).unwrap();
     assert!(plans.iter().any(|p| p.destination() == out.join("Album/sub/song_PN.wav")));
     assert!(plans.iter().any(|p| p.destination() == out.join("Album/other/song_PN.wav")));
     let tx = begin(&plans[0]).unwrap(); stage(tx.staging_path(), b"encoded");
@@ -189,7 +199,7 @@ fn ordinary_output_reserves_and_publishes_without_clobbering() {
     let plan = OutputPlan::new(&selected(&source), SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
     let tx = begin(&plan).unwrap();
     assert!(matches!(begin(&plan).err().unwrap(), WorkflowError::ReservationExists(_)));
-    let workspace = tx.staging_path().parent().unwrap().to_owned();
+    let workspace = workspace_directory(&tx, plan.destination().parent().unwrap());
     stage(tx.staging_path(), b"complete output");
     let published = tx.finish(&Cancellation::new()).unwrap();
     assert_eq!(fs::read(&published.destination).unwrap(), b"complete output");
@@ -221,7 +231,7 @@ fn overwrite_atomically_replaces_existing_output_and_preserves_source() {
     let files = vec![selected(&source)];
     let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    file_workflow::validate_batch(&[&plan]).unwrap();
+    file_workflow::validate_batch(&[&plan], &files).unwrap();
     let tx = begin(&plan).unwrap(); stage(tx.staging_path(), b"new complete output");
     assert_eq!(fs::read(&destination).unwrap(), b"old output");
     let result = tx.finish(&Cancellation::new()).unwrap();
@@ -250,27 +260,27 @@ fn overwrite_refuses_selected_sources_hard_links_symlinks_and_directories() {
     let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
     fs::hard_link(&source, &destination).unwrap();
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    assert!(matches!(file_workflow::validate_batch(&[&plan]), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationConflict { .. })));
     assert_eq!(fs::read(&source).unwrap(), b"source");
     fs::remove_file(&destination).unwrap();
     symlink(&source, &destination).unwrap();
     let files = vec![selected(&source)];
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    assert!(matches!(file_workflow::validate_batch(&[&plan]), Err(WorkflowError::DestinationExists(_))));
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationExists(_))));
     fs::remove_file(&destination).unwrap(); fs::create_dir(&destination).unwrap();
-    assert!(matches!(file_workflow::validate_batch(&[&plan]), Err(WorkflowError::DestinationExists(_))));
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationExists(_))));
     fs::remove_dir(&destination).unwrap();
 
     let selected_output = f.file("song_PN.wav", b"another selected input");
     let files = vec![selected(&source), selected(&selected_output)];
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    assert!(matches!(file_workflow::validate_batch(&[&plan]), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationConflict { .. })));
     fs::remove_file(&selected_output).unwrap();
     let other_source = f.file("other.wav", b"another input");
     fs::hard_link(&other_source, &destination).unwrap();
     let files = vec![selected(&source), selected(&other_source)];
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    assert!(matches!(file_workflow::validate_batch(&[&plan]), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationConflict { .. })));
     assert_eq!(fs::read(&other_source).unwrap(), b"another input");
     assert_eq!(fs::read(&source).unwrap(), b"source");
 }
@@ -284,7 +294,7 @@ fn overwrite_refuses_duplicate_and_hard_linked_batch_destinations() {
     let files = vec![selected(&first), selected(&second)];
     let mut plans: Vec<_> = files.iter().map(|file| OutputPlan::new(file, SourceCodec::Lpcm, &settings, None).unwrap()).collect();
     authorize_overwrite(&mut plans, &files);
-    assert!(matches!(file_workflow::validate_batch(&plans), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&plans, &files), Err(WorkflowError::DestinationConflict { .. })));
 
     let first = f.file("one.wav", b"one"); let second = f.file("two.wav", b"two");
     let first_output = f.file("one_PN.wav", b"existing");
@@ -292,7 +302,7 @@ fn overwrite_refuses_duplicate_and_hard_linked_batch_destinations() {
     let files = vec![selected(&first), selected(&second)];
     let mut plans: Vec<_> = files.iter().map(|file| OutputPlan::new(file, SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap()).collect();
     authorize_overwrite(&mut plans, &files);
-    assert!(matches!(file_workflow::validate_batch(&plans), Err(WorkflowError::DestinationConflict { .. })));
+    assert!(matches!(file_workflow::validate_batch(&plans, &files), Err(WorkflowError::DestinationConflict { .. })));
     assert_eq!(fs::read(first_output).unwrap(), b"existing");
 }
 
@@ -332,14 +342,14 @@ fn overwrite_rejects_destinations_changed_between_preflight_and_begin() {
     let files = vec![selected(&source)];
     let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    file_workflow::validate_batch(&[&plan]).unwrap();
+    file_workflow::validate_batch(&[&plan], &files).unwrap();
     stage(plan.destination(), b"created after preflight");
     assert!(matches!(begin(&plan), Err(WorkflowError::Transaction { cause, published: false, .. })
         if matches!(*cause, WorkflowError::DestinationChanged(_))));
     assert_eq!(fs::read(plan.destination()).unwrap(), b"created after preflight");
 
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    file_workflow::validate_batch(&[&plan]).unwrap();
+    file_workflow::validate_batch(&[&plan], &files).unwrap();
     let replacement = f.file("replacement.tmp", b"different file");
     fs::rename(replacement, plan.destination()).unwrap();
     assert!(matches!(begin(&plan), Err(WorkflowError::Transaction { cause, published: false, .. })
@@ -356,7 +366,7 @@ fn overwrite_reports_permission_denied_for_unreadable_destination() {
     let files = vec![selected(&source)];
     let mut plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
     authorize_overwrite(std::slice::from_mut(&mut plan), &files);
-    file_workflow::validate_batch(&[&plan]).unwrap();
+    file_workflow::validate_batch(&[&plan], &files).unwrap();
     let tx = begin(&plan).unwrap(); stage(tx.staging_path(), b"candidate");
     let error = tx.finish(&Cancellation::new()).unwrap_err();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
@@ -378,11 +388,77 @@ fn batch_detects_case_equivalent_destinations_on_case_insensitive_volume() {
     let insensitive = output.join("caseprobe").exists();
     fs::remove_file(probe).unwrap();
     if insensitive {
-        assert!(matches!(file_workflow::validate_batch(&plans), Err(WorkflowError::DestinationConflict { .. })));
+        assert!(matches!(file_workflow::validate_batch(&plans, &files), Err(WorkflowError::DestinationConflict { .. })));
     } else {
-        file_workflow::validate_batch(&plans).unwrap();
+        file_workflow::validate_batch(&plans, &files).unwrap();
     }
     assert!(!plans[0].destination().exists()); assert!(!plans[1].destination().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn batch_rejects_canonically_equivalent_destinations_before_publication() {
+    let f = Fixture::new();
+    let nfc = f.file("a/café.wav", b"first");
+    let nfd = f.file("b/cafe\u{301}.wav", b"second");
+    let distinct = f.file("c/caff.wav", b"third");
+    let output = f.dir("output");
+    let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: output.clone(), mirror: false }, format: AudioFormat::Wav };
+    let files = vec![selected(&nfc), selected(&nfd), selected(&distinct)];
+    let plans: Vec<_> = files.iter().map(|file| OutputPlan::new(file, SourceCodec::Lpcm, &settings, None).unwrap()).collect();
+    assert!(matches!(file_workflow::validate_batch(&plans[..2], &files), Err(WorkflowError::DestinationConflict { .. })));
+    file_workflow::validate_batch(&[&plans[0], &plans[2]], &files).unwrap();
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
+    assert_eq!(fs::read(nfc).unwrap(), b"first"); assert_eq!(fs::read(nfd).unwrap(), b"second");
+}
+
+#[test]
+fn batch_case_and_normalization_follow_destination_volume_policy() {
+    let f = Fixture::new();
+    let upper = f.file("a/Café.wav", b"first");
+    let lower = f.file("b/cafe\u{301}.wav", b"second");
+    let output = f.dir("output");
+    let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: output.clone(), mirror: false }, format: AudioFormat::Wav };
+    let files = vec![selected(&upper), selected(&lower)];
+    let plans: Vec<_> = files.iter().map(|file| OutputPlan::new(file, SourceCodec::Lpcm, &settings, None).unwrap()).collect();
+    let probe = output.join("CaseProbe"); fs::write(&probe, b"probe").unwrap();
+    let insensitive = output.join("caseprobe").exists(); fs::remove_file(probe).unwrap();
+    if insensitive {
+        assert!(matches!(file_workflow::validate_batch(&plans, &files), Err(WorkflowError::DestinationConflict { .. })));
+    } else {
+        file_workflow::validate_batch(&plans, &files).unwrap();
+    }
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn batch_rejects_normalized_destination_matching_an_unplanned_selected_source() {
+    let f = Fixture::new();
+    let input = f.file("input/café.wav", b"original");
+    let selected_output = f.file("output/cafe\u{301}_PN.wav", b"selected input");
+    let output = f.0.join("output");
+    let settings = OutputSettings { mode: OutputMode::SpecificFolder { directory: output.clone(), mirror: false }, format: AudioFormat::Wav };
+    let files = vec![selected(&input), selected(&selected_output)];
+    let plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &settings, None).unwrap();
+    assert!(matches!(file_workflow::validate_batch(&[&plan], &files), Err(WorkflowError::DestinationConflict { .. })));
+    assert_eq!(fs::read(&selected_output).unwrap(), b"selected input");
+    assert_eq!(fs::read(&input).unwrap(), b"original");
+    assert_eq!(fs::read_dir(output).unwrap().count(), 1);
+}
+
+#[test]
+fn invalid_utf8_selected_name_does_not_block_unrelated_plan() {
+    use std::os::unix::ffi::OsStringExt;
+    let f = Fixture::new(); let input = f.file("song.wav", b"original");
+    let invalid_name = std::ffi::OsString::from_vec(b"other\xff.wav".to_vec());
+    let invalid = file_workflow::DiscoveredFile {
+        path: f.0.join(&invalid_name), relative_path: PathBuf::from(invalid_name), source_type: SourceType::Wav,
+    };
+    let files = vec![selected(&input), invalid];
+    let plan = OutputPlan::new(&files[0], SourceCodec::Lpcm, &same_folder(AudioFormat::Wav), None).unwrap();
+    file_workflow::validate_batch(&[&plan], &files).unwrap();
+    assert!(!plan.destination().exists()); assert_eq!(fs::read(input).unwrap(), b"original");
 }
 
 #[test]
@@ -423,8 +499,9 @@ fn changed_backup_or_source_blocks_replacement_before_original_is_moved() {
 fn abort_cleans_its_stage_and_reports_retained_backup() {
     let f = Fixture::new(); let source = f.file("song.wav", b"original"); let backups = f.dir("backups");
     let plan = OutputPlan::new(&selected(&source), SourceCodec::Lpcm, &replacement(&backups, AudioFormat::Wav), None).unwrap();
-    let tx = begin(&plan).unwrap(); let workspace = tx.staging_path().parent().unwrap().to_owned();
+    let tx = begin(&plan).unwrap(); let workspace = workspace_directory(&tx, plan.destination().parent().unwrap());
     stage(tx.staging_path(), b"partial");
+    tx.remember_staging_file().unwrap();
     let report = tx.abort().unwrap();
     assert_eq!(fs::read(report.retained_backup.unwrap()).unwrap(), b"original");
     assert_eq!(fs::read(source).unwrap(), b"original"); assert!(!workspace.exists());
@@ -709,7 +786,7 @@ fn cancellation_before_publication_preserves_original_and_restore_input() {
     let f = Fixture::new(); let backups = f.dir("backups"); let source = f.file("song.wav", b"original");
     let plan = OutputPlan::new(&selected(&source), SourceCodec::Lpcm, &replacement(&backups, AudioFormat::Wav), None).unwrap();
     let tx = begin(&plan).unwrap(); let backup = tx.backup_path().unwrap().to_owned();
-    let workspace = tx.staging_path().parent().unwrap().to_owned();
+    let workspace = workspace_directory(&tx, plan.destination().parent().unwrap());
     stage(tx.staging_path(), b"encoded");
     let cancelled = Cancellation::new(); cancelled.cancel();
     let error = tx.finish(&cancelled).unwrap_err();

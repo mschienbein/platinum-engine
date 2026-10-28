@@ -1,0 +1,217 @@
+name: Release runtime image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to package (currently v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: platinum-runtime-v0.1.0
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  IMAGE: ghcr.io/mschienbein/platinum-engine
+
+jobs:
+  platform:
+    name: Build image from verified Linux ${{ matrix.arch }} asset
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            machine: x86_64
+            runner: ubuntu-24.04
+            archive_sha256: c5b3f3ec384cbcc8ceef8589172e2e073833db909ff7bbe029f2d229e9c9d0ea
+            binary_sha256: 1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff
+            bridge_sha256: 27922fdf10e6c7efbb43f8645f74138b82c4598edf0c3f2e2f55410cbaf3714d
+            flac_sha256: 9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755
+            lame_sha256: cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b
+          - arch: arm64
+            machine: aarch64
+            runner: ubuntu-24.04-arm
+            archive_sha256: b9d861435928a79c05091d61fb28b67f543389bb73bdcebc28a70b0de8ffd36b
+            binary_sha256: 6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e
+            bridge_sha256: 10eb77c1e12d7a12959300da3a1d853fe4907a3c7872bb4f83b12ab255549a9b
+            flac_sha256: 41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72
+            lame_sha256: c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check release and runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
+          test "$RELEASE_TAG" = v0.1.0
+          test "$(uname -m)" = "$MACHINE"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease \
+            | jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and .isDraft == false and .isPrerelease == false'
+      - name: Check out the published tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Download and verify release payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+          ARCHIVE_SHA256: ${{ matrix.archive_sha256 }}
+          BINARY_SHA256: ${{ matrix.binary_sha256 }}
+          BRIDGE_SHA256: ${{ matrix.bridge_sha256 }}
+          FLAC_SHA256: ${{ matrix.flac_sha256 }}
+          LAME_SHA256: ${{ matrix.lame_sha256 }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' 8f8cdf5030890125d1ed2a86ab4c32ca9c5756b026d1af441113a44395dbc1a9 linux/Dockerfile.runtime | sha256sum -c -
+          asset="platinum-engine-${RELEASE_TAG}-linux-${ARCH}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/assets" "$RUNNER_TEMP/runtime-context/linux-$ARCH"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS --pattern "$asset" --dir "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP/assets"
+          printf '%s  %s\n' 4969a179f607f6228a6eb72f87fac6a0a4e1cd732aa151203ffcd6985400b690 SHA256SUMS | sha256sum -c -
+          grep -Fx -- "$ARCHIVE_SHA256  $asset" SHA256SUMS
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$asset" | sha256sum -c -
+          tar -xzf "$asset" -C "$RUNNER_TEMP/runtime-context/linux-$ARCH"
+          cd "$RUNNER_TEMP/runtime-context/linux-$ARCH"
+          sha256sum -c SHA256SUMS
+          printf '%s  %s\n' \
+            "$BINARY_SHA256" bin/platinum \
+            "$BRIDGE_SHA256" lib/libpn-tag-bridge.so \
+            "$FLAC_SHA256" lib/libFLAC.so.12 \
+            "$LAME_SHA256" lib/libmp3lame.so.0 | sha256sum -c -
+      - name: Push native image by digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --name platinum-release --driver docker-container \
+            --driver-opt image=moby/buildkit@sha256:0f63d66f8d2de0bd16438284831a3e9ee6ca7cd57b6eb3ed6e38a7a456590fa7 --use
+          docker buildx inspect --bootstrap
+          docker buildx build --platform "linux/$ARCH" \
+            --file linux/Dockerfile.runtime \
+            --label org.opencontainers.image.source=https://github.com/mschienbein/platinum-engine \
+            --provenance=false \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file "$RUNNER_TEMP/image-metadata.json" "$RUNNER_TEMP/runtime-context"
+          digest=$(jq -er '.["containerimage.digest"]' "$RUNNER_TEMP/image-metadata.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/digest.txt"
+      - name: Retain platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: Publish multi-architecture manifest
+    needs: platform
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-digest-amd64
+          path: ${{ runner.temp }}/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-digest-arm64
+          path: ${{ runner.temp }}/arm64
+      - name: Publish and verify manifest
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
+          test "$RELEASE_TAG" = v0.1.0
+          amd=$(cat "$RUNNER_TEMP/amd64/digest.txt")
+          arm=$(cat "$RUNNER_TEMP/arm64/digest.txt")
+          [[ "$amd" =~ ^sha256:[0-9a-f]{64}$ && "$arm" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" --tag "$IMAGE:latest" \
+            --metadata-file "$RUNNER_TEMP/manifest-metadata.json" "$IMAGE@$amd" "$IMAGE@$arm"
+          digest=$(jq -er '.["containerimage.descriptor"].digest // .["containerimage.digest"]' "$RUNNER_TEMP/manifest-metadata.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect --raw "$IMAGE@$digest" > "$RUNNER_TEMP/manifest.json"
+          jq -e --arg amd "$amd" --arg arm "$arm" \
+            '[.manifests[] | select(.platform.os == "linux") | {architecture: .platform.architecture, digest: .digest}] | sort_by(.architecture) == [{architecture:"amd64",digest:$amd},{architecture:"arm64",digest:$arm}]' \
+            "$RUNNER_TEMP/manifest.json"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published %s@%s (amd64 %s; arm64 %s)\n' "$IMAGE" "$digest" "$amd" "$arm"
+
+  smoke:
+    name: Smoke pushed image on Linux ${{ matrix.arch }}
+    needs: manifest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            machine: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            machine: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Run version and synthetic processing smoke
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_DIGEST: ${{ needs.manifest.outputs.digest }}
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$MACHINE"
+          [[ "$MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          image="$IMAGE@$MANIFEST_DIGEST"
+          docker pull "$image"
+          test "$(docker run --rm "$image" --version)" = 'platinum 0.1.0'
+          python3 - "$RUNNER_TEMP/reference.wav" <<'PY'
+          import struct, sys, wave
+          with open(sys.argv[1], 'xb') as raw:
+              with wave.open(raw, 'wb') as wav:
+                  wav.setnchannels(2)
+                  wav.setsampwidth(2)
+                  wav.setframerate(48000)
+                  data = bytearray()
+                  for i in range(48000 * 2):
+                      a, b = i % 240, i % 300
+                      left = (a if a < 120 else 239 - a) * 300 - 17850
+                      right = (b if b < 150 else 299 - b) * 240 - 17880
+                      data.extend(struct.pack('<hh', left, right))
+                  wav.writeframes(data)
+          PY
+          printf '%s  %s\n' 277281e3d08e52992b390f10d96584e3a115f99182c890648cc535b410528a6d "$RUNNER_TEMP/reference.wav" | sha256sum -c -
+          docker run -i --rm --read-only --tmpfs /tmp:exec,mode=1777 \
+            --entrypoint /bin/sh "$image" -c '
+              set -eu
+              mkdir /tmp/state /tmp/output
+              cat > /tmp/reference.wav
+              pn=/opt/platinum-engine/bin/platinum
+              "$pn" --state-dir /tmp/state config set libraries.tag_bridge '\''"/opt/platinum-engine/lib/libpn-tag-bridge.so"'\''
+              "$pn" --state-dir /tmp/state --json process /tmp/reference.wav --template-index 0 --format wav --output-dir /tmp/output --jobs 1
+              printf "%s  %s\n" a012870a4d68dbaf06347f6efba1b3ea387eec2c24762672b52eb7a1aa687aca /tmp/output/reference_PN.wav | sha256sum -c -
+            ' < "$RUNNER_TEMP/reference.wav"

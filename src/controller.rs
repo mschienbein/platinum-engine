@@ -9,10 +9,13 @@ use crate::math;
 use crate::multipass::{self, DynamicsBand, ParameterWrite, ShippedPreset};
 use crate::templates::{Band, Template};
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "log2f"]
     fn native_log2f(value: f32) -> f32;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::log2f as native_log2f;
 
 /// Stored analysis values, after the reference's float32 capture boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]

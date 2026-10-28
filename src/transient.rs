@@ -7,15 +7,26 @@
 //! Serialized preset values are not automatically effective DSP values.
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
 const TIME_EPSILON: f32 = f32::from_bits(0x3580_0000);
 const ENERGY_FLOOR: f32 = f32::from_bits(0x36a0_0000);
 const ENVELOPE_MINIMUM: f32 = f32::from_bits(0x3c23_d70a); // 0.01
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "powf"]
     fn system_powf(base: f32, exponent: f32) -> f32;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::powf as system_powf;
+
+#[cfg(target_arch = "x86_64")]
+use crate::portable::arm::{
+    max_number_fz as max_number, min_number_fz as min_number,
+    max_propagating_fz as max_propagating, min_propagating_fz as min_propagating,
+    arm_lt_fz as arm_lt,
+};
 
 #[inline]
 fn power(base: f32, exponent: f32) -> f32 {
@@ -23,6 +34,7 @@ fn power(base: f32, exponent: f32) -> f32 {
     unsafe { system_powf(base, exponent) }
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn max_number(a: f32, b: f32) -> f32 {
     let result: f32;
@@ -37,6 +49,7 @@ fn max_number(a: f32, b: f32) -> f32 {
     result
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn min_number(a: f32, b: f32) -> f32 {
     let result: f32;
@@ -50,6 +63,7 @@ fn min_number(a: f32, b: f32) -> f32 {
     result
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn max_propagating(a: f32, b: f32) -> f32 {
     let result: f32;
@@ -63,6 +77,7 @@ fn max_propagating(a: f32, b: f32) -> f32 {
     result
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn min_propagating(a: f32, b: f32) -> f32 {
     let result: f32;
@@ -96,6 +111,7 @@ fn changed(a: f32, b: f32) -> bool {
 }
 
 // ARM64 FCMP followed by the LT condition also selects LT for unordered input.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn arm_lt(a: f32, b: f32) -> bool {
     a < b || a.is_nan() || b.is_nan()
@@ -131,7 +147,7 @@ impl Follower {
     #[inline]
     fn follow(&mut self, target: f32) -> f32 {
         let coeff = if arm_lt(self.value, target) { self.rise } else { self.fall };
-        self.value = (target - self.value).mul_add(coeff, self.value);
+        self.value = (target - self.value).arm_mul_add(coeff, self.value);
         self.value
     }
 }
@@ -290,13 +306,11 @@ impl TransientShaper {
             };
             let amplitude = max_number(detector_left.abs(), detector_right.abs());
             let energy = amplitude * amplitude;
-            self.slow_energy = (energy - self.slow_energy)
-                .mul_add(self.slow_coefficient, self.slow_energy);
-            self.fast_energy = (energy - self.fast_energy)
-                .mul_add(self.fast_coefficient, self.fast_energy);
+            self.slow_energy = (energy - self.slow_energy).arm_mul_add(self.slow_coefficient, self.slow_energy);
+            self.fast_energy = (energy - self.fast_energy).arm_mul_add(self.fast_coefficient, self.fast_energy);
             let slow = max_number(self.slow_energy, ENERGY_FLOOR);
             let fast = max_number(self.fast_energy, ENERGY_FLOOR);
-            let onset = (fast / slow).sqrt().mul_add(1.5, -2.0);
+            let onset = (fast / slow).sqrt().arm_mul_add(1.5, -2.0);
             let transient_target = max_number(ENVELOPE_MINIMUM, shape(onset).abs());
             let transient = self.transient.follow(transient_target);
             let sustain_target = max_number(ENVELOPE_MINIMUM, transient.abs());
@@ -317,7 +331,7 @@ impl TransientShaper {
         let (last_transient, last_sustain_difference, last_pump_meter) = if left.is_empty() {
             (0.0, 0.0, 0.0)
         } else {
-            let t = clamp_unit(self.sustain.value.mul_add(10.0, f32::from_bits(0xbdcc_cccd)));
+            let t = clamp_unit(self.sustain.value.arm_mul_add(10.0, f32::from_bits(0xbdcc_cccd)));
             (
                 self.transient.value,
                 1.0 - last_pump_base,
@@ -354,7 +368,7 @@ impl TransientShaper {
         let slow = max_number(self.slow_energy, ENERGY_FLOOR);
         let fast = max_number(self.fast_energy, ENERGY_FLOOR);
         let onset = if slow > ENERGY_FLOOR && fast > ENERGY_FLOOR {
-            (fast / slow).sqrt().mul_add(1.5, -2.0)
+            (fast / slow).sqrt().arm_mul_add(1.5, -2.0)
         } else {
             -0.5
         };
@@ -363,9 +377,9 @@ impl TransientShaper {
         let sustain_decay = math::powi_f64(f64::from(1.0_f32 - self.sustain.fall), n) as f32;
         self.sustain.value *= sustain_decay;
         let sustain = self.sustain.value;
-        let t = clamp_unit(sustain.mul_add(10.0, f32::from_bits(0xbdcc_cccd)));
+        let t = clamp_unit(sustain.arm_mul_add(10.0, f32::from_bits(0xbdcc_cccd)));
         let square = t * t;
-        let pump = (-sustain).mul_add(square, square) * (3.0 - (t + t));
+        let pump = (-sustain).arm_mul_add(square, square) * (3.0 - (t + t));
         TransientMeters {
             transient: clamp_unit(transient),
             sustain: clamp_unit(sustain - transient),
@@ -378,8 +392,8 @@ impl TransientShaper {
 fn soft_clip(sample: f32) -> f32 {
     let magnitude = f32::from_bits(sample.to_bits() & 0x7fff_ffff);
     let clipped_base = min_propagating(magnitude, f32::from_bits(0x3f66_6666));
-    let excess = max_propagating(magnitude.mul_add(10.0, -9.0), 0.0);
-    let curved = excess.mul_add(excess, excess);
+    let excess = max_propagating(magnitude.arm_mul_add(10.0, -9.0), 0.0);
+    let curved = excess.arm_mul_add(excess, excess);
     let magnitude = ((curved * f32::from_bits(0x3dcc_cccd)) / (curved + 1.0)) + clipped_base;
     f32::from_bits((sample.to_bits() & 0x8000_0000) | magnitude.to_bits())
 }

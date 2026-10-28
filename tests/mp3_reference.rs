@@ -2,7 +2,6 @@
 //! The ignored probe requires an explicitly pinned LAME 3.100 and the pinned
 //! PN LAME oracle. They may be the same file to isolate recorder behavior;
 //! neither library is obtained or built by this test.
-#![cfg(target_os = "macos")]
 
 use platinum_engine::mp3::{inspect_mp3_header_bytes, output_sample_rate, Mp3Header, SourceHeader};
 
@@ -71,6 +70,44 @@ fn native_header_fallback_and_output_rate_policy() {
     assert_eq!(output_sample_rate(96_000.0), 44_100);
 }
 
+#[test]
+#[ignore = "requires PN_MP3_LAME_PATH and PN_MP3_LAME_SHA256 for a public LAME build"]
+fn six_channel_pcm_is_converted_then_encoded_as_stereo() {
+    use platinum_engine::apple_codec::Pcm16StereoConverter;
+    use platinum_engine::mp3::{LameLibrary, Mp3Config, Mp3Encoder, Mp3Mode};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let library = LameLibrary::load(
+        std::env::var("PN_MP3_LAME_PATH").unwrap(),
+        &std::env::var("PN_MP3_LAME_SHA256").unwrap(),
+    ).unwrap();
+    let dir = std::env::temp_dir().join(format!("pn-mp3-six-channel-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    let _cleanup = Cleanup(dir.clone());
+    let input: Vec<f32> = (0..2048 * 6).map(|i| ((i * 37 % 2003) as i32 - 1001) as f32 / 1024.0).collect();
+    let mut converter = Pcm16StereoConverter::new(44_100.0, 6).unwrap();
+    let mut pcm = vec![0i16; 2048 * 2];
+    assert_eq!(converter.convert(&input, &mut pcm).unwrap(), 2048);
+    converter.close().unwrap();
+    let encode = |channels, name| {
+        let path = dir.join(name);
+        let config = Mp3Config { sample_rate: 44_100, channels, mode: Mp3Mode::Cbr320,
+            source: SourceHeader::Other(Mp3Header::default()), native_update_result_byte_3: None };
+        let mut encoder = Mp3Encoder::create_new(&library, &path, config).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        encoder.write_converted_stereo(&mut pcm.clone()).unwrap();
+        encoder.finish().unwrap();
+        fs::read(path).unwrap()
+    };
+    assert_eq!(encode(6, "six.mp3"), encode(2, "stereo.mp3"));
+}
+
+#[cfg(target_os = "macos")]
 mod oracle {
     use super::*;
     use libloading::Library;
@@ -79,6 +116,7 @@ mod oracle {
     use std::ffi::{c_char, c_int, c_void, CStr};
     use std::fs::{self, OpenOptions};
     use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::{Path, PathBuf};
     use std::ptr::NonNull;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,7 +352,39 @@ mod oracle {
     #[ignore = "requires an explicitly pinned LAME 3.100"]
     fn unknown_source_update_byte_selects_the_nonzero_branch() {
         let candidate = LameLibrary::load(required("PN_MP3_LAME_PATH"), &required("PN_MP3_LAME_SHA256")).unwrap();
-        let dir = probe_dir();
+        struct ProbeDirectory { path: PathBuf, keep: bool }
+        impl ProbeDirectory {
+            fn new() -> Self {
+                // An explicitly supplied, not-yet-existing directory retains artifacts.
+                if let Some(path) = std::env::var_os("PN_MP3_PROBE_OUTPUT_DIR") {
+                    let path = PathBuf::from(path);
+                    fs::DirBuilder::new().mode(0o700).create(&path).expect("create new PN_MP3_PROBE_OUTPUT_DIR");
+                    return Self { path, keep: true };
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+                for attempt in 0..128 {
+                    let path = std::env::temp_dir().join(format!("platinum-mp3-update-{}-{now}-{attempt}", std::process::id()));
+                    match fs::DirBuilder::new().mode(0o700).create(&path) {
+                        Ok(()) => return Self { path, keep: false },
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => panic!("create private MP3 probe directory: {error}"),
+                    }
+                }
+                panic!("could not allocate a unique MP3 probe directory");
+            }
+        }
+        impl Drop for ProbeDirectory {
+            fn drop(&mut self) {
+                if !self.keep {
+                    if let Err(error) = fs::remove_dir_all(&self.path) {
+                        if std::thread::panicking() { eprintln!("remove MP3 probe directory {}: {error}", self.path.display()); }
+                        else { panic!("remove MP3 probe directory {}: {error}", self.path.display()); }
+                    }
+                }
+            }
+        }
+        let workspace = ProbeDirectory::new();
+        let dir = &workspace.path;
         let samples: Vec<i16> = (0..8192).map(|i| ((i * 37 % 2003) as i32 - 1001) as i16).collect();
         let encode = |path: &Path, source, byte| {
             let config = Mp3Config { sample_rate: 44_100, channels: 2, mode: Mp3Mode::Cbr320,

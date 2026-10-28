@@ -53,9 +53,13 @@ mod candidate_bridge {
     }
     impl Drop for Temp { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
     fn library() -> TagBridge {
-        let path = std::env::var_os("PN_TAG_BRIDGE").expect("set PN_TAG_BRIDGE to the trusted, separately built open-source candidate bridge");
+        let path = PathBuf::from(std::env::var_os("PN_TAG_BRIDGE").expect("set PN_TAG_BRIDGE to the trusted, separately built open-source candidate bridge"));
+        let expected = platinum_engine::mp3::file_sha256(&path).unwrap();
         // SAFETY: opt-in test requires the caller to select a trusted bridge.
-        unsafe { TagBridge::load(path).unwrap() }
+        let bridge = unsafe { TagBridge::load(&path).unwrap() };
+        let observed: String = bridge.bridge_sha256().iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(observed, expected);
+        bridge
     }
     fn marker() -> Marker {
         Marker::from_processing(ProcessingMarker {
@@ -188,6 +192,29 @@ mod candidate_bridge {
             assert!(p + 4 + n <= data.len()); types.push(flags & 127); p += 4 + n; if flags & 128 != 0 { break; }
         }
         types
+    }
+
+    #[test]
+    #[ignore = "requires a PN_TAG_BRIDGE with source-container status support"]
+    fn unreadable_source_copies_no_tags_but_still_writes_marker() {
+        let bridge = library(); let marker = marker();
+        let source_bytes = b"OggS\0synthetic non-container bytes";
+        for (extension, format) in [("wav", Format::Wav), ("aif", Format::Aiff), ("m4a", Format::Mp4)] {
+            let src = Temp::new(extension, source_bytes);
+            let dst = Temp::new("wav", &base_wav(&[]));
+            assert!(matches!(bridge.inspect(src.path(), format), Err(TagError::SourceContainerUnavailable(_))));
+            assert!(matches!(bridge.read_processing_marker(src.path(), format), Err(TagError::SourceContainerUnavailable(_))));
+            let report = bridge.transfer(src.path(), dst.path(), format, Format::Wav, OutputChoice::Explicit, &marker).unwrap();
+            assert!(report.is_success(), "{report:?}");
+            let mut expected = marker.encoded_bytes().unwrap().unwrap();
+            if expected.len() & 1 != 0 { expected.push(0); }
+            assert_eq!(bridge.read_processing_marker(dst.path(), Format::Wav).unwrap().unwrap(), expected);
+            assert_eq!(src.bytes(), source_bytes);
+            let bad_dst = Temp::new("wav", b"invalid destination");
+            let failure = bridge.transfer(src.path(), bad_dst.path(), format, Format::Wav, OutputChoice::Explicit, &marker);
+            assert!(failure.is_err() || !failure.unwrap().is_success());
+            assert_eq!(bad_dst.bytes(), b"invalid destination");
+        }
     }
 
     #[test]
@@ -325,6 +352,20 @@ mod candidate_bridge {
         let result = dst.bytes(); assert!(contains(&result, b"\x89PNG\r\n\x1a\n")); assert!(!contains(&result, gif));
     }
 
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    #[ignore = "requires PN_TAG_BRIDGE built from the portable TagLib bridge"]
+    fn portable_artwork_refusal_does_not_save_a_marker_fallback() {
+        let bridge = library(); let marker = marker();
+        let original = mp3(&tag(&[text(b"TIT2", "Image"), image_frame()]));
+        let src = Temp::new("mp3", &original); let dst = Temp::new("m4a", &mp4(&[]));
+        let before = dst.bytes();
+        assert!(matches!(bridge.transfer(src.path(), dst.path(), Format::Mp3, Format::Mp4,
+            OutputChoice::Explicit, &marker), Err(TagError::ArtworkTranscodeUnavailable(_))));
+        assert_eq!(dst.bytes(), before);
+        assert_eq!(src.bytes(), original);
+    }
+
     // The original probe runs in a separate process: loading the candidate and
     // proprietary TagLib in one image would allow C++ symbol interposition.
     // A failed case keeps its generated directory for diagnosis.
@@ -406,14 +447,20 @@ mod candidate_bridge {
     }
     fn sha256(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
-        #[link(name = "System")]
-        unsafe extern "C" {
-            fn CC_SHA256(data: *const std::ffi::c_void, length: u32, out: *mut u8) -> *mut u8;
-        }
-        let length = u32::try_from(bytes.len()).unwrap();
-        let mut digest = [0u8; 32];
-        // SAFETY: the input and output buffers remain live for the call.
-        assert!(!unsafe { CC_SHA256(bytes.as_ptr().cast(), length, digest.as_mut_ptr()) }.is_null());
+        #[cfg(target_os = "macos")]
+        let digest = {
+            #[link(name = "System")]
+            unsafe extern "C" {
+                fn CC_SHA256(data: *const std::ffi::c_void, length: u32, out: *mut u8) -> *mut u8;
+            }
+            let length = u32::try_from(bytes.len()).unwrap();
+            let mut digest = [0u8; 32];
+            // SAFETY: the input and output buffers remain live for the call.
+            assert!(!unsafe { CC_SHA256(bytes.as_ptr().cast(), length, digest.as_mut_ptr()) }.is_null());
+            digest
+        };
+        #[cfg(target_os = "linux")]
+        let digest = platinum_engine::portable::digest::sha256(bytes);
         let mut text = String::with_capacity(64);
         for byte in digest { write!(text, "{byte:02x}").unwrap(); }
         text
@@ -591,7 +638,7 @@ mod candidate_bridge {
                 let target = Temp::new(ext, &data);
                 let path = CString::new(target.path().as_os_str().as_bytes()).unwrap();
                 let mut context = Context { present, calls: 0 };
-                let mut error = [0i8; 1024];
+                let mut error = [0 as c_char; 1024];
                 let status = unsafe { save(format as c_int, path.as_ptr(), callback, None,
                     (&mut context as *mut Context).cast(), error.as_mut_ptr(), error.len()) };
                 let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();

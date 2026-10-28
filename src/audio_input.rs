@@ -12,7 +12,6 @@
 //! For a source with more channels the native interleaved copy packs only the
 //! first two channels at the start of the supplied buffer and leaves the rest
 //! untouched; neither path is a surround mix.
-#![cfg(target_os = "macos")]
 
 use crate::apple_codec::{self, StreamDescription};
 use crate::flac::{FlacError, FlacLibrary, LibraryIdentity};
@@ -227,13 +226,18 @@ fn verify_loaded_image(address: New, path: &Path) -> Result<(), AudioInputError>
 }
 
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AudioBuffer { channels: u32, size: u32, data: *mut c_void }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl Default for AudioBuffer { fn default() -> Self { Self { channels: 0, size: 0, data: ptr::null_mut() } } }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct AudioBufferList { count: u32, buffers: [AudioBuffer; MAX_CHANNELS] }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 type ConverterInput = unsafe extern "C" fn(*mut c_void, *mut u32, *mut AudioBufferList, *mut *mut c_void, *mut c_void) -> i32;
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
     fn AudioConverterNew(source: *const StreamDescription, destination: *const StreamDescription, converter: *mut *mut c_void) -> i32;
@@ -243,10 +247,13 @@ unsafe extern "C" {
 
 #[derive(Clone, Copy)]
 struct Metadata { rate: u32, channels: u32, bits: u32, total: u64 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 struct InputBlock { channels: usize, pointers: [*const u8; MAX_CHANNELS], frames: u32, bytes_per_sample: u32, sent: bool }
 struct DecodeContext {
     metadata: Option<Metadata>,
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     converter: Option<NonNull<c_void>>,
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     packed: [Vec<u8>; MAX_CHANNELS],
     converted: Vec<f32>,
     queue: Vec<f32>,
@@ -255,9 +262,16 @@ struct DecodeContext {
 }
 impl DecodeContext {
     fn new() -> Self {
-        Self { metadata: None, converter: None, packed: std::array::from_fn(|_| Vec::new()),
-            converted: Vec::new(), queue: Vec::new(), queue_offset: 0, error: None }
+        Self {
+            metadata: None,
+            #[cfg(all(target_os = "macos", not(feature = "portable")))]
+            converter: None,
+            #[cfg(all(target_os = "macos", not(feature = "portable")))]
+            packed: std::array::from_fn(|_| Vec::new()),
+            converted: Vec::new(), queue: Vec::new(), queue_offset: 0, error: None
+        }
     }
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fn setup_converter(&mut self, source: &StreamDescription) -> Result<(), AudioInputError> {
         let planar = StreamDescription { sample_rate: source.sample_rate, format_id: LPCM, format_flags: 0x29,
             bytes_per_packet: 4, frames_per_packet: 1, bytes_per_frame: 4,
@@ -272,10 +286,18 @@ impl DecodeContext {
         self.converted.resize(count, 0.0);
         Ok(())
     }
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    fn setup_converter(&mut self, source: &StreamDescription) -> Result<(), AudioInputError> {
+        if !matches!(source.bits_per_channel, 8 | 16 | 24 | 32) {
+            return Err(AudioInputError::Unsupported("FLAC PCM conversion is verified only for 8-, 16-, 24- and 32-bit sources"));
+        }
+        Ok(())
+    }
     fn queue_frames(&self) -> usize {
         let channels = self.metadata.map_or(1, |m| (m.channels as usize).min(2));
         (self.queue.len() - self.queue_offset) / channels
     }
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fn convert_block(&mut self, frame: *const c_void, channels: *const *const i32) -> Result<(), AudioInputError> {
         let metadata = self.metadata.ok_or(AudioInputError::UnexpectedNativeResult("FLAC frame before STREAMINFO"))?;
         if frame.is_null() || channels.is_null() { return Err(AudioInputError::UnexpectedNativeResult("null FLAC frame")); }
@@ -336,6 +358,37 @@ impl DecodeContext {
         }
         Ok(())
     }
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    fn convert_block(&mut self, frame: *const c_void, channels: *const *const i32) -> Result<(), AudioInputError> {
+        let metadata = self.metadata.ok_or(AudioInputError::UnexpectedNativeResult("FLAC frame before STREAMINFO"))?;
+        if frame.is_null() || channels.is_null() { return Err(AudioInputError::UnexpectedNativeResult("null FLAC frame")); }
+        let header = unsafe { &*frame.cast::<FramePrefix>() };
+        let frames = header.blocksize as usize;
+        if frames == 0 || frames > 65_535 { return Err(AudioInputError::UnexpectedNativeResult("invalid FLAC blocksize")); }
+        let n_channels = metadata.channels as usize;
+        if header.channels < metadata.channels || header.channels as usize > MAX_CHANNELS {
+            return Err(AudioInputError::UnexpectedNativeResult("FLAC frame has fewer channel buffers than STREAMINFO"));
+        }
+        let emitted_channels = n_channels.min(2);
+        let samples = frames.checked_mul(emitted_channels).ok_or(AudioInputError::Allocation)?;
+        self.converted.try_reserve(samples.saturating_sub(self.converted.len())).map_err(|_| AudioInputError::Allocation)?;
+        self.converted.resize(samples, 0.0);
+        for c in 0..n_channels {
+            let input = unsafe { *channels.add(c) };
+            if input.is_null() { return Err(AudioInputError::UnexpectedNativeResult("null FLAC channel")); }
+            if c < emitted_channels {
+                // libFLAC lends each full channel plane for the duration of this callback.
+                let input = unsafe { std::slice::from_raw_parts(input, frames) };
+                apple_codec::convert_flac_pcm(input, metadata.bits, &mut self.converted[c * frames..(c + 1) * frames])?;
+            }
+        }
+        self.queue.try_reserve(samples).map_err(|_| AudioInputError::Allocation)?;
+        if emitted_channels == 1 { self.queue.extend_from_slice(&self.converted[..frames]); }
+        else {
+            for i in 0..frames { self.queue.push(self.converted[i]); self.queue.push(self.converted[frames + i]); }
+        }
+        Ok(())
+    }
 }
 
 unsafe extern "C" fn metadata_callback(_decoder: *const Decoder, metadata: *const StreamMetadata, data: *mut c_void) {
@@ -361,6 +414,7 @@ unsafe extern "C" fn write_callback(_decoder: *const Decoder, frame: *const c_vo
         Err(error) => { ctx.error = Some(error); 1 }
     }
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" fn converter_input(_converter: *mut c_void, packets: *mut u32, list: *mut AudioBufferList, _descriptions: *mut *mut c_void, data: *mut c_void) -> i32 {
     if packets.is_null() || list.is_null() || data.is_null() { return -1; }
     let block = unsafe { &mut *data.cast::<InputBlock>() };
@@ -386,9 +440,8 @@ unsafe extern "C" fn converter_input(_converter: *mut c_void, packets: *mut u32,
 pub struct FlacReader {
     decoder: NonNull<Decoder>,
     functions: DecoderFunctions,
-    // Keep both handles live; validation supplies the existing encoder module's
-    // version/vendor/digest policy and the second handle supplies decoder ABI.
-    _library: Library,
+    // The validated descriptor-backed handle supplies both encoder identity
+    // and the decoder ABI, so the two cannot refer to different images.
     validation: FlacLibrary,
     context: Box<DecodeContext>,
     source: StreamDescription,
@@ -406,15 +459,13 @@ impl FlacReader {
         }
         let canonical = library_path.canonicalize().map_err(|e| AudioInputError::Library(e.to_string()))?;
         check_digest(&canonical, expected_sha256)?;
-        let validation = FlacLibrary::load(&canonical)?;
-        // SAFETY: the caller explicitly selected a trusted public dylib; its
-        // full-file pin was checked before loading and both handles remain live.
-        let library = unsafe { Library::new(&canonical) }.map_err(|e| AudioInputError::Library(e.to_string()))?;
-        let functions = unsafe { DecoderFunctions::load(&library)? };
+        let validation = FlacLibrary::load(&canonical, expected_sha256)?;
+        // SAFETY: the pinned, validated library remains live in this reader.
+        let functions = unsafe { DecoderFunctions::load(validation.decoder_library())? };
         verify_loaded_image(functions.new, &canonical)?;
         check_digest(&canonical, expected_sha256)?;
         let decoder = NonNull::new(unsafe { (functions.new)() }).ok_or(AudioInputError::Allocation)?;
-        let mut reader = Self { decoder, functions, _library: library, validation, context: Box::new(DecodeContext::new()),
+        let mut reader = Self { decoder, functions, validation, context: Box::new(DecodeContext::new()),
             source: StreamDescription::default(), client: StreamDescription::default(), total_samples: 0, failed: false };
         let decoder = reader.decoder.as_ptr();
         if unsafe { (reader.functions.set_md5)(decoder, 1) } == 0 { return Err(reader.failure("set MD5 checking", 0)); }
@@ -501,6 +552,7 @@ impl FlacReader {
         Ok(written)
     }
     fn close(mut self) -> Result<(), AudioInputError> {
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
         if let Some(converter) = self.context.converter.take() {
             let status = unsafe { AudioConverterDispose(converter.as_ptr()) };
             if status != 0 { return Err(AudioInputError::Converter { operation: "AudioConverterDispose(FLAC)", status }); }
@@ -513,6 +565,23 @@ impl FlacReader {
 impl Drop for FlacReader {
     fn drop(&mut self) {
         unsafe { (self.functions.delete)(self.decoder.as_ptr()); }
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
         if let Some(converter) = self.context.converter.take() { unsafe { AudioConverterDispose(converter.as_ptr()); } }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", feature = "portable")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_flac_rejects_every_unverified_pcm_depth() {
+        for bits in 4..=32 {
+            let mut context = DecodeContext::new();
+            let source = StreamDescription { bits_per_channel: bits, ..Default::default() };
+            let result = context.setup_converter(&source);
+            if matches!(bits, 8 | 16 | 24 | 32) { assert!(result.is_ok(), "depth {bits}"); }
+            else { assert!(matches!(result, Err(AudioInputError::Unsupported(_))), "depth {bits}"); }
+        }
     }
 }

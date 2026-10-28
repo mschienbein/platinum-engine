@@ -8,12 +8,15 @@
 
 use super::fft::{self, RealFft};
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "sinf"]
     fn host_sinf(value: f32) -> f32;
     #[link_name = "cosf"]
     fn host_cosf(value: f32) -> f32;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{sinf as host_sinf, cosf as host_cosf};
 
 const PI: f32 = f32::from_bits(0x4049_0fdb);
 const TWO_PI: f32 = f32::from_bits(0x40c9_0fdb);

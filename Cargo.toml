@@ -14,9 +14,18 @@ path = "src/lib.rs"
 name = "platinum"
 path = "src/main.rs"
 
+[features]
+# Use the portable replacements for Apple system components on macOS too, so
+# their outputs can be verified against the macOS reference builds.
+portable = []
+
+[lints.clippy]
+disallowed_methods = "deny"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+libc = "0.2.191"
 libloading = "0.8"
 quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }

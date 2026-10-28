@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", not(feature = "portable")))]
 //! Codec-only probes. The ignored oracle test compares complete files against an
 //! independent AudioToolbox call sequence, not against Platinum Notes tags/DSP.
 
@@ -58,6 +58,31 @@ fn read_all(reader: &mut Reader, frames_per_block: usize) -> Vec<f32> {
 }
 fn as_bytes_f32(samples: &[f32]) -> Vec<u8> { samples.iter().flat_map(|v| v.to_ne_bytes()).collect() }
 fn as_bytes_i16(samples: &[i16]) -> Vec<u8> { samples.iter().flat_map(|v| v.to_ne_bytes()).collect() }
+
+#[test]
+#[ignore = "requires PN_AAC_REGRESSION_SOURCE, the pinned generated AAC fixture"]
+fn pinned_aac_planar_decoder_samples_match_release_context() {
+    let path = PathBuf::from(std::env::var_os("PN_AAC_REGRESSION_SOURCE")
+        .expect("set PN_AAC_REGRESSION_SOURCE to the generated mono AAC fixture"));
+    assert_eq!(platinum_engine::mp3::file_sha256(&path).unwrap(),
+        "ea1ee427e8b5ec9f017f7ebae71042a8bd31ecbda5a85eeea82a62e61a9b9b56");
+    let mut reader = Reader::open(path, Some(44_100.0)).unwrap();
+    reader.set_stereo_planar(44_100.0).unwrap();
+    let mut left = [0.0f32; 512];
+    let mut right = [0.0f32; 512];
+    assert_eq!(reader.read_stereo_planar(&mut left, &mut right).unwrap(), 512);
+    // Captured from the first healing read in a native-matching replay; these
+    // exact samples distinguish the observed AudioToolbox stack contexts.
+    for (frame, expected) in [
+        (389, 0xbc6a_4d0a), (395, 0xbc09_1370), (396, 0x3e00_a6af),
+        (401, 0xbb21_f400), (402, 0x3e07_0c22), (407, 0x3b82_8850),
+        (408, 0x3e10_af39), (409, 0x3e8c_c113),
+    ] {
+        assert_eq!(left[frame].to_bits(), expected, "left frame {frame}");
+        assert_eq!(right[frame].to_bits(), expected, "right frame {frame}");
+    }
+    reader.close().unwrap();
+}
 
 #[test]
 fn controller_bit_depth_bucketing_and_validation() {
@@ -144,6 +169,46 @@ fn wav_roundtrip_and_invalid_buffer_do_not_advance_stream() {
     let actual = read_all(&mut reader, 257);
     assert_eq!(actual.len(), expected.len());
     for (a, b) in actual.iter().zip(&expected) { assert!((a - b).abs() <= 2.0 / 32768.0); }
+    reader.close().unwrap();
+}
+
+#[test]
+fn alac_postflight_refuses_a_silently_truncated_multichannel_stream() {
+    let dir = TestDir::new();
+    let path = dir.path("truncated.m4a");
+    let mut state = 0x5eed1234u32;
+    let mut input: Vec<f32> = (0..8191 * 6).map(|_| {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        (state as i32) as f32 * (1.0 / 2_147_483_648.0)
+    }).collect();
+    input[..4096 * 6].fill(0.0);
+    let mut writer = Writer::create(&path, config(OutputFormat::Alac, 6, 24)).unwrap();
+    for block in input.chunks(512 * 6) { writer.write(block).unwrap(); }
+    assert!(matches!(writer.finish(), Err(CodecError::AlacFrameMismatch { submitted: 8191, decoded: 4095 })));
+    assert!(!path.exists());
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[test]
+fn alac_postflight_accepts_complete_and_empty_streams() {
+    let dir = TestDir::new();
+    let valid = dir.path("complete.m4a");
+    write_fixture(&valid, config(OutputFormat::Alac, 2, 16), 513);
+    let mut reader = Reader::open(&valid, None).unwrap();
+    assert_eq!(read_all(&mut reader, 512).len(), 513 * 2);
+    reader.close().unwrap();
+    let empty = dir.path("empty.m4a");
+    let writer = Writer::create(&empty, config(OutputFormat::Alac, 2, 16)).unwrap();
+    writer.finish().unwrap();
+    let reader = Reader::open(&empty, None).unwrap();
+    assert_eq!(reader.file_length_frames().unwrap(), 0);
+    reader.close().unwrap();
+    let differently_named = dir.path("complete.flac");
+    write_fixture(&differently_named, config(OutputFormat::Alac, 2, 16), 513);
+    let renamed = dir.path("renamed.m4a");
+    fs::rename(differently_named, &renamed).unwrap();
+    let mut reader = Reader::open(&renamed, None).unwrap();
+    assert_eq!(read_all(&mut reader, 512).len(), 513 * 2);
     reader.close().unwrap();
 }
 

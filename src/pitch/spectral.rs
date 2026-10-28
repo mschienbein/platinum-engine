@@ -11,12 +11,15 @@ use super::fft::{
 const PI: f32 = f32::from_bits(0x4049_0fdb);
 const LOG_FLOOR: f32 = f32::from_bits(0x179a_be15);
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "sinf"]
     fn host_sinf(value: f32) -> f32;
     #[link_name = "cosf"]
     fn host_cosf(value: f32) -> f32;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{sinf as host_sinf, cosf as host_cosf};
 
 /// The cepstral envelope iteration at `0x3a1c0` for the selected split layout.
 pub struct SpectralEnvelope {

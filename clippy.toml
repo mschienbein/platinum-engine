@@ -1,0 +1,10 @@
+# Mac ARM float methods have architecture-specific edge semantics. Keep direct
+# operations inside portable/ only; engine code uses the ArmFloat trait.
+disallowed-methods = [
+    { path = "f32::mul_add", reason = "use ArmFloat::arm_mul_add" },
+    { path = "f32::min", reason = "use ArmFloat::arm_min" },
+    { path = "f32::max", reason = "use ArmFloat::arm_max" },
+    { path = "f64::mul_add", reason = "use ArmFloat::arm_mul_add" },
+    { path = "f64::min", reason = "use ArmFloat::arm_min" },
+    { path = "f64::max", reason = "use ArmFloat::arm_max" },
+]

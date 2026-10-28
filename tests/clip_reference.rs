@@ -3,6 +3,7 @@
 //! from the ARM64 instructions, not yet independent native golden recordings.
 
 use platinum_engine::clip::{ClipError, ClipParameters, ClipRepair};
+use platinum_engine::portable::arm_scalar::ArmFloat;
 
 const RATE: f64 = 48_000.0;
 const DELAY: usize = 2560;
@@ -72,7 +73,7 @@ fn measured_default_gain_has_the_recorded_naive_reference_differences() {
             mismatches += 1;
             first.get_or_insert(frame);
         }
-        maximum_error = maximum_error.max((f64::from(actual) - f64::from(expected)).abs());
+        maximum_error = maximum_error.arm_max((f64::from(actual) - f64::from(expected)).abs());
     }
     assert_eq!(mismatches, 486);
     assert_eq!(first, Some(2574));

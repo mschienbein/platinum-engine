@@ -14,8 +14,9 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// These ABI values describe container families, not PN's input type codes.
@@ -107,6 +108,10 @@ pub fn transfer_mode(source: Format, destination: Format, choice: OutputChoice) 
 pub enum TagError {
     Io { operation: &'static str, source: io::Error },
     Library(String),
+    #[cfg(target_os = "linux")]
+    LibraryPolicy(crate::linux_libraries::LibraryPolicyError),
+    ArtworkTranscodeUnavailable(String),
+    SourceContainerUnavailable(String),
     WrongBridgeAbi(u32),
     PathContainsNul,
     SourceIsDestination,
@@ -120,6 +125,10 @@ impl fmt::Display for TagError {
         match self {
             Self::Io { operation, source } => write!(f, "{operation}: {source}"),
             Self::Library(e) => write!(f, "TagLib bridge: {e}"),
+            #[cfg(target_os = "linux")]
+            Self::LibraryPolicy(error) => write!(f, "{error}"),
+            Self::ArtworkTranscodeUnavailable(message) => write!(f, "artwork conversion is unavailable on the portable tag bridge: {message}"),
+            Self::SourceContainerUnavailable(message) => write!(f, "source tag container is unavailable: {message}"),
             Self::WrongBridgeAbi(n) => write!(f, "unsupported TagLib bridge ABI {n}"),
             Self::PathContainsNul => write!(f, "tag file path contains NUL"),
             Self::SourceIsDestination => write!(f, "source and destination are the same file"),
@@ -132,7 +141,13 @@ impl fmt::Display for TagError {
 }
 impl std::error::Error for TagError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self { Self::Io { source, .. } => Some(source), Self::Marker(e) => Some(e), _ => None }
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Marker(e) => Some(e),
+            #[cfg(target_os = "linux")]
+            Self::LibraryPolicy(error) => Some(error),
+            _ => None,
+        }
     }
 }
 impl From<MarkerError> for TagError { fn from(e: MarkerError) -> Self { Self::Marker(e) } }
@@ -269,15 +284,24 @@ unsafe extern "C" fn rewrite_wav_marker(context: *mut c_void, path: *const c_cha
 fn native_with_marker(marker: &Marker, call: impl FnOnce(SerializeMarker, RewriteWav, *mut c_void, *mut c_char, usize) -> c_int)
     -> Result<Option<String>, TagError> {
     let mut context = MarkerCallback { marker, bytes: None, failure: None };
-    let error = native_call(|out, len| call(serialize_marker, rewrite_wav_marker, (&mut context as *mut MarkerCallback<'_>).cast(), out, len));
-    match context.failure { Some(error) => Err(error), None => Ok(error) }
+    let error = native_call(|out, len| {
+        call(serialize_marker, rewrite_wav_marker, (&mut context as *mut MarkerCallback<'_>).cast(), out, len)
+    });
+    if let Some(error) = context.failure { return Err(error); }
+    match error {
+        Some(error) if error.status == 3 || (error.status == 2 && cfg!(any(target_os = "linux", feature = "portable"))) =>
+            Err(error.into_tag_error()),
+        Some(error) => Ok(Some(error.message)),
+        None => Ok(None),
+    }
 }
 
 /// The native bridge and its open-source TagLib dependency must be trusted: a
 /// dynamic library can execute initializers. The handle remains alive for all
 /// calls. A bridge ABI/version string does not establish source provenance.
 pub struct TagBridge {
-    _library: Library,
+    _library: std::sync::Arc<Library>,
+    _pinned: crate::native_library::PinnedLibrary,
     path: PathBuf,
     direct: CopyDirect,
     generic: CopyGeneric,
@@ -292,10 +316,22 @@ impl TagBridge {
     /// its normal dynamic-library initializers.
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self, TagError> {
         let path = fs::canonicalize(path).map_err(|e| io_error("resolve bridge", e))?;
+        #[cfg(target_os = "macos")]
+        let pinned = crate::native_library::PinnedLibrary::open(&path).map_err(|e| TagError::Library(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let pinned = crate::linux_libraries::open_approved(&path, crate::linux_libraries::LibraryKind::TagBridge)
+            .map_err(TagError::LibraryPolicy)?;
         // SAFETY: trust and ABI compatibility are the caller's preconditions.
-        let lib = unsafe { Library::new(&path) }.map_err(|e| TagError::Library(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        let lib = unsafe { pinned.load() }.map_err(|e| TagError::Library(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let lib = unsafe { pinned.load() }.map_err(|e| TagError::LibraryPolicy(e.into()))?;
         // SAFETY: the caller guarantees this exported version function's ABI.
         let version: Version = unsafe { *lib.get(b"pn_tag_bridge_abi\0").map_err(|e| TagError::Library(e.to_string()))? };
+        #[cfg(target_os = "macos")]
+        pinned.verify_symbol(version as *const () as *const c_void).map_err(|e| TagError::Library(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        pinned.verify_symbol(version as *const () as *const c_void).map_err(|e| TagError::LibraryPolicy(e.into()))?;
         // SAFETY: the caller guarantees the function obtained above.
         let abi = unsafe { version() };
         if abi != 5 { return Err(TagError::WrongBridgeAbi(abi)); }
@@ -309,9 +345,11 @@ impl TagBridge {
             let inspect: Inspect = *lib.get(b"pn_tag_inspect\0").map_err(|e| TagError::Library(e.to_string()))?;
             (direct, generic, marker, read_marker, inspect)
         };
-        Ok(Self { _library: lib, path, direct, generic, marker, read_marker, inspect })
+        Ok(Self { _library: lib, _pinned: pinned, path, direct, generic, marker, read_marker, inspect })
     }
     pub fn bridge_path(&self) -> &Path { &self.path }
+    /// SHA-256 of the retained, descriptor-bound bridge image.
+    pub fn bridge_sha256(&self) -> [u8; 32] { self._pinned.digest() }
 
     /// Read the source's generic values, actual TagLib properties/unsupported
     /// identifiers, ordered ID3v2 frames and embedded artwork inventory.
@@ -327,7 +365,7 @@ impl TagBridge {
                 (&mut context as *mut InspectionCallback).cast(), out, len) }
         });
         if let Some(error) = context.failure { return Err(error); }
-        if let Some(error) = error { return Err(TagError::Library(error)); }
+        if let Some(error) = error { return Err(error.into_tag_error()); }
         context.result.ok_or_else(|| TagError::Library("tag inspector returned no callback".into()))
     }
 
@@ -354,7 +392,7 @@ impl TagBridge {
                 (&mut context as *mut ReadCallback).cast(), out, len) }
         });
         if let Some(error) = context.failure { return Err(error); }
-        if let Some(error) = error { return Err(TagError::Library(error)); }
+        if let Some(error) = error { return Err(error.into_tag_error()); }
         context.result.ok_or_else(|| TagError::Library("marker reader returned no callback".into()))
     }
 
@@ -374,19 +412,33 @@ impl TagBridge {
         let mut report = TransferReport { mode, copy_error: None, marker_error: None };
         match mode {
             TransferMode::Direct(op) => {
-                report.copy_error = native_call(|out, len| {
+                let error = native_call(|out, len| {
                     // SAFETY: function came from a caller-trusted bridge, paths
                     // and writable output buffer live through this call.
                     unsafe { (self.direct)(op as c_int, src.as_ptr(), dst.as_ptr(), out, len) }
                 });
+                report.copy_error = match error {
+                    Some(error) if error.status == 3 => None,
+                    Some(error) if error.status == 2 && cfg!(any(target_os = "linux", feature = "portable")) =>
+                        return Err(error.into_tag_error()),
+                    Some(error) => Some(error.message),
+                    None => None,
+                };
                 report.marker_error = self.save_marker(&dst, destination_format, marker)?;
             }
             TransferMode::Generic => {
-                report.copy_error = native_with_marker(marker, |callback, rewrite, context, out, len| {
+                report.copy_error = match native_with_marker(marker, |callback, rewrite, context, out, len| {
                     // SAFETY: the bridge is trusted, all borrowed pointers
                     // remain live during this synchronous callback-based call.
                     unsafe { (self.generic)(source_format as c_int, destination_format as c_int, src.as_ptr(), dst.as_ptr(), callback, rewrite, context, out, len) }
-                })?;
+                }) {
+                    Ok(error) => error,
+                    Err(TagError::SourceContainerUnavailable(_)) => {
+                        report.marker_error = self.save_marker(&dst, destination_format, marker)?;
+                        return Ok(report);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if report.copy_error.is_some() {
                     report.marker_error = self.save_marker(&dst, destination_format, marker)?;
                 }
@@ -401,32 +453,177 @@ impl TagBridge {
         })
     }
 }
-fn native_call(call: impl FnOnce(*mut c_char, usize) -> c_int) -> Option<String> {
+struct BridgeFailure { status: c_int, message: String }
+impl BridgeFailure {
+    fn into_tag_error(self) -> TagError {
+        match self.status {
+            3 => TagError::SourceContainerUnavailable(self.message),
+            2 if cfg!(any(target_os = "linux", feature = "portable")) => TagError::ArtworkTranscodeUnavailable(self.message),
+            _ => TagError::Library(self.message),
+        }
+    }
+}
+fn native_call(call: impl FnOnce(*mut c_char, usize) -> c_int) -> Option<BridgeFailure> {
     let mut buffer = [0u8; 1024];
     let status = call(buffer.as_mut_ptr().cast(), buffer.len());
     if status == 0 { return None; }
     let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
     let message = String::from_utf8_lossy(&buffer[..end]);
-    Some(if message.is_empty() { format!("native bridge failed with status {status}") } else { message.into_owned() })
+    Some(BridgeFailure { status, message: if message.is_empty() { format!("native bridge failed with status {status}") } else { message.into_owned() } })
 }
 
 /// MIKTag uses the destination path plus `_`. Do not overwrite a pre-existing
-/// sibling: it may belong to the user or a concurrent process. The temporary
-/// file is created exclusively and removed on errors; replacement occurs only
-/// after the whole rewrite has succeeded.
+/// sibling: it may belong to the user or a concurrent process. On errors,
+/// only a verified sibling in a private parent can be removed safely.
 fn rewrite_wav(path: &Path, payload: Option<&[u8]>) -> Result<(), TagError> {
     let mut name = path.as_os_str().to_os_string(); name.push("_");
     let temp = PathBuf::from(name);
     let mut input = fs::File::open(path).map_err(|e| io_error("open WAV for marker", e))?;
-    let mut output = OpenOptions::new().write(true).create_new(true).open(&temp)
+    let permissions = input.metadata().map_err(|e| io_error("inspect WAV staging permissions", e))?.permissions();
+    let mut output = OpenOptions::new().write(true).create_new(true).mode(permissions.mode() & 0o777).open(&temp)
         .map_err(|e| io_error("create WAV marker sibling", e))?;
     let result = (|| {
         metadata::rewrite_wav_marker(&mut input, &mut output, payload)?;
         output.flush().map_err(|e| io_error("flush WAV marker sibling", e))?;
-        drop(output);
+        // open's umask may have narrowed the initial mode. Restore exactly the
+        // stage's permissions only after writing, which can clear special bits.
+        output.set_permissions(permissions).map_err(|e| io_error("set WAV marker sibling permissions", e))?;
+        // Keep the created inode open through cleanup so it cannot be reused.
         fs::rename(&temp, path).map_err(|e| io_error("publish WAV marker staging file", e))?;
         Ok(())
     })();
-    if result.is_err() { let _ = fs::remove_file(&temp); }
-    result
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match remove_wav_sibling_if_owned(&temp, &output) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io_error("cleanup WAV marker sibling", io::Error::new(cleanup.kind(),
+                format!("{error}; could not safely remove {}: {cleanup}", temp.display())))),
+        },
+    }
+}
+
+fn remove_wav_sibling_if_owned(path: &Path, created: &fs::File) -> io::Result<()> {
+    let expected = created.metadata()?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let directory = OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(parent)?;
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sibling has no filename"))?;
+    let name = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sibling filename contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || (stat.st_dev as u64, stat.st_ino as u64) != (expected.dev(), expected.ino()) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "sibling identity changed"));
+    }
+    // A check followed by unlink is not atomic in a shared writable parent.
+    // Refuse cleanup unless other users cannot replace the verified entry.
+    let parent_metadata = directory.metadata()?;
+    if parent_metadata.uid() != unsafe { libc::geteuid() } || parent_metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "parent directory is not private"));
+    }
+    crate::file_workflow::require_no_extended_acl(&directory, parent).map_err(io::Error::other)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_cleanup_retains_substituted_or_shared_siblings() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = loop {
+            let path = std::env::temp_dir().join(format!("platinum-wav-cleanup-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create fixture directory: {e}"),
+            }
+        };
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let sibling = dir.join("stage.wav_");
+        let created = OpenOptions::new().write(true).create_new(true).open(&sibling).unwrap();
+        let original = dir.join("original-inode");
+        fs::rename(&sibling, &original).unwrap();
+        fs::write(&sibling, b"substituted").unwrap();
+        let error = remove_wav_sibling_if_owned(&sibling, &created).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(fs::read(&sibling).unwrap(), b"substituted");
+        assert!(original.exists());
+        fs::remove_file(&sibling).unwrap();
+        std::os::unix::fs::symlink(&original, &sibling).unwrap();
+        assert_eq!(remove_wav_sibling_if_owned(&sibling, &created).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(fs::symlink_metadata(&sibling).unwrap().file_type().is_symlink());
+
+        let owned = dir.join("owned_");
+        let file = OpenOptions::new().write(true).create_new(true).open(&owned).unwrap();
+        remove_wav_sibling_if_owned(&owned, &file).unwrap();
+        assert!(!owned.exists());
+        #[cfg(target_os = "linux")]
+        {
+            let parent = fs::File::open(&dir).unwrap();
+            let alias = PathBuf::from(format!("/proc/self/fd/{}/aliased_", parent.as_raw_fd()));
+            let file = OpenOptions::new().write(true).create_new(true).open(&alias).unwrap();
+            remove_wav_sibling_if_owned(&alias, &file).unwrap();
+            assert!(!alias.exists());
+        }
+
+        let stage = dir.join("bad.wav");
+        fs::write(&stage, b"invalid WAV").unwrap();
+        assert!(rewrite_wav(&stage, None).is_err());
+        assert!(!dir.join("bad.wav_").exists());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = rewrite_wav(&stage, None).unwrap_err();
+        assert!(error.to_string().contains("could not safely remove"));
+        assert!(error.to_string().contains("parent directory is not private"));
+        assert!(dir.join("bad.wav_").exists());
+        assert_eq!(fs::read(&stage).unwrap(), b"invalid WAV");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wav_marker_rewrite_preserves_staging_permissions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = loop {
+            let path = std::env::temp_dir().join(format!("platinum-wav-mode-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create fixture directory: {e}"),
+            }
+        };
+        for mode in [0o600, 0o640, 0o400] {
+            let path = dir.join(format!("stage-{mode:o}.wav"));
+            fs::write(&path, b"RIFF\x04\0\0\0WAVE").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            rewrite_wav(&path, Some(b"test")).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, mode);
+            assert_eq!(fs::read(&path).unwrap(), b"RIFF\x10\0\0\0WAVEPLTN\x04\0\0\0test");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bridge_source_unavailability_is_distinct_from_other_failures() {
+        let source = native_call(|_, _| 3).unwrap().into_tag_error();
+        assert!(matches!(source, TagError::SourceContainerUnavailable(_)));
+        let other = native_call(|_, _| 1).unwrap().into_tag_error();
+        assert!(matches!(other, TagError::Library(_)));
+    }
+
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    fn bridge_artwork_refusal_is_not_a_generic_failure() {
+        let error = native_call(|_, _| 2).unwrap().into_tag_error();
+        assert!(matches!(error, TagError::ArtworkTranscodeUnavailable(_)));
+    }
 }

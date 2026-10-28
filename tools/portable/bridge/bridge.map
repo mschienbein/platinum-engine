@@ -1,0 +1,10 @@
+{
+  global:
+    pn_tag_bridge_abi;
+    pn_tag_read_marker;
+    pn_tag_inspect;
+    pn_tag_copy_direct;
+    pn_tag_copy_generic;
+    pn_tag_save_marker;
+  local: *;
+};

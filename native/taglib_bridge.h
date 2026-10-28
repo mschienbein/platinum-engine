@@ -15,6 +15,18 @@ enum pn_tag_format { PN_TAG_MP3 = 1, PN_TAG_MP4 = 2, PN_TAG_WAV = 3,
 enum pn_tag_copy { PN_COPY_ID3 = 1, PN_COPY_MP4 = 2, PN_COPY_WAV = 3,
                    PN_COPY_AIFF = 4, PN_COPY_FLAC = 5, PN_COPY_MP4_TO_ID3 = 6 };
 
+/* ABI-5 result codes for bridge operations:
+ * 0: success; 1: ordinary failure, including path/open/read/write errors,
+ * destination container errors, callbacks and malformed metadata;
+ * 2: portable-only refusal of artwork requiring or potentially requiring
+ * Apple image transcoding; 3: an opened source tag container is unavailable
+ * or invalid for the requested format. A status-3 copy does not commit to the
+ * destination or invoke callbacks. Destination validation takes precedence
+ * over status 3; callers may separately save a marker to a valid destination.
+ * Source I/O errors return 1 even if TagLib finds a valid container; unlike
+ * the legacy bridge, a directory presented as MP3 is an error, not success.
+ * The CLI admits only regular files. */
+
 typedef struct pn_tag_payload {
     const uint8_t *bytes; /* may be NULL only when length is zero */
     size_t length;

@@ -12,12 +12,18 @@
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct SplitComplex {
     real: *mut f32,
     imaginary: *mut f32,
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::vdsp::{SplitComplex, vDSP_create_fftsetup, vDSP_destroy_fftsetup, vDSP_ctoz,
+    vDSP_ztoc, vDSP_fft_zrip, vDSP_vsmul, vDSP_vmul, vDSP_vadd, vDSP_vsub, vDSP_vdiv,
+    vDSP_vmax, vDSP_vabs, vDSP_maxvi, vDSP_zvphas, vDSP_zvabs};
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
     fn vDSP_create_fftsetup(log2n: usize, radix: i32) -> *mut c_void;
@@ -270,7 +276,10 @@ pub fn sincos(input: &[f32], sine: &mut [f32], cosine: &mut [f32]) {
     assert_eq!(input.len(), sine.len());
     assert_eq!(input.len(), cosine.len());
     let count = i32::try_from(input.len()).expect("vForce input exceeds i32");
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     unsafe { vvsincosf(sine.as_mut_ptr(), cosine.as_mut_ptr(), input.as_ptr(), &count) };
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    { let _ = count; crate::portable::vforce::vvsincosf(sine, cosine, input); }
 }
 
 /// `0x1ffb8`: replace real zeroes permanently and temporarily clear Nyquist.
@@ -342,11 +351,17 @@ pub(crate) fn log_floor_in_place(data: &mut [f32], floor: f32) {
         }
     }
     let count = i32::try_from(data.len()).expect("vForce input exceeds i32");
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     unsafe { vvlogf(data.as_mut_ptr(), data.as_ptr(), &count) };
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    { let _ = count; crate::portable::vforce::vvlogf_in_place(data); }
 }
 
 pub(crate) fn exp_in_place(data: &mut [f32]) {
     let count = i32::try_from(data.len()).expect("vForce input exceeds i32");
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     unsafe { vvexpf(data.as_mut_ptr(), data.as_ptr(), &count) };
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    { let _ = count; crate::portable::vforce::vvexpf_in_place(data); }
 }
 

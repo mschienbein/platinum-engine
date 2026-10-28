@@ -2,6 +2,7 @@
 //! local HeartCore copy as a comparison oracle; the Rust implementation does not.
 
 use platinum_engine::transient::{TransientMeters, TransientParameters, TransientShaper};
+use platinum_engine::portable::arm_scalar::ArmFloat;
 
 fn parameters() -> TransientParameters {
     TransientParameters {
@@ -112,8 +113,8 @@ fn soft_clip_preserves_sign_and_has_the_native_fused_curve() {
     let mut left = [0.0, -0.0, 0.5, 1.0];
     let mut right = [-1.0, -0.5, 0.25, 1.0];
     dsp.process_chunk(&mut left, &mut right, None);
-    let excess = 1.0_f32.mul_add(10.0, -9.0);
-    let curved = excess.mul_add(excess, excess);
+    let excess = 1.0_f32.arm_mul_add(10.0, -9.0);
+    let curved = excess.arm_mul_add(excess, excess);
     let expected = (curved * 0.1_f32) / (curved + 1.0) + 0.9_f32;
     assert_eq!(bits(&left), vec![0.0_f32.to_bits(), (-0.0_f32).to_bits(), 0.5_f32.to_bits(), expected.to_bits()]);
     assert_eq!(right[0].to_bits(), (-expected).to_bits());

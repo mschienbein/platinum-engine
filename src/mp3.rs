@@ -4,15 +4,15 @@
 //! not a claim that every 3.100 build produces the reference bytes. A complete
 //! output also needs the original processing, AudioToolbox conversion, sample
 //! scheduling and metadata handling. See `docs/VERIFICATION.md` for scope.
-#![cfg(target_os = "macos")]
 
 use libloading::Library;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
@@ -22,6 +22,8 @@ const SCAN_BYTES: usize = 65_536;
 pub enum Mp3Error {
     Io(io::Error),
     Load(String),
+    #[cfg(target_os = "linux")]
+    LibraryPolicy(crate::linux_libraries::LibraryPolicyError),
     InvalidDigest,
     DigestMismatch { expected: String, actual: String },
     UnsupportedVersion(String),
@@ -36,6 +38,8 @@ impl fmt::Display for Mp3Error {
         match self {
             Self::Io(e) => write!(f, "MP3 I/O: {e}"),
             Self::Load(e) => write!(f, "LAME library: {e}"),
+            #[cfg(target_os = "linux")]
+            Self::LibraryPolicy(error) => write!(f, "{error}"),
             Self::InvalidDigest => write!(f, "expected SHA-256 must be 64 hexadecimal digits"),
             Self::DigestMismatch { expected, actual } => write!(f, "LAME SHA-256 mismatch: expected {expected}, got {actual}"),
             Self::UnsupportedVersion(v) => write!(f, "LAME 3.100 required; library reports {v:?}"),
@@ -46,16 +50,25 @@ impl fmt::Display for Mp3Error {
         }
     }
 }
-impl std::error::Error for Mp3Error {}
+impl std::error::Error for Mp3Error {
+    #[cfg(target_os = "linux")]
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::LibraryPolicy(error) => Some(error), _ => None }
+    }
+}
 impl From<io::Error> for Mp3Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct Sha256Context { count: [u32; 2], hash: [u32; 8], wbuf: [u32; 16] }
 #[repr(C)]
 struct DlInfo { filename: *const c_char, base: *mut c_void, symbol: *const c_char, address: *mut c_void }
 unsafe extern "C" {
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fn CC_SHA256_Init(ctx: *mut Sha256Context) -> c_int;
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fn CC_SHA256_Update(ctx: *mut Sha256Context, data: *const c_void, len: u32) -> c_int;
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fn CC_SHA256_Final(md: *mut u8, ctx: *mut Sha256Context) -> c_int;
     fn dladdr(address: *const c_void, info: *mut DlInfo) -> c_int;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
@@ -67,6 +80,7 @@ unsafe extern "C" {
 }
 
 /// SHA-256 of the entire supplied file, using macOS CommonCrypto.
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 pub fn file_sha256(path: impl AsRef<Path>) -> Result<String, Mp3Error> {
     let mut file = File::open(path)?;
     let mut context = Sha256Context { count: [0; 2], hash: [0; 8], wbuf: [0; 16] };
@@ -92,6 +106,22 @@ pub fn file_sha256(path: impl AsRef<Path>) -> Result<String, Mp3Error> {
     Ok(hex)
 }
 
+#[cfg(any(target_os = "linux", feature = "portable"))]
+pub fn file_sha256(path: impl AsRef<Path>) -> Result<String, Mp3Error> {
+    let mut file = File::open(path)?;
+    let mut digest = crate::portable::digest::Sha256::new();
+    let mut block = [0u8; 32768];
+    loop {
+        let count = file.read(&mut block)?;
+        if count == 0 { break; }
+        digest.update(&block[..count]);
+    }
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in digest.finalize() { let _ = write!(hex, "{byte:02x}"); }
+    Ok(hex)
+}
+
 type Init = unsafe extern "C" fn() -> *mut c_void;
 type Set = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type InitParams = unsafe extern "C" fn(*mut c_void) -> c_int;
@@ -114,7 +144,8 @@ pub struct LibraryIdentity {
 /// supply a trusted LGPL-compatible open-source build and record its source and
 /// build provenance. Path, version and digest are not proof of reference parity.
 pub struct LameLibrary {
-    _library: Library,
+    _library: std::sync::Arc<Library>,
+    _pinned: crate::native_library::PinnedLibrary,
     identity: LibraryIdentity,
     init: Init, set_channels: Set, set_rate: Set, set_mode: Set,
     set_brate: Set, set_quality: Set, set_vbr: Set, set_vbr_mean: Set,
@@ -130,13 +161,20 @@ impl LameLibrary {
             return Err(Mp3Error::InvalidDigest);
         }
         let path = path.as_ref().canonicalize()?;
-        let digest = file_sha256(&path)?;
+        #[cfg(target_os = "macos")]
+        let pinned = crate::native_library::PinnedLibrary::open(&path).map_err(|e| Mp3Error::Load(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let pinned = crate::linux_libraries::open_approved(&path, crate::linux_libraries::LibraryKind::Lame).map_err(Mp3Error::LibraryPolicy)?;
+        let digest = pinned.digest_hex();
         if !digest.eq_ignore_ascii_case(expected_sha256) {
             return Err(Mp3Error::DigestMismatch { expected: expected_sha256.to_ascii_lowercase(), actual: digest });
         }
         // SAFETY: the path is explicitly supplied by the caller and pinned above;
         // the caller is responsible for trusting executable library initializers.
-        let library = unsafe { Library::new(&path) }.map_err(|e| Mp3Error::Load(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        let library = unsafe { pinned.load() }.map_err(|e| Mp3Error::Load(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let library = unsafe { pinned.load() }.map_err(|e| Mp3Error::LibraryPolicy(e.into()))?;
         unsafe fn symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> Result<T, Mp3Error> {
             // SAFETY: names and ABI signatures below are declared by LAME's public API.
             unsafe { lib.get::<T>(name) }.map(|s| *s).map_err(|e| Mp3Error::Load(e.to_string()))
@@ -144,6 +182,10 @@ impl LameLibrary {
         // SAFETY: each symbol is copied with its public C ABI; the library stays owned here.
         unsafe {
             let version_fn: Version = symbol(&library, b"get_lame_version\0")?;
+            #[cfg(target_os = "macos")]
+            pinned.verify_symbol(version_fn as *const () as *const c_void).map_err(|e| Mp3Error::Load(e.to_string()))?;
+            #[cfg(target_os = "linux")]
+            pinned.verify_symbol(version_fn as *const () as *const c_void).map_err(|e| Mp3Error::LibraryPolicy(e.into()))?;
             let mut info = DlInfo { filename: ptr::null(), base: ptr::null_mut(), symbol: ptr::null(), address: ptr::null_mut() };
             if dladdr(version_fn as *const () as *const c_void, &mut info) == 0 || info.filename.is_null() {
                 return Err(Mp3Error::Load("cannot identify loaded LAME image".into()));
@@ -179,7 +221,7 @@ impl LameLibrary {
                 get_write_tag: symbol(&library, b"lame_get_bWriteVbrTag\0")?,
                 get_lametag_frame: symbol(&library, b"lame_get_lametag_frame\0")?,
                 identity: LibraryIdentity { canonical_path: path, sha256: digest, version },
-                _library: library,
+                _library: library, _pinned: pinned,
             })
         }
     }
@@ -226,7 +268,7 @@ pub struct Mp3Header {
 pub struct Mp3Config {
     /// Actual final-render rate; controller-selected MP3 rates are 22050, 32000, 44100, 48000.
     pub sample_rate: u32,
-    /// Number of channels in the graph source (1 or 2), also passed to LAME.
+    /// Number of source channels, converted to stereo PCM before LAME.
     pub channels: u8,
     pub mode: Mp3Mode,
     pub source: SourceHeader,
@@ -297,7 +339,13 @@ pub struct EncodeReport {
 }
 impl<'a> Mp3Encoder<'a> {
     pub fn create_new(library: &'a LameLibrary, staging: impl AsRef<Path>, config: Mp3Config) -> Result<Self, Mp3Error> {
-        if !matches!(config.channels, 1 | 2) { return Err(Mp3Error::InvalidConfiguration("MP3 source channel count must be 1 or 2")); }
+        Self::create_with(library, config, || OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(staging))
+    }
+    pub(crate) fn from_file(library: &'a LameLibrary, file: File, config: Mp3Config) -> Result<Self, Mp3Error> {
+        Self::create_with(library, config, || Ok(file))
+    }
+    fn create_with(library: &'a LameLibrary, config: Mp3Config, open: impl FnOnce() -> io::Result<File>) -> Result<Self, Mp3Error> {
+        if !(1..=64).contains(&config.channels) { return Err(Mp3Error::InvalidConfiguration("MP3 source channel count must be in 1..=64")); }
         if !matches!(config.sample_rate, 22_050 | 32_000 | 44_100 | 48_000) {
             return Err(Mp3Error::InvalidConfiguration("MP3 sample rate must be the controller-selected final rate"));
         }
@@ -309,7 +357,7 @@ impl<'a> Mp3Encoder<'a> {
             let code = unsafe { setter(state.flags.as_ptr(), value) };
             if code < 0 { Err(Mp3Error::Lame { operation: op, code }) } else { Ok(()) }
         };
-        set("set_num_channels", library.set_channels, i32::from(config.channels))?;
+        set("set_num_channels", library.set_channels, i32::from(config.channels.min(2)))?;
         set("set_in_samplerate", library.set_rate, config.sample_rate as i32)?;
         set("set_mode", library.set_mode, if config.channels == 1 { 3 } else { 0 })?;
         match config.mode {
@@ -325,7 +373,7 @@ impl<'a> Mp3Encoder<'a> {
         let result = unsafe { (library.init_params)(state.flags.as_ptr()) };
         if result < 0 { return Err(Mp3Error::Lame { operation: "init_params", code: result }); }
         let effective_tag = unsafe { (library.get_write_tag)(state.flags.as_ptr()) } != 0;
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(staging)?;
+        let file = open()?;
         let fd = file.try_clone()?.into_raw_fd();
         // SAFETY: fd is newly duplicated and transferred to fdopen on success.
         let c_ptr = unsafe { fdopen(fd, c"r+".as_ptr()) };
@@ -428,7 +476,7 @@ const BITRATES: [[[u16; 15]; 3]; 2] = [
     ],
 ];
 
-fn frame_size(word: u32) -> usize {
+pub(crate) fn frame_size(word: u32) -> usize {
     if word <= 0xffdf_ffff || word & 0xf000 == 0xf000 || word & 0x60000 == 0 ||
         word & 0xc00 == 0xc00 {
         return 0;
@@ -448,6 +496,169 @@ fn frame_size(word: u32) -> usize {
         2 => (bitrate * 144_000 / rate + padding) as usize,
         _ => (bitrate * 144_000 / (rate << low_version) + padding) as usize,
     }
+}
+/// Metadata required by the output report, obtained without decoding audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodedMp3Info {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub frames_per_packet: u32,
+    pub frames: u64,
+}
+
+#[derive(Clone, Copy)]
+struct OutputFrame {
+    size: u64,
+    rate: u32,
+    channels: u32,
+    samples: u32,
+    bitrate: u32,
+    crc_bytes: usize,
+    side_bytes: usize,
+}
+
+fn output_frame(word: u32) -> Option<OutputFrame> {
+    let version = (word >> 19) & 3;
+    let layer = (word >> 17) & 3;
+    let bitrate_index = ((word >> 12) & 15) as usize;
+    let rate_index = ((word >> 10) & 3) as usize;
+    if word >> 21 != 0x7ff || version == 1 || layer != 1 ||
+        bitrate_index == 0 || bitrate_index == 15 || rate_index == 3 {
+        return None;
+    }
+    let low_version = usize::from(version != 3);
+    let rate = [44_100, 48_000, 32_000][rate_index] >> match version { 3 => 0, 2 => 1, _ => 2 };
+    let channels = if (word >> 6) & 3 == 3 { 1 } else { 2 };
+    let samples = if version == 3 { 1152 } else { 576 };
+    let bitrate = u32::from(BITRATES[low_version][2][bitrate_index]) * 1000;
+    let size = u64::from(frame_size(word) as u32);
+    let side_bytes = match (version == 3, channels == 1) {
+        (true, true) => 17, (true, false) => 32,
+        (false, true) => 9, (false, false) => 17,
+    };
+    Some(OutputFrame { size, rate, channels, samples, bitrate,
+        crc_bytes: if word & (1 << 16) == 0 { 2 } else { 0 }, side_bytes })
+}
+
+enum OutputTag { Info, Xing }
+struct OutputGapless {
+    kind: OutputTag,
+    declared_frames: u32,
+    delay: u32,
+    padding: u32,
+}
+
+fn output_gapless(frame: &[u8], header: OutputFrame) -> Result<Option<OutputGapless>, Mp3Error> {
+    let offset = 4 + header.crc_bytes + header.side_bytes;
+    let Some(marker) = frame.get(offset..offset + 4) else { return Ok(None); };
+    let kind = match marker { b"Info" => OutputTag::Info, b"Xing" => OutputTag::Xing, _ => return Ok(None) };
+    let invalid = || Mp3Error::InvalidBuffer("unsupported or truncated MP3 gapless header");
+    let read_u32 = |at: usize| -> Result<u32, Mp3Error> {
+        Ok(u32::from_be_bytes(frame.get(at..at + 4).ok_or_else(invalid)?.try_into().map_err(|_| invalid())?))
+    };
+    let flags = read_u32(offset + 4)?;
+    if flags & 1 == 0 || flags & !15 != 0 { return Err(invalid()); }
+    let declared_frames = read_u32(offset + 8)?;
+    let lame = offset + 8 + 4 + if flags & 2 != 0 { 4 } else { 0 }
+        + if flags & 4 != 0 { 100 } else { 0 } + if flags & 8 != 0 { 4 } else { 0 };
+    let packed = match frame.get(lame..lame + 4).ok_or_else(invalid)? {
+        b"LAME" | b"Lavc" | b"Lavf" => {
+            let bytes = frame.get(lame + 21..lame + 24).ok_or_else(invalid)?;
+            (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2])
+        }
+        // The native source-header update can erase the LAME identifier;
+        // AudioToolbox then reports no encoder delay or padding.
+        [0, 0, 0, 0] => 0,
+        _ => return Err(invalid()),
+    };
+    Ok(Some(OutputGapless { kind, declared_frames, delay: packed >> 12, padding: packed & 0xfff }))
+}
+
+/// Validate a staged LAME output and reproduce the native report's MP3
+/// properties without making MP3 input decoding available.
+pub(crate) fn inspect_encoded_output(path: &Path) -> Result<EncodedMp3Info, Mp3Error> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    inspect_encoded_reader(file, file_len)
+}
+
+fn inspect_encoded_reader<R: Read + Seek>(file: R, file_len: u64) -> Result<EncodedMp3Info, Mp3Error> {
+    let mut input = BufReader::new(file);
+    let mut prefix = [0u8; 10];
+    input.read_exact(&mut prefix)?;
+    let start = if &prefix[..3] == b"ID3" {
+        if prefix[6..10].iter().any(|byte| byte & 0x80 != 0) {
+            return Err(Mp3Error::InvalidBuffer("invalid MP3 ID3 size"));
+        }
+        let size = (u64::from(prefix[6]) << 21) | (u64::from(prefix[7]) << 14)
+            | (u64::from(prefix[8]) << 7) | u64::from(prefix[9]);
+        10 + size + if prefix[5] & 0x10 != 0 { 10 } else { 0 }
+    } else { 0 };
+    if start >= file_len { return Err(Mp3Error::InvalidBuffer("MP3 output has no audio frames")); }
+    input.seek(SeekFrom::Start(start))?;
+    let mut offset = start;
+    let mut frame_count = 0u64;
+    let mut audio_bytes = 0u64;
+    let mut first = None;
+    let mut gapless = None;
+    while offset < file_len {
+        if file_len - offset < 4 { return Err(Mp3Error::InvalidBuffer("truncated MP3 frame header")); }
+        let mut bytes = [0u8; 4];
+        input.read_exact(&mut bytes)?;
+        if &bytes[..3] == b"TAG" && file_len - offset == 128 { break; }
+        let header = output_frame(u32::from_be_bytes(bytes))
+            .ok_or(Mp3Error::InvalidBuffer("invalid MP3 frame header"))?;
+        if header.size < 4 || header.size > file_len - offset {
+            return Err(Mp3Error::InvalidBuffer("truncated MP3 frame"));
+        }
+        if let Some(initial) = first {
+            let initial: OutputFrame = initial;
+            if header.rate != initial.rate || header.channels != initial.channels || header.samples != initial.samples
+                || matches!(gapless.as_ref().map(|value: &OutputGapless| &value.kind), Some(OutputTag::Info))
+                    && header.bitrate != initial.bitrate {
+                return Err(Mp3Error::InvalidBuffer("MP3 output changes stream parameters"));
+            }
+            audio_bytes = audio_bytes.checked_add(header.size)
+                .ok_or(Mp3Error::InvalidBuffer("MP3 audio length overflow"))?;
+            input.seek_relative((header.size - 4) as i64)?;
+        } else {
+            let size = usize::try_from(header.size).map_err(|_| Mp3Error::InvalidBuffer("MP3 frame too large"))?;
+            let mut frame = [0u8; 2048];
+            if size > frame.len() { return Err(Mp3Error::InvalidBuffer("MP3 frame too large")); }
+            frame[..4].copy_from_slice(&bytes);
+            input.read_exact(&mut frame[4..size])?;
+            gapless = output_gapless(&frame[..size], header)?;
+            first = Some(header);
+        }
+        frame_count = frame_count.checked_add(1).ok_or(Mp3Error::InvalidBuffer("MP3 frame count overflow"))?;
+        offset += header.size;
+    }
+    let initial = first.ok_or(Mp3Error::InvalidBuffer("MP3 output has no audio frames"))?;
+    let frames = if let Some(gapless) = gapless {
+        if u64::from(gapless.declared_frames) != frame_count - 1 {
+            return Err(Mp3Error::InvalidBuffer("MP3 gapless frame count does not match the file"));
+        }
+        let packets = match gapless.kind {
+            OutputTag::Xing => u128::from(gapless.declared_frames),
+            // AudioToolbox estimates duration in binary64 and then converts it
+            // to packets. The operation order matters: an integral packet count
+            // can round slightly upward before the final ceil.
+            OutputTag::Info => {
+                let duration = (audio_bytes as f64 * 8.0) / f64::from(initial.bitrate);
+                let packets_per_second = f64::from(initial.rate) / f64::from(initial.samples);
+                (duration * packets_per_second).ceil() as u128
+            }
+        };
+        let samples = packets * u128::from(initial.samples);
+        let trimmed = samples.checked_sub(u128::from(gapless.delay) + u128::from(gapless.padding))
+            .ok_or(Mp3Error::InvalidBuffer("invalid MP3 gapless delay or padding"))?;
+        u64::try_from(trimmed).map_err(|_| Mp3Error::InvalidBuffer("MP3 frame count overflow"))?
+    } else {
+        frame_count.checked_mul(u64::from(initial.samples))
+            .ok_or(Mp3Error::InvalidBuffer("MP3 frame count overflow"))?
+    };
+    Ok(EncodedMp3Info { sample_rate: initial.rate, channels: initial.channels,
+        frames_per_packet: initial.samples, frames })
 }
 
 fn word_at(data: &[u8], pos: usize) -> u32 {
@@ -781,5 +992,165 @@ mod source_update_tests {
         assert_eq!(&one[..zero.len()], zero.as_slice());
         assert!(one[zero.len()..].iter().all(|&byte| byte == 0));
         assert_eq!(updated(&input, &source, None).unwrap(), one);
+    }
+}
+
+#[cfg(test)]
+mod output_inspection_tests {
+    use super::*;
+
+    fn fixture(tagged: bool, id3: bool) -> Vec<u8> {
+        let frame_size = 417usize;
+        let prefix = if id3 { 15 } else { 0 };
+        let mut bytes = vec![0u8; prefix + frame_size * 4];
+        if id3 { bytes[..15].copy_from_slice(b"ID3\x04\x00\x00\x00\x00\x00\x05abcde"); }
+        for index in 0..4 {
+            let offset = prefix + index * frame_size;
+            bytes[offset..offset + 4].copy_from_slice(&0xfffb_9000u32.to_be_bytes());
+        }
+        if tagged {
+            let tag = prefix + 36;
+            bytes[tag..tag + 4].copy_from_slice(b"Info");
+            bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
+            bytes[tag + 8..tag + 12].copy_from_slice(&3u32.to_be_bytes());
+            let lame = tag + 120;
+            bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
+            let packed = (576u32 << 12) | 720;
+            bytes[lame + 21..lame + 24].copy_from_slice(&packed.to_be_bytes()[1..]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn encoded_inspection_reads_gapless_and_plain_streams_and_rejects_truncation() {
+        for id3 in [false, true] {
+            for tagged in [false, true] {
+                let bytes = fixture(tagged, id3);
+                let parsed = inspect_encoded_reader(io::Cursor::new(&bytes), bytes.len() as u64).unwrap();
+                assert_eq!(parsed, EncodedMp3Info { sample_rate: 44_100, channels: 2,
+                    frames_per_packet: 1152, frames: if tagged { 2160 } else { 4608 } });
+                let mut truncated = bytes.clone();
+                truncated.pop();
+                assert!(inspect_encoded_reader(io::Cursor::new(&truncated), truncated.len() as u64).is_err());
+                if tagged {
+                    let mut bad_count = bytes.clone();
+                    let count = usize::from(id3) * 15 + 36 + 8;
+                    bad_count[count..count + 4].copy_from_slice(&2u32.to_be_bytes());
+                    assert!(inspect_encoded_reader(io::Cursor::new(&bad_count), bad_count.len() as u64).is_err());
+                    let mut erased = bytes.clone();
+                    let identifier = usize::from(id3) * 15 + 36 + 120;
+                    for name in [b"Lavc", b"Lavf"] {
+                        let mut alias = bytes.clone();
+                        alias[identifier..identifier + 4].copy_from_slice(name);
+                        assert_eq!(inspect_encoded_reader(io::Cursor::new(&alias), alias.len() as u64).unwrap().frames, 2160);
+                    }
+                    erased[identifier..identifier + 9].fill(0);
+                    let parsed = inspect_encoded_reader(io::Cursor::new(&erased), erased.len() as u64).unwrap();
+                    assert_eq!(parsed.frames, 3456, "an erased LAME identifier disables gapless trimming");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cbr_info_length_matches_native_byte_based_packet_rounding() {
+        let mut bytes = Vec::new();
+        for index in 0..11 {
+            let padded = index >= 2 && index % 2 == 0;
+            let size = 522 + usize::from(padded);
+            let offset = bytes.len();
+            bytes.resize(offset + size, 0);
+            let word = 0xfff3_e0c4u32 | (u32::from(padded) << 9);
+            bytes[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        let tag = 13;
+        bytes[tag..tag + 4].copy_from_slice(b"Info");
+        bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
+        bytes[tag + 8..tag + 12].copy_from_slice(&10u32.to_be_bytes());
+        let lame = tag + 120;
+        bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
+        let packed = (576u32 << 12) | 1088;
+        bytes[lame + 21..lame + 24].copy_from_slice(&packed.to_be_bytes()[1..]);
+        let parsed = inspect_encoded_reader(io::Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        assert_eq!(parsed, EncodedMp3Info { sample_rate: 22_050, channels: 1,
+            frames_per_packet: 576, frames: 4672 });
+    }
+
+    #[test]
+    fn cbr_info_preserves_native_binary64_packet_rounding() {
+        // AudioToolbox reports 30 packets for 29 exact 32 kHz/320 kbps
+        // packets because its binary64 duration calculation rounds upward.
+        for (declared, estimated) in [(13u32, 14u64), (23, 23), (29, 30), (31, 32), (32, 32)] {
+            let frame_size = 1440usize;
+            let mut bytes = vec![0u8; frame_size * (declared as usize + 1)];
+            for offset in (0..bytes.len()).step_by(frame_size) {
+                bytes[offset..offset + 4].copy_from_slice(&0xfffb_e8c4u32.to_be_bytes());
+            }
+            let tag = 21;
+            bytes[tag..tag + 4].copy_from_slice(b"Info");
+            bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
+            bytes[tag + 8..tag + 12].copy_from_slice(&declared.to_be_bytes());
+            let lame = tag + 120;
+            bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
+            let packed = (576u32 << 12) | 832;
+            bytes[lame + 21..lame + 24].copy_from_slice(&packed.to_be_bytes()[1..]);
+            let parsed = inspect_encoded_reader(io::Cursor::new(&bytes), bytes.len() as u64).unwrap();
+            assert_eq!(parsed, EncodedMp3Info { sample_rate: 32_000, channels: 1,
+                frames_per_packet: 1152, frames: estimated * 1152 - 576 - 832 });
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
+    #[test]
+    #[ignore = "requires PN_MP3_POSTFLIGHT_CORPORA and a new PN_MP3_POSTFLIGHT_RECEIPT"]
+    fn encoded_inspection_matches_audiotoolbox_corpora() {
+        use crate::audio_input::{AudioReader, InputLibraries};
+        use serde_json::json;
+        use std::fs;
+
+        let roots = std::env::var_os("PN_MP3_POSTFLIGHT_CORPORA").expect("PN_MP3_POSTFLIGHT_CORPORA");
+        let receipt = std::env::var_os("PN_MP3_POSTFLIGHT_RECEIPT").expect("PN_MP3_POSTFLIGHT_RECEIPT");
+        let mut rows = Vec::new();
+        let mut root_counts = Vec::new();
+        let mut mismatches = 0usize;
+        for root in std::env::split_paths(&roots) {
+            let mut paths: Vec<_> = fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp3")))
+                .collect();
+            paths.sort();
+            assert!(!paths.is_empty(), "empty MP3 corpus {}", root.display());
+            root_counts.push(json!({"root":root, "files":paths.len()}));
+            for path in paths {
+                let native = (|| -> Result<Vec<u64>, String> {
+                    let reader = AudioReader::open(&path, None, &InputLibraries::default()).map_err(|e| e.to_string())?;
+                    let stream = reader.source_format();
+                    let frames = reader.file_length_frames().map_err(|e| e.to_string())?;
+                    reader.close().map_err(|e| e.to_string())?;
+                    let frames = u64::try_from(frames).map_err(|e| e.to_string())?;
+                    Ok(vec![stream.sample_rate.to_bits(), u64::from(stream.format_id), u64::from(stream.format_flags),
+                        u64::from(stream.bytes_per_packet), u64::from(stream.frames_per_packet),
+                        u64::from(stream.bytes_per_frame), u64::from(stream.channels_per_frame),
+                        u64::from(stream.bits_per_channel), u64::from(stream.reserved), frames])
+                })();
+                let candidate = inspect_encoded_output(&path).map(|info| vec![
+                    f64::from(info.sample_rate).to_bits(), u64::from(u32::from_be_bytes(*b".mp3")), 0, 0,
+                    u64::from(info.frames_per_packet), 0, u64::from(info.channels), 0, 0, info.frames
+                ]).map_err(|e| e.to_string());
+                let equal = native == candidate;
+                if !equal { mismatches += 1; }
+                rows.push(json!({"path":path, "sha256":file_sha256(&path).unwrap(),
+                    "native":native, "candidate":candidate, "equal":equal}));
+            }
+        }
+        let count = rows.len();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mp3.rs");
+        let output = json!({"schema":"platinum-mp3-postflight-v1", "source_sha256":file_sha256(source).unwrap(),
+            "fields":["sample_rate_bits","format_id","format_flags","bytes_per_packet","frames_per_packet",
+                "bytes_per_frame","channels_per_frame","bits_per_channel","reserved","file_length_frames"],
+            "corpora":root_counts, "files":count, "mismatches":mismatches, "rows":rows});
+        let mut file = OpenOptions::new().write(true).create_new(true).open(receipt).unwrap();
+        serde_json::to_writer(&mut file, &output).unwrap();
+        file.write_all(b"\n").unwrap();
+        assert_eq!(mismatches, 0, "{mismatches}/{count} MP3 postflight mismatches");
     }
 }

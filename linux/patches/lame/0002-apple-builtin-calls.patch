@@ -1,0 +1,151 @@
+--- a/libmp3lame/lame.c
++++ b/libmp3lame/lame.c
+@@ -1140,3 +1140,3 @@
+     /* initialize internal adaptive ATH settings  -jd */
+-    gfc->ATH->aa_sensitivity_p = pow(10.0, gfp->athaa_sensitivity / -10.0);
++    gfc->ATH->aa_sensitivity_p = pn_codec_exp10(gfp->athaa_sensitivity / -10.0);
+ 
+@@ -1190,3 +1190,3 @@
+     cfg->ATH_offset_db = 0-gfp->ATH_lower_db;
+-    cfg->ATH_offset_factor = powf(10.f, cfg->ATH_offset_db * 0.1f);
++    cfg->ATH_offset_factor = pn_codec_exp10f(cfg->ATH_offset_db * 0.1f);
+     cfg->ATHcurve = gfp->ATHcurve;
+--- a/libmp3lame/psymodel.c
++++ b/libmp3lame/psymodel.c
+@@ -1707,3 +1707,3 @@
+ 
+-    return pow(10.0, 1.25 * (1 - cos(PI * arg)) - 2.5);
++    return pn_codec_exp10(1.25 * (1 - cos(PI * arg)) - 2.5);
+ }
+@@ -1950,3 +1950,3 @@
+         }
+-        norm[i] = pow(10.0, snr / 10.0);
++        norm[i] = pn_codec_exp10(snr / 10.0);
+     }
+@@ -1968,3 +1968,3 @@
+             level = ATHformula(cfg, freq * 1000) - 20; /* scale to FFT units; returned value is in dB */
+-            level = pow(10., 0.1 * level); /* convert from dB -> energy */
++            level = pn_codec_exp10(0.1 * level); /* convert from dB -> energy */
+             level *= gd->l.numlines[i];
+@@ -1993,3 +1993,3 @@
+         x -= 8.;
+-        gd->l.minval[i] = pow(10.0, x / 10.) * gd->l.numlines[i];
++        gd->l.minval[i] = pn_codec_exp10(x / 10.) * gd->l.numlines[i];
+     }
+@@ -2012,3 +2012,3 @@
+         }
+-        norm[i] = pow(10.0, snr / 10.0);
++        norm[i] = pn_codec_exp10(snr / 10.0);
+ 
+@@ -2021,3 +2021,3 @@
+             level = ATHformula(cfg, freq * 1000) - 20; /* scale to FFT units; returned value is in dB */
+-            level = pow(10., 0.1 * level); /* convert from dB -> energy */
++            level = pn_codec_exp10(0.1 * level); /* convert from dB -> energy */
+             level *= gd->s.numlines[i];
+@@ -2048,3 +2048,3 @@
+         x -= 8;
+-        gd->s.minval[i] = pow(10.0, x / 10) * gd->s.numlines[i];
++        gd->s.minval[i] = pn_codec_exp10(x / 10) * gd->s.numlines[i];
+     }
+@@ -2083,3 +2083,3 @@
+ #define  frame_duration (576. * cfg->mode_gr / sfreq)
+-    gfc->ATH->decay = pow(10., -12. / 10. * frame_duration);
++    gfc->ATH->decay = pn_codec_exp10(-12. / 10. * frame_duration);
+     gfc->ATH->adjust_factor = 0.01; /* minimum, for leading low loudness */
+@@ -2101,3 +2101,3 @@
+             freq += freq_inc;
+-            gfc->ATH->eql_w[i] = 1. / pow(10, ATHformula(cfg, freq) / 10);
++            gfc->ATH->eql_w[i] = 1. / pn_codec_exp10(ATHformula(cfg, freq) / 10);
+             eql_balance += gfc->ATH->eql_w[i];
+@@ -2149,3 +2149,3 @@
+             float   m = (float) (gd->s.npart - b) / gd->s.npart;
+-            gd->s.masking_lower[b] = powf(10.f, sk_s * m * 0.1f);
++            gd->s.masking_lower[b] = pn_codec_exp10f(sk_s * m * 0.1f);
+         }
+@@ -2157,3 +2157,3 @@
+             float   m = (float) (gd->l.npart - b) / gd->l.npart;
+-            gd->l.masking_lower[b] = powf(10.f, sk_l * m * 0.1f);
++            gd->l.masking_lower[b] = pn_codec_exp10f(sk_l * m * 0.1f);
+         }
+--- a/libmp3lame/quantize.c
++++ b/libmp3lame/quantize.c
+@@ -1425,3 +1425,3 @@
+             }
+-            gfc->sv_qnt.masking_lower = pow(10.0, masking_lower_db * 0.1);
++            gfc->sv_qnt.masking_lower = pn_codec_exp10(masking_lower_db * 0.1);
+ 
+@@ -1618,3 +1618,3 @@
+ 
+-            gfc->sv_qnt.masking_lower = pow(10.0, gfc->sv_qnt.mask_adjust * 0.1);
++            gfc->sv_qnt.masking_lower = pn_codec_exp10(gfc->sv_qnt.mask_adjust * 0.1);
+ 
+@@ -1939,3 +1939,3 @@
+             }
+-            gfc->sv_qnt.masking_lower = pow(10.0, masking_lower_db * 0.1);
++            gfc->sv_qnt.masking_lower = pn_codec_exp10(masking_lower_db * 0.1);
+ 
+@@ -2028,3 +2028,3 @@
+             }
+-            gfc->sv_qnt.masking_lower = pow(10.0, masking_lower_db * 0.1);
++            gfc->sv_qnt.masking_lower = pn_codec_exp10(masking_lower_db * 0.1);
+ 
+--- a/libmp3lame/quantize_pvt.c
++++ b/libmp3lame/quantize_pvt.c
+@@ -226,3 +226,3 @@
+     /* modify the MDCT scaling for the ATH and convert to energy */
+-    ath = powf(10.0f, ath * 0.1f);
++    ath = pn_codec_exp10f(ath * 0.1f);
+     return ath;
+@@ -364,5 +364,5 @@
+         for (i = 0; i < Q_MAX; i++)
+-            ipow20[i] = pow(2.0, (double) (i - 210) * -0.1875);
++            ipow20[i] = pn_codec_exp2((double) (i - 210) * -0.1875);
+         for (i = 0; i <= Q_MAX + Q_MAX2; i++)
+-            pow20[i] = pow(2.0, (double) (i - 210 - Q_MAX2) * 0.25);
++            pow20[i] = pn_codec_exp2((double) (i - 210 - Q_MAX2) * 0.25);
+ 
+@@ -375,3 +375,3 @@
+         db = cfg->adjust_bass_db + payload_long[sel][0];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (i = 0; i <= 6; ++i) {
+@@ -380,3 +380,3 @@
+         db = cfg->adjust_alto_db + payload_long[sel][1];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i <= 13; ++i) {
+@@ -385,3 +385,3 @@
+         db = cfg->adjust_treble_db + payload_long[sel][2];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i <= 20; ++i) {
+@@ -390,3 +390,3 @@
+         db = cfg->adjust_sfb21_db + payload_long[sel][3];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i < SBMAX_l; ++i) {
+@@ -397,3 +397,3 @@
+         db = cfg->adjust_bass_db + payload_short[sel][0];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (i = 0; i <= 2; ++i) {
+@@ -402,3 +402,3 @@
+         db = cfg->adjust_alto_db + payload_short[sel][1];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i <= 6; ++i) {
+@@ -407,3 +407,3 @@
+         db = cfg->adjust_treble_db + payload_short[sel][2];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i <= 11; ++i) {
+@@ -412,3 +412,3 @@
+         db = cfg->adjust_sfb21_db + payload_short[sel][3];
+-        adjust = powf(10.f, db * 0.1f);
++        adjust = pn_codec_exp10f(db * 0.1f);
+         for (; i < SBMAX_s; ++i) {
+@@ -572,3 +572,3 @@
+ 
+-    return powf(10.f, 0.1f * u);
++    return pn_codec_exp10f(0.1f * u);
+ }

@@ -7,16 +7,20 @@
 //! file, compare the original bytes, and atomically publish a new revision.
 
 use crate::file_workflow::{AudioFormat, OutputMode, OutputSettings};
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::foundation::uuid;
 use crate::templates::{self, Band, IgnoredAttribute, IgnoredElement, SerializationLoss, Template, TemplateCatalog, TemplateError};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::error::Error;
-use std::ffi::{c_int, c_void};
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+use std::ffi::c_void;
+use std::ffi::{CStr, CString, c_int};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const STATE_VERSION: u32 = 1;
@@ -411,17 +415,44 @@ impl Settings {
     }
     /// Atomically publish a new XML file without replacing an existing path.
     pub fn export_file(&self, reference: TemplateRef<'_>, path: &Path) -> Result<ExportReport, SettingsError> {
+        self.export_file_impl(reference, path, #[cfg(test)] None)
+    }
+    fn export_file_impl(&self, reference: TemplateRef<'_>, path: &Path,
+        #[cfg(test)] after_stage: Option<Box<dyn FnOnce(&Path)>>) -> Result<ExportReport, SettingsError> {
         let report = self.export_template(reference)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let stage = write_stage(parent, "template", report.xml.as_bytes())?;
-        if let Err(e) = fs::hard_link(&stage, path) {
-            let error = io_error("publish template without replacement", path, e);
-            return Err(cleanup_failed_stage(&stage, error));
+        let name = path.file_name().ok_or_else(|| io_error("publish template", path,
+            io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename")))?;
+        let destination = parent.join(name);
+        let work = crate::file_workflow::Workspace::create(parent, "template")
+            .map_err(|e| io_error("create private template workspace", path, io::Error::other(e)))?;
+        let publish = (|| {
+            let mut file = work.create_stage()
+                .map_err(|e| io_error("create private template stage", path, io::Error::other(e)))?;
+            file.write_all(report.xml.as_bytes()).and_then(|_| file.sync_all())
+                .map_err(|e| io_error("write private template stage", path, e))?;
+            #[cfg(test)] if let Some(hook) = after_stage { hook(work.directory_path()); }
+            work.link_stage(&destination)
+                .map_err(|e| io_error("publish template without replacement", path, io::Error::other(e)))
+        })();
+        if let Err(cause) = publish {
+            let cleanup = work.cleanup(false);
+            return if cleanup.is_empty() { Err(cause) } else {
+                Err(SettingsError::Cleanup { operation: "remove private template workspace",
+                    path: cleanup[0].path.clone(), cause: Box::new(cause), source: io::Error::other(format!("{cleanup:?}")) })
+            };
         }
-        if let Err(source) = fs::remove_file(&stage) {
-            return Err(SettingsError::PublishedCleanup { destination: path.to_owned(), temporary: stage, source });
+        let actual = work.actual_destination(&destination).unwrap_or_else(|| path.to_owned());
+        let post = work.validate_parent(&destination).map_err(io::Error::other).and_then(|_| work.sync_parent());
+        let cleanup = work.cleanup(false);
+        if let Err(source) = post {
+            let source = if cleanup.is_empty() { source } else { io::Error::other(format!("{source}; cleanup: {cleanup:?}")) };
+            return Err(SettingsError::AfterPublish { operation: "validate and sync export directory", path: actual, source });
         }
-        sync_directory(parent).map_err(|source| SettingsError::AfterPublish { operation: "sync export directory", path: path.to_owned(), source })?;
+        if !cleanup.is_empty() {
+            return Err(SettingsError::PublishedCleanup { destination: actual,
+                temporary: cleanup[0].path.clone(), source: io::Error::other(format!("{cleanup:?}")) });
+        }
         Ok(report)
     }
 }
@@ -572,17 +603,20 @@ fn edit_field(t: &mut Template, field: &str, value: &Value) -> Result<(), Settin
 
 // CFUUID is a public macOS primitive. Keep the returned aggregate layout equal
 // to the sixteen individual uint8_t members in CFUUIDBytes.
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct CFUUIDBytes {
     b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8,
     b8: u8, b9: u8, b10: u8, b11: u8, b12: u8, b13: u8, b14: u8, b15: u8,
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFUUIDCreate(allocator: *const c_void) -> *const c_void;
     fn CFUUIDGetUUIDBytes(uuid: *const c_void) -> CFUUIDBytes;
     fn CFRelease(value: *const c_void);
 }
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 fn uuid() -> Result<String, SettingsError> {
     // SAFETY: a null allocator requests the system default; a successful create
     // returns a live CFUUID. Its bytes are copied before the balanced release.
@@ -592,6 +626,12 @@ fn uuid() -> Result<String, SettingsError> {
     unsafe { CFRelease(object) };
     Ok(format!("{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         b.b0, b.b1, b.b2, b.b3, b.b4, b.b5, b.b6, b.b7, b.b8, b.b9, b.b10, b.b11, b.b12, b.b13, b.b14, b.b15))
+}
+
+
+#[cfg(target_os = "linux")]
+pub(crate) fn xdg_directory(variable: &str, fallback: PathBuf) -> PathBuf {
+    std::env::var_os(variable).map(PathBuf::from).filter(|path| path.is_absolute()).unwrap_or(fallback)
 }
 fn unique_template_uuid(catalog: &TemplateCatalog) -> Result<String, SettingsError> {
     for _ in 0..16 {
@@ -610,6 +650,12 @@ struct StateFile { version: u32, revision: u64, settings: Settings }
 pub struct LoadedSettings {
     pub settings: Settings,
     expected: Option<Vec<u8>>,
+    expected_stamp: Option<StateStamp>,
+    directory_identity: (u64, u64),
+    lock_identity: (u64, u64),
+    _directory_pin: File,
+    _lock_pin: File,
+    _state_pin: Option<File>,
     revision: u64,
     store_path: PathBuf,
 }
@@ -624,7 +670,11 @@ impl SettingsStore {
     }
     pub fn in_home(home: impl Into<PathBuf>, available_cores: usize) -> Self {
         let home = home.into();
-        Self::new(home.join("Library/Application Support/Platinum Engine"), home, available_cores)
+        #[cfg(target_os = "macos")]
+        let directory = home.join("Library/Application Support/Platinum Engine");
+        #[cfg(target_os = "linux")]
+        let directory = xdg_directory("XDG_CONFIG_HOME", home.join(".config")).join("platinum-engine");
+        Self::new(directory, home, available_cores)
     }
     pub fn directory(&self) -> &Path { &self.directory }
     pub fn settings_path(&self) -> PathBuf { self.directory.join(SETTINGS_FILE) }
@@ -632,10 +682,10 @@ impl SettingsStore {
     pub fn home(&self) -> &Path { &self.home }
 
     pub fn load(&self) -> Result<LoadedSettings, SettingsError> {
-        self.create_directory()?;
-        let _lock = StoreLock::acquire(&self.directory.join(LOCK_FILE))?;
+        let directory = SecureSettingsDirectory::open(&self.directory)?;
+        let lock = StoreLock::acquire(&directory)?;
         let path = self.settings_path();
-        let bytes = read_state(&path)?;
+        let (bytes, expected_stamp, state_pin) = read_state(&directory, &lock)?;
         let (mut settings, revision) = match &bytes {
             None => (Settings::defaults(&self.home, self.available_cores), 0),
             Some(bytes) => {
@@ -647,7 +697,14 @@ impl SettingsStore {
         };
         settings.processor_max = settings.processor_max.clamp(1, self.available_cores);
         settings.validate().map_err(|e| SettingsError::Corrupt(e.to_string()))?;
-        Ok(LoadedSettings { settings, expected: bytes, revision, store_path: path })
+        let directory_pin = directory.file.try_clone().map_err(|e| io_error("pin settings directory", &self.directory, e))?;
+        // A distinct open description pins the lock inode without retaining its flock.
+        let lock_pin = directory.open_entry(c"settings.lock", libc::O_RDONLY, 0)
+            .map_err(|e| io_error("pin settings lock", &self.directory.join(LOCK_FILE), e))?;
+        let lock_meta = secure_file_metadata(&lock_pin, &self.directory.join(LOCK_FILE), false)?;
+        if (lock_meta.dev(), lock_meta.ino()) != lock.identity { return Err(SettingsError::ConcurrentModification(self.directory.join(LOCK_FILE))); }
+        Ok(LoadedSettings { settings, expected: bytes, expected_stamp, directory_identity: directory.identity,
+            lock_identity: lock.identity, _directory_pin: directory_pin, _lock_pin: lock_pin, _state_pin: state_pin, revision, store_path: path })
     }
     pub fn save(&self, loaded: &mut LoadedSettings) -> Result<(), SettingsError> {
         let path = self.settings_path();
@@ -655,63 +712,294 @@ impl SettingsStore {
         let mut settings = loaded.settings.clone();
         settings.processor_max = settings.processor_max.clamp(1, self.available_cores);
         settings.validate()?;
-        self.create_directory()?;
-        let _lock = StoreLock::acquire(&self.directory.join(LOCK_FILE))?;
-        if read_state(&path)? != loaded.expected { return Err(SettingsError::ConcurrentModification(path)); }
+        let directory = SecureSettingsDirectory::open(&self.directory)?;
+        if directory.identity != loaded.directory_identity { return Err(SettingsError::ConcurrentModification(self.directory.clone())); }
+        let lock = StoreLock::acquire(&directory)?;
+        if lock.identity != loaded.lock_identity { return Err(SettingsError::ConcurrentModification(self.directory.join(LOCK_FILE))); }
+        let (current, current_stamp, _current_pin) = read_state(&directory, &lock)?;
+        if current != loaded.expected || current_stamp != loaded.expected_stamp { return Err(SettingsError::ConcurrentModification(path)); }
         let revision = loaded.revision.checked_add(1).ok_or_else(|| SettingsError::Corrupt("revision counter exhausted".into()))?;
         let mut bytes = serde_json::to_vec_pretty(&StateFile { version: STATE_VERSION, revision, settings: settings.clone() })?;
         bytes.push(b'\n');
-        let stage = write_stage(&self.directory, "settings", &bytes)?;
-        if let Err(e) = fs::rename(&stage, &path) {
-            return Err(cleanup_failed_stage(&stage, io_error("publish settings", &path, e)));
-        }
-        // The rename succeeded even if directory sync fails: keep the token in
-        // agreement and report the publication explicitly to the caller.
+        let stage = directory.write_stage(&bytes)?;
+        let new_pin = match stage.file.try_clone() {
+            Ok(file) => file,
+            Err(e) => return Err(directory.cleanup_stage(&stage, io_error("pin temporary settings", &path, e))),
+        };
+        let publish = (|| {
+            directory.validate()?;
+            lock.validate(&directory)?;
+            let (_, current_stamp, _current_pin) = read_state(&directory, &lock)?;
+            if current_stamp != loaded.expected_stamp { return Err(SettingsError::ConcurrentModification(path.clone())); }
+            directory.publish(&stage, current_stamp.is_some())
+        })();
+        if let Err(error) = publish { return Err(directory.cleanup_stage(&stage, error)); }
+        // Rename succeeded: retain the new comparison token even if sync fails.
         loaded.expected = Some(bytes);
         loaded.revision = revision;
         loaded.settings = settings;
-        sync_directory(&self.directory).map_err(|source| SettingsError::AfterPublish { operation: "sync settings directory", path, source })?;
+        let metadata = stage.file.metadata().map_err(|source| SettingsError::AfterPublish {
+            operation: "inspect published settings", path: path.clone(), source,
+        })?;
+        loaded.expected_stamp = Some(StateStamp::new(&metadata));
+        loaded._state_pin = Some(new_pin);
+        directory.file.sync_all().map_err(|source| SettingsError::AfterPublish { operation: "sync settings directory", path, source })?;
         Ok(())
     }
-    fn create_directory(&self) -> Result<(), SettingsError> {
-        if self.directory.as_os_str().is_empty() { return Err(invalid("state directory", "path cannot be empty")); }
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(&self.directory).map_err(|e| io_error("create settings directory", &self.directory, e))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateStamp { dev: u64, ino: u64, len: u64, mtime: i64, mtime_nsec: i64, ctime: i64, ctime_nsec: i64, mode: u32, uid: u32 }
+impl StateStamp {
+    fn new(meta: &fs::Metadata) -> Self {
+        Self { dev: meta.dev(), ino: meta.ino(), len: meta.len(), mtime: meta.mtime(), mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(), ctime_nsec: meta.ctime_nsec(), mode: meta.mode(), uid: meta.uid() }
     }
 }
 
-fn read_state(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => fs::read(path).map(Some).map_err(|e| io_error("read settings", path, e)),
-        Ok(_) => Err(SettingsError::Corrupt(format!("{} is not a regular file", path.display()))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error("inspect settings", path, e)),
+pub(crate) fn validate_owner_mode(path: &Path, meta: &fs::Metadata, uid: u32, directory: bool) -> Result<(), SettingsError> {
+    let kind_ok = if directory { meta.file_type().is_dir() } else { meta.file_type().is_file() && meta.nlink() == 1 };
+    if !kind_ok || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(SettingsError::Corrupt(format!("{} must be a non-symlink {} owned by the current user and not group/world writable",
+            path.display(), if directory { "directory" } else { "singly linked regular file" })));
     }
+    Ok(())
 }
-
-#[link(name = "System")]
-unsafe extern "C" { fn flock(fd: c_int, operation: c_int) -> c_int; }
-struct StoreLock { _file: File }
-impl StoreLock {
-    fn acquire(path: &Path) -> Result<Self, SettingsError> {
-        let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path)
-            .map_err(|e| io_error("open settings lock", path, e))?;
-        loop {
-            // SAFETY: fd remains owned by `file` for the whole locked scope;
-            // closing it releases the advisory lock, including on early return.
-            if unsafe { flock(file.as_raw_fd(), 2) } == 0 { return Ok(Self { _file: file }); }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted { return Err(io_error("lock settings", path, error)); }
+fn secure_metadata(path: &Path, directory: bool, mut read: impl FnMut() -> io::Result<fs::Metadata>) -> Result<fs::Metadata, SettingsError> {
+    let mut meta = read().map_err(|e| io_error("inspect secure file", path, e))?;
+    let first = (meta.dev(), meta.ino(), meta.mode(), meta.nlink(), meta.len(),
+        meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec());
+    for attempt in 0..3 {
+        match validate_owner_mode(path, &meta, unsafe { libc::geteuid() }, directory) {
+            Ok(()) => return Ok(meta),
+            // Never retry a bad kind, link count or writable permission.
+            Err(error) if attempt == 2 || meta.mode() & 0o022 != 0
+                || (directory && !meta.file_type().is_dir())
+                || (!directory && (!meta.file_type().is_file() || meta.nlink() != 1)) => return Err(error),
+            Err(_) => {
+                let next = read().map_err(|e| io_error("reinspect secure file", path, e))?;
+                let observed = (next.dev(), next.ino(), next.mode(), next.nlink(), next.len(),
+                    next.mtime(), next.mtime_nsec(), next.ctime(), next.ctime_nsec());
+                if observed != first { return Err(SettingsError::ConcurrentModification(path.to_owned())); }
+                meta = next;
+            }
         }
     }
+    unreachable!()
 }
-fn cleanup_failed_stage(path: &Path, cause: SettingsError) -> SettingsError {
-    match fs::remove_file(path) {
+/// Recheck a held descriptor when a filesystem transiently reports an
+/// unmapped owner; a persistently wrong owner is always refused.
+pub(crate) fn secure_file_metadata(file: &File, path: &Path, directory: bool) -> Result<fs::Metadata, SettingsError> {
+    secure_metadata(path, directory, || file.metadata())
+}
+pub(crate) fn secure_path_metadata(path: &Path, directory: bool) -> Result<fs::Metadata, SettingsError> {
+    secure_metadata(path, directory, || fs::symlink_metadata(path))
+}
+pub(crate) fn validate_private_acl(file: &File, path: &Path) -> Result<(), SettingsError> {
+    crate::file_workflow::require_no_extended_acl(file, path).map_err(|error| SettingsError::Corrupt(error.to_string()))
+}
+
+pub(crate) struct SecureSettingsDirectory { file: File, path: PathBuf, identity: (u64, u64) }
+struct SettingsStage { file: File, name: CString, identity: (u64, u64) }
+impl SecureSettingsDirectory {
+    pub(crate) fn open(path: &Path) -> Result<Self, SettingsError> {
+        if path.as_os_str().is_empty() { return Err(invalid("state directory", "path cannot be empty")); }
+        // A trailing slash or "/." otherwise makes O_NOFOLLOW apply to a
+        // synthetic final component and can dereference the directory symlink.
+        let normalized = path.components().collect::<PathBuf>();
+        let path = normalized.as_path();
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+            .map_err(|e| io_error("create settings directory", path, e))?;
+        let file = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path).map_err(|e| io_error("open non-symlink settings directory", path, e))?;
+        let meta = secure_file_metadata(&file, path, true)?;
+        let dir = Self { file, path: path.to_owned(), identity: (meta.dev(), meta.ino()) };
+        dir.validate()?;
+        Ok(dir)
+    }
+    pub(crate) fn validate(&self) -> Result<(), SettingsError> {
+        let opened = secure_file_metadata(&self.file, &self.path, true)?;
+        validate_private_acl(&self.file, &self.path)?;
+        let named = secure_path_metadata(&self.path, true)?;
+        if (opened.dev(), opened.ino()) != self.identity || (named.dev(), named.ino()) != self.identity {
+            return Err(SettingsError::ConcurrentModification(self.path.clone()));
+        }
+        Ok(())
+    }
+    pub(crate) fn alias(&self) -> Result<PathBuf, SettingsError> {
+        #[cfg(target_os = "macos")]
+        let alias = PathBuf::from(format!("/.vol/{}/{}", self.identity.0, self.identity.1));
+        #[cfg(target_os = "linux")]
+        let alias = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        let meta = fs::metadata(&alias).map_err(|e| io_error("resolve pinned state directory", &self.path, e))?;
+        if (meta.dev(), meta.ino()) != self.identity {
+            return Err(SettingsError::ConcurrentModification(self.path.clone()));
+        }
+        Ok(alias)
+    }
+    fn open_entry(&self, name: &CStr, flags: c_int, mode: libc::mode_t) -> Result<File, io::Error> {
+        let fd = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC, mode as libc::c_uint) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+    }
+    fn validate_entry(&self, name: &CStr, expected: (u64, u64), file: &File) -> Result<(), SettingsError> {
+        let path = self.path.join(name.to_string_lossy().as_ref());
+        let meta = secure_file_metadata(file, &path, false)?;
+        validate_private_acl(file, &path)?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(self.file.as_raw_fd(), name.as_ptr(), named.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io_error("inspect non-symlink settings entry", &path, io::Error::last_os_error()));
+        }
+        let named = unsafe { named.assume_init() };
+        if (meta.dev(), meta.ino()) != expected || named.st_mode & libc::S_IFMT != libc::S_IFREG
+            || (named.st_dev as u64, named.st_ino as u64) != expected {
+            return Err(SettingsError::ConcurrentModification(path));
+        }
+        Ok(())
+    }
+    fn write_stage(&self, bytes: &[u8]) -> Result<SettingsStage, SettingsError> {
+        for _ in 0..16 {
+            let name = CString::new(format!(".platinum-settings-{}.tmp", uuid()?)).unwrap();
+            let path = self.path.join(name.to_string_lossy().as_ref());
+            let file = match self.open_entry(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600) {
+                Ok(file) => file, Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(io_error("create temporary settings", &path, e)),
+            };
+            let meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(error) => return Err(SettingsError::Cleanup { operation: "remove unverified temporary settings",
+                    path: path.clone(), cause: Box::new(io_error("inspect temporary settings", &path, error)),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "stage identity unavailable; retained") }),
+            };
+            let stage = SettingsStage { file, name, identity: (meta.dev(), meta.ino()) };
+            if let Err(error) = ensure_stage_read_write(&stage.file, meta.mode()) {
+                return Err(self.cleanup_stage(&stage, io_error("set temporary settings permissions", &path, error)));
+            }
+            if let Err(e) = (&stage.file).write_all(bytes).and_then(|_| stage.file.sync_all()) {
+                return Err(self.cleanup_stage(&stage, io_error("write temporary settings", &path, e)));
+            }
+            return Ok(stage);
+        }
+        Err(SettingsError::UuidUnavailable)
+    }
+    fn cleanup_stage(&self, stage: &SettingsStage, cause: SettingsError) -> SettingsError {
+        let path = self.path.join(stage.name.to_string_lossy().as_ref());
+        let result = self.validate_entry(&stage.name, stage.identity, &stage.file).map_err(io::Error::other).and_then(|_| {
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), stage.name.as_ptr(), 0) } == 0 { Ok(()) }
+            else { Err(io::Error::last_os_error()) }
+        });
+        match result { Ok(()) => cause, Err(source) => SettingsError::Cleanup {
+            operation: "remove temporary settings", path, cause: Box::new(cause), source,
+        } }
+    }
+    fn publish(&self, stage: &SettingsStage, replacing: bool) -> Result<(), SettingsError> {
+        self.validate_entry(&stage.name, stage.identity, &stage.file)?;
+        let fd = self.file.as_raw_fd();
+        let status = if replacing {
+            unsafe { libc::renameat(fd, stage.name.as_ptr(), fd, c"settings.json".as_ptr()) }
+        } else {
+            #[cfg(target_os = "macos")]
+            { unsafe { libc::renameatx_np(fd, stage.name.as_ptr(), fd, c"settings.json".as_ptr(), libc::RENAME_EXCL) } }
+            #[cfg(target_os = "linux")]
+            { unsafe { libc::renameat2(fd, stage.name.as_ptr(), fd, c"settings.json".as_ptr(), libc::RENAME_NOREPLACE) } }
+        };
+        if status == 0 { return Ok(()); }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::AlreadyExists { Err(SettingsError::ConcurrentModification(self.path.join(SETTINGS_FILE))) }
+        else { Err(io_error("publish settings", &self.path.join(SETTINGS_FILE), error)) }
+    }
+}
+
+fn read_state(directory: &SecureSettingsDirectory, lock: &StoreLock) -> Result<(Option<Vec<u8>>, Option<StateStamp>, Option<File>), SettingsError> {
+    directory.validate()?;
+    lock.validate(directory)?;
+    let path = directory.path.join(SETTINGS_FILE);
+    let mut file = match directory.open_entry(c"settings.json", libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            directory.validate()?;
+            lock.validate(directory)?;
+            return Ok((None, None, None));
+        }
+        Err(e) => return Err(io_error("open non-symlink settings", &path, e)),
+    };
+    let before = secure_file_metadata(&file, &path, false)?;
+    validate_private_acl(&file, &path)?;
+    let stamp = StateStamp::new(&before);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| io_error("read settings", &path, e))?;
+    let after = secure_file_metadata(&file, &path, false)?;
+    validate_private_acl(&file, &path)?;
+    if StateStamp::new(&after) != stamp { return Err(SettingsError::ConcurrentModification(path)); }
+    directory.validate_entry(c"settings.json", (stamp.dev, stamp.ino), &file)?;
+    directory.validate()?;
+    lock.validate(directory)?;
+    Ok((Some(bytes), Some(stamp), Some(file)))
+}
+
+#[cfg_attr(target_os = "macos", link(name = "System"))]
+unsafe extern "C" { fn flock(fd: c_int, operation: c_int) -> c_int; }
+struct StoreLock { file: File, identity: (u64, u64) }
+impl StoreLock {
+    fn acquire(directory: &SecureSettingsDirectory) -> Result<Self, SettingsError> {
+        directory.validate()?;
+        let path = directory.path.join(LOCK_FILE);
+        let open_lock = || directory.open_entry(c"settings.lock", libc::O_RDWR | libc::O_CREAT, 0o600);
+        let file = match open_lock() {
+            Ok(file) => file,
+            // Darwin can return ENOENT while another writer creates this lock.
+            // Revalidate the pinned directory before one bounded retry.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                directory.validate()?;
+                open_lock().map_err(|e| io_error("open non-symlink settings lock", &path, e))?
+            }
+            Err(e) => return Err(io_error("open non-symlink settings lock", &path, e)),
+        };
+        let meta = secure_file_metadata(&file, &path, false)?;
+        validate_private_acl(&file, &path)?;
+        let lock = Self { file, identity: (meta.dev(), meta.ino()) };
+        loop {
+            lock.validate(directory)?;
+            if unsafe { flock(lock.file.as_raw_fd(), 2) } == 0 {
+                lock.validate(directory)?;
+                return Ok(lock);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted { return Err(io_error("lock settings", &path, error)); }
+        }
+    }
+    fn validate(&self, directory: &SecureSettingsDirectory) -> Result<(), SettingsError> {
+        directory.validate()?;
+        let path = directory.path.join(LOCK_FILE);
+        let meta = secure_file_metadata(&self.file, &path, false)?;
+        validate_private_acl(&self.file, &path)?;
+        if (meta.dev(), meta.ino()) != self.identity { return Err(SettingsError::ConcurrentModification(path)); }
+        directory.validate_entry(c"settings.lock", self.identity, &self.file)
+    }
+}
+fn ensure_stage_read_write(file: &File, mode: u32) -> io::Result<()> {
+    if mode & 0o777 == 0o600 { return Ok(()); }
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 { return Err(io::Error::last_os_error()); }
+    if file.metadata()?.mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "could not establish owner read/write permissions"));
+    }
+    Ok(())
+}
+
+fn cleanup_failed_stage(path: &Path, file: &File, cause: SettingsError) -> SettingsError {
+    let result = file.metadata().and_then(|held| {
+        let named = fs::symlink_metadata(path)?;
+        if !held.file_type().is_file() || !named.file_type().is_file()
+            || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "temporary file was replaced; retained"));
+        }
+        fs::remove_file(path)
+    });
+    match result {
         Ok(()) => cause,
         Err(source) => SettingsError::Cleanup { operation: "remove temporary file", path: path.to_owned(), cause: Box::new(cause), source },
     }
 }
-pub(crate) fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, SettingsError> {
+pub(crate) fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<(PathBuf, File), SettingsError> {
     for _ in 0..16 {
         let path = directory.join(format!(".platinum-{kind}-{}.tmp", uuid()?));
         let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path);
@@ -720,13 +1008,104 @@ pub(crate) fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(io_error("create temporary file", &path, e)),
         };
-        if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-            drop(file);
-            return Err(cleanup_failed_stage(&path, io_error("write temporary file", &path, e)));
+        let mode = match file.metadata() {
+            Ok(meta) => meta.mode(),
+            Err(error) => return Err(cleanup_failed_stage(&path, &file, io_error("inspect temporary file", &path, error))),
+        };
+        if let Err(error) = ensure_stage_read_write(&file, mode) {
+            return Err(cleanup_failed_stage(&path, &file, io_error("set temporary file permissions", &path, error)));
         }
-        drop(file);
-        return Ok(path);
+        if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            return Err(cleanup_failed_stage(&path, &file, io_error("write temporary file", &path, e)));
+        }
+        return Ok((path, file));
     }
     Err(SettingsError::UuidUnavailable)
 }
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> { File::open(path)?.sync_all() }
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("pn-settings-stage-{}-{}", std::process::id(), uuid().unwrap()));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
+
+    #[test]
+    fn template_export_does_not_follow_a_substituted_workspace() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let shared = fixture.0.join("shared"); let victim = fixture.0.join("victim");
+        fs::create_dir(&shared).unwrap(); fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::write(victim.join("output.template"), b"victim").unwrap();
+        let moved = shared.join("moved");
+        let moved_hook = moved.clone(); let victim_hook = victim.clone();
+        let settings = Settings::defaults(&fixture.0, 1);
+        let destination = shared.join("export.pntemplate");
+        let error = settings.export_file_impl(TemplateRef::Index(0), &destination, Some(Box::new(move |workspace| {
+            fs::rename(workspace, &moved_hook).unwrap();
+            symlink(&victim_hook, workspace).unwrap();
+        }))).unwrap_err();
+        assert!(matches!(error, SettingsError::PublishedCleanup { .. }));
+        assert_eq!(fs::read(victim.join("output.template")).unwrap(), b"victim");
+        assert!(fs::read_to_string(destination).unwrap().contains("<"));
+        assert!(!moved.join("output.template").exists());
+    }
+
+    #[test]
+    fn restrictive_umask_settings_and_statistics_stages_remain_readable() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "PN_TEST_SETTINGS_UMASK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let directory = SecureSettingsDirectory::open(&path).unwrap();
+            let stage = directory.write_stage(b"discard").unwrap();
+            assert_eq!(stage.file.metadata().unwrap().mode() & 0o777, 0o600);
+            let stage_name = path.join(stage.name.to_string_lossy().as_ref());
+            assert!(matches!(directory.cleanup_stage(&stage, SettingsError::Corrupt("injected".into())), SettingsError::Corrupt(_)));
+            assert!(!stage_name.exists());
+            let store = SettingsStore::new(&path, &path, 1);
+            let mut loaded = store.load().unwrap();
+            loaded.settings.mp3_mode = Mp3Mode::Vbr192;
+            store.save(&mut loaded).unwrap();
+            assert_eq!(fs::metadata(store.settings_path()).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(store.load().unwrap().settings.mp3_mode, Mp3Mode::Vbr192);
+            let statistics = crate::statistics::StatisticsStore::new(&path);
+            statistics.reset(&crate::file_workflow::Cancellation::new()).unwrap();
+            assert_eq!(fs::metadata(statistics.statistics_path()).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(statistics.show(&crate::file_workflow::Cancellation::new()).unwrap(), crate::statistics::Statistics::default());
+            return;
+        }
+        let fixture = Fixture::new();
+        for name in ["settings.lock", "statistics.lock"] {
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(fixture.0.join(name)).unwrap();
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg("--exact").arg("settings::security_tests::restrictive_umask_settings_and_statistics_stages_remain_readable")
+            .arg("--nocapture").env(CHILD, &fixture.0);
+        unsafe { child.pre_exec(|| { libc::umask(0o400); Ok(()) }); }
+        assert!(child.status().unwrap().success());
+    }
+
+    #[test]
+    fn owner_validation_rejects_a_different_effective_uid() {
+        let path = std::env::temp_dir().join(format!("pn-settings-owner-{}-{}", std::process::id(), uuid().unwrap()));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let file_path = path.join("state");
+        OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file_path).unwrap();
+        for (entry, is_directory) in [(&path, true), (&file_path, false)] {
+            let meta = fs::symlink_metadata(entry).unwrap();
+            assert!(validate_owner_mode(entry, &meta, meta.uid(), is_directory).is_ok());
+            assert!(validate_owner_mode(entry, &meta, meta.uid().wrapping_add(1), is_directory).is_err());
+        }
+        fs::remove_file(file_path).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
+}

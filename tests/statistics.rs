@@ -9,8 +9,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[link(name = "System")]
-unsafe extern "C" { fn mkfifo(path: *const std::ffi::c_char, mode: u16) -> i32; }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const CHILD_DIR: &str = "PLATINUM_STATISTICS_TEST_CHILD_DIR";
@@ -41,8 +39,34 @@ fn report(input_volume: f32, output_volume: f32, clip_count: u64) -> ProcessRepo
         encoded_length_frames: 1, input_frames: 1, healed_frames: 1, output_frames: 1,
         input_volume, healed_volume: input_volume, output_volume, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
         tempo_factor: 1.0, clip_count, applied_stages: Vec::new(),
-        processing_marker_status: "present", input_marker_override: None, controlled_mp4_time_1904: None,
+        processing_marker_status: "present", input_marker_override: None, source_tags_unavailable: None, controlled_mp4_time_1904: None,
     }
+}
+
+#[test]
+fn restrictive_umask_record_can_be_read_and_updated_again() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    const CHILD: &str = "PN_TEST_RECORD_UMASK_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let store = StatisticsStore::new(PathBuf::from(path));
+        store.record(&report(0.0, 0.6, 4), &Cancellation::new()).unwrap();
+        assert_eq!(fs::metadata(store.statistics_path()).unwrap().permissions().mode() & 0o777, 0o600);
+        let first = store.show(&Cancellation::new()).unwrap();
+        assert_eq!((first.processed_songs, first.clipped_peaks, first.decibel_adjustment), (1, 4, 1));
+        store.record(&report(0.0, 1.5, 3), &Cancellation::new()).unwrap();
+        let second = store.show(&Cancellation::new()).unwrap();
+        assert_eq!((second.processed_songs, second.clipped_peaks, second.decibel_adjustment), (2, 7, 3));
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(fixture.0.join("statistics.lock")).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child.arg("--exact").arg("restrictive_umask_record_can_be_read_and_updated_again")
+        .arg("--nocapture").env(CHILD, &fixture.0);
+    unsafe { child.pre_exec(|| { libc::umask(0o400); Ok(()) }); }
+    assert!(child.status().unwrap().success());
 }
 
 #[test]
@@ -173,6 +197,35 @@ fn state_and_lock_symlinks_and_hardlink_aliases_are_never_followed() {
 }
 
 #[test]
+fn unsafe_statistics_directory_state_and_lock_are_refused() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let cancel = Cancellation::new();
+    store.reset(&cancel).unwrap();
+    let state = store.statistics_path();
+    let lock = fixture.0.join("statistics.lock");
+    let before = fs::read(&state).unwrap();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(store.show(&cancel).is_err()); assert!(store.reset(&cancel).is_err());
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o620)).unwrap();
+    assert!(store.show(&cancel).is_err()); assert!(store.reset(&cancel).is_err());
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o602)).unwrap();
+    assert!(store.show(&cancel).is_err());
+    assert_eq!(fs::read(&state).unwrap(), before);
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let target = fixture.0.join("real"); fs::create_dir(&target).unwrap();
+    let alias = fixture.0.join("alias"); symlink(&target, &alias).unwrap();
+    for suffix in ["", "/", "/."] {
+        assert!(StatisticsStore::new(PathBuf::from(format!("{}{suffix}", alias.display()))).show(&cancel).is_err());
+    }
+    assert!(!target.join("statistics.lock").exists());
+}
+
+#[test]
 fn fifo_state_and_lock_are_rejected_without_blocking() {
     if let Some(directory) = std::env::var_os(CHILD_SPECIAL) {
         let store = StatisticsStore::new(PathBuf::from(directory));
@@ -185,7 +238,7 @@ fn fifo_state_and_lock_are_rejected_without_blocking() {
         let path = fixture.0.join(name);
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: c_path is a valid NUL-terminated path in an isolated fixture.
-        assert_eq!(unsafe { mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("fifo_state_and_lock_are_rejected_without_blocking")
             .env(CHILD_SPECIAL, &fixture.0).stdout(Stdio::null()).spawn().unwrap();

@@ -5,6 +5,7 @@
 //! as the other pitch leaves.  FPCR is owned by the enclosing host callback.
 
 use super::fft::{conjugate_in_place, multiply_spectra_in_place, scale_in_place, RealFft};
+use crate::portable::arm_scalar::ArmFloat;
 
 const PAD: usize = 8192;
 const COEFFICIENTS: usize = 768;
@@ -12,18 +13,25 @@ const FADE_SIZE: usize = 16384;
 const CUTOFF: f32 = f32::from_bits(0x3f67_0000);
 const BETA: f32 = 9.0;
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
     fn vvsincosf(sine: *mut f32, cosine: *mut f32, input: *const f32, count: *const i32);
     fn vDSP_vmul(a: *const f32, a_stride: isize, b: *const f32, b_stride: isize,
                  output: *mut f32, output_stride: isize, count: usize);
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::vdsp::vDSP_vmul;
 unsafe extern "C" {
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     #[link_name = "sinf"]
     fn native_sinf(value: f32) -> f32;
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     #[link_name = "tanh"]
     fn native_tanh(value: f64) -> f64;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{sinf as native_sinf, tanh as native_tanh};
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Marker {
@@ -90,9 +98,10 @@ impl Tables {
         let count = FADE_SIZE as i32;
         // 0x203ec writes both vectors; 0x3ac20 copies sine and multiplies it
         // by the same sine vector twice using the installed vDSP_vmul wrapper.
-        unsafe {
-            vvsincosf(sine.as_mut_ptr(), cosine.as_mut_ptr(), angles.as_ptr(), &count);
-        }
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
+        unsafe { vvsincosf(sine.as_mut_ptr(), cosine.as_mut_ptr(), angles.as_ptr(), &count); }
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        { let _ = count; crate::portable::vforce::vvsincosf(&mut sine, &mut cosine, &angles); }
         let mut fade = angles;
         fade.copy_from_slice(&sine);
         unsafe {
@@ -367,7 +376,7 @@ impl Synthesis {
         self.inverse_pitch = 1.0_f32 / pitch;
         // 0x3c89c..0x3c8bc caps the phase-table advance before widening
         // to binary64 for the +0.5 integer conversion.
-        let table_step = (self.inverse_pitch * 256.0_f32).min(256.0_f32) * 128.0_f32;
+        let table_step = (self.inverse_pitch * 256.0_f32).arm_min(256.0_f32) * 128.0_f32;
         self.coefficient_step = (f64::from(table_step) + 0.5_f64) as i32;
         self.pitch_bound = if self.inverse_pitch > 1.0 { self.inverse_pitch } else { 1.0 };
         self.interpolation_gain = if self.inverse_pitch > 1.0 { 0.99_f32 }
@@ -472,9 +481,9 @@ impl Synthesis {
     fn overlap_add(&mut self, mut overlap: i32, period: i32, marker: i32) {
         let overlap_as_f = overlap as f32;
         let scaled_overlap = (self.pitch * overlap_as_f + 0.5).floor();
-        if self.pitch < 1.0 { overlap = overlap_as_f.min(scaled_overlap) as i32; }
+        if self.pitch < 1.0 { overlap = overlap_as_f.arm_min(scaled_overlap) as i32; }
         let scaled_period = (self.inverse_pitch * period as f32 + 0.5).floor();
-        let fade_out_len = scaled_period.min(period as f32) as i32;
+        let fade_out_len = scaled_period.arm_min(period as f32) as i32;
         let start = self.input_len + marker - self.total_input;
         let end = self.output_end;
         self.ensure_input(start + fade_out_len + 1);
@@ -571,7 +580,7 @@ impl Synthesis {
         let dest = self.output_end - overlap;
         let source_len = length + overlap - crossfade;
         let generated = (self.inverse_pitch * source_len as f32) as i32;
-        let actual_generated = (self.inverse_pitch * source_len as f32).ceil().max(0.0) as i32;
+        let actual_generated = (self.inverse_pitch * source_len as f32).ceil().arm_max(0.0) as i32;
         let second_start = start + (self.pitch * crossfade as f32) as i32;
         self.ensure_input(second_start + (self.pitch * actual_generated as f32).ceil() as i32 + 16);
         self.ensure_output(dest + crossfade + actual_generated + 1);

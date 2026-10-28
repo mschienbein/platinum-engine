@@ -7,12 +7,16 @@
 //! This module does not host the proprietary processor.
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     // Mach-O imports ___exp10f and _log10f; C-level symbol names below.
     fn __exp10f(value: f32) -> f32;
     fn log10f(value: f32) -> f32;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{exp10f as __exp10f, log10f};
 
 #[inline]
 fn exp10f(value: f32) -> f32 {
@@ -72,7 +76,7 @@ struct Descriptor {
 impl Descriptor {
     #[inline]
     fn clamp_physical(self, value: f32) -> f32 {
-        value.max(self.first.min(self.last)).min(self.first.max(self.last))
+        value.arm_max(self.first.arm_min(self.last)).arm_min(self.first.arm_max(self.last))
     }
 
     // Model descriptor slots 0 and 12: clamp physical input first.
@@ -91,9 +95,9 @@ impl Descriptor {
     #[inline]
     fn physical(self, normalized: f32) -> f32 {
         let value = match self.mapping {
-            Mapping::Linear => (self.last - self.first).mul_add(normalized, self.first),
+            Mapping::Linear => (self.last - self.first).arm_mul_add(normalized, self.first),
             Mapping::Log { first_log, last_log } => {
-                let exponent = (last_log - first_log).mul_add(normalized, first_log);
+                let exponent = (last_log - first_log).arm_mul_add(normalized, first_log);
                 math::expf(exponent) - 0.0
             }
         };
@@ -151,7 +155,7 @@ impl DynamicsField {
     pub fn model_event_value(self, raw_physical: f32, normalized_modulation: f32) -> f32 {
         let descriptor = self.descriptor();
         let base = descriptor.normalize(raw_physical);
-        let normalized = (base + normalized_modulation).max(0.0).min(1.0);
+        let normalized = (base + normalized_modulation).arm_max(0.0).arm_min(1.0);
         descriptor.physical(normalized)
     }
 }
@@ -274,9 +278,9 @@ impl Ramp {
 
     #[inline]
     fn next(&mut self) -> f32 {
-        let phase = self.counter.mul_add(self.step, self.step);
+        let phase = self.counter.arm_mul_add(self.step, self.step);
         self.counter += 1.0;
-        self.current = phase.mul_add(self.target - self.start, self.start);
+        self.current = phase.arm_mul_add(self.target - self.start, self.start);
         self.current
     }
 }
@@ -374,7 +378,7 @@ impl Dynamics {
         self.detector_db = f32::from_bits(0xc288_5461);
         let low = soft_knee(self.low_threshold - self.detector_db, self.low_knee);
         let high = soft_knee(self.detector_db - self.high_threshold, self.high_knee);
-        self.gain_db = low.mul_add(self.low_slope, high * self.high_slope);
+        self.gain_db = low.arm_mul_add(self.low_slope, high * self.high_slope);
         self.input_gain.reset();
         self.output_gain.reset();
         self.mix.reset();
@@ -413,7 +417,7 @@ impl Dynamics {
 
         let inverse_frames = 1.0 / frames as f32;
         let low_sum = parameters.low_ratio + self.low_slope;
-        let low_step = (-low_sum).mul_add(inverse_frames, inverse_frames);
+        let low_step = (-low_sum).arm_mul_add(inverse_frames, inverse_frames);
         let high_step = ((parameters.high_ratio + -1.0) - self.high_slope) * inverse_frames;
         let low_knee_step = ((parameters.knee / (parameters.low_ratio + 1.0)) - self.low_knee) * inverse_frames;
         let high_knee_step = ((parameters.knee / (parameters.high_ratio + 1.0)) - self.high_knee) * inverse_frames;
@@ -442,21 +446,21 @@ impl Dynamics {
             let detect_left = *left * input_gain;
             let detect_right = *right * input_gain;
             let energy = ((detect_left * detect_left) + (detect_right * detect_right)) * 0.5;
-            self.energy = (energy - self.energy).mul_add(self.detector_coefficient, self.energy);
-            let level = log10(self.energy.max(f32::from_bits(0x3423_d70a))) * 10.0;
+            self.energy = (energy - self.energy).arm_mul_add(self.detector_coefficient, self.energy);
+            let level = log10(self.energy.arm_max(f32::from_bits(0x3423_d70a))) * 10.0;
             let attack = if self.detector_db < self.high_threshold { attack_below } else { attack_above };
             let coefficient = if self.detector_db < level { attack } else { release };
             let delta = level - self.detector_db;
-            self.detector_db += (-coefficient).mul_add(delta, delta);
+            self.detector_db += (-coefficient).arm_mul_add(delta, delta);
 
             let low = soft_knee(self.low_threshold - self.detector_db, self.low_knee);
             let high = soft_knee(self.detector_db - self.high_threshold, self.high_knee);
-            self.gain_db = high.mul_add(self.high_slope, low * self.low_slope);
+            self.gain_db = high.arm_mul_add(self.high_slope, low * self.low_slope);
             let gain = exp10f(self.gain_db * f32::from_bits(0x3d4c_cccd));
             let combined = gain * (input_gain * output_gain);
-            let difference = combined.mul_add(mix, -mix);
-            *left = difference.mul_add(dry_left, dry_left);
-            *right = difference.mul_add(dry_right, dry_right);
+            let difference = combined.arm_mul_add(mix, -mix);
+            *left = difference.arm_mul_add(dry_left, dry_left);
+            *right = difference.arm_mul_add(dry_right, dry_right);
         }
         Ok(())
     }

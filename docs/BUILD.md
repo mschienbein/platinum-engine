@@ -1,6 +1,6 @@
 # Build and run on macOS arm64
 
-The production CLI is independent of the Platinum Notes installation. It uses Rust DSP, macOS AudioToolbox and Accelerate, a separately built TagLib bridge, and, when needed, separately built FLAC and LAME libraries. Reference-only probes are optional and are not part of these instructions. This is a macOS arm64 setup; other operating systems and architectures are not established targets.
+The production CLI is independent of the Platinum Notes installation. On macOS arm64 it uses Rust DSP, AudioToolbox and Accelerate, a separately built TagLib bridge, and separately built FLAC and LAME libraries when needed. Reference-only probes are optional. Linux aarch64 and x86_64 builds use portable implementations and the pinned native-library builds described in [LINUX.md](LINUX.md).
 
 ## Prerequisites and recorded setup
 
@@ -11,11 +11,10 @@ The production CLI is independent of the Platinum Notes installation. It uses Ru
 
 The recorded TagLib build was Release, static and position-independent; the bridge used the system Apple frameworks and zlib. FLAC was a Release shared build with Ogg disabled. LAME used the flags and one export-list correction below. Other recorded host diagnostics report macOS 27.2 build 26B118 on arm64; the TagLib build cache reports the macOS 27.0 SDK. Compiler, SDK, OS, source, options and paths can affect outputs. Matching these directions does **not** by itself prove byte-identical libraries or output on another machine.
 
-Run the examples from the repository root in the same shell. They create a **new** ignored dependency directory; do not point them at an existing dependency tree. Stop if a download, digest check, build, or configuration command fails.
+Run the examples from the repository root in the same shell. They create a **new** temporary dependency directory; do not point them at an existing dependency tree. Stop if a download, digest check, build, or configuration command fails.
 
 ```sh
-mkdir -p local-artifacts
-DEPS="$(mktemp -d "$PWD/local-artifacts/deps.XXXXXX")"
+DEPS="$(mktemp -d "${TMPDIR:-/tmp}/platinum-deps.XXXXXX")"
 PN_STATE="$DEPS/state"
 PN="$PWD/target/debug/platinum"
 ```
@@ -29,9 +28,9 @@ cargo build --locked --bin platinum
 "$PN" --state-dir "$PN_STATE" --json config show
 ```
 
-Building the CLI does not itself build the native libraries. Configuration/template commands do not require them. `research/templates/builtins.json` is a compile-time resource, not an optional research report; it must be present with the source tree.
+Building the CLI does not itself build the native libraries. Configuration/template commands do not require them. `research/templates/builtins.json` and `src/portable/fft_sme_coefficients.bin` are compile-time resources, not optional research reports; both must be present with the source tree.
 
-## Required: TagLib 1.11.1 and ABI-5 bridge
+## Required: TagLib 1.11.1 and ABI-5 bridge v07
 
 The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073b7`. This uses a public TagLib build, never the framework supplied with the reference application. The checksum is for that exact archive, not for an arbitrary 1.11.1 archive.
 
@@ -64,7 +63,7 @@ The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073
 )
 ```
 
-The bridge ABI must be 5. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge; the loader checks its ABI, not its source provenance. A dynamic library is executable code, so configure only a library you trust. The recorded bridge SHA-256 was `ab36bcd51a901ccb5d95e73b960596033c0387ec450215d66bf7bc8d18fc57aa`; a locally rebuilt file can differ.
+The bridge ABI must be 5; the v07 source adds source-container status and read-failure handling. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge. The recorded v07 macOS bridge SHA-256 was `7e2f65614f2ad87322e030213b3b2fb2914a3e69635b434fd96cf6b1da38d585`; a locally rebuilt file can differ. The older `ab36bcd5…` bridge was an earlier build. The loader checks the ABI and pins the opened file, not its provenance. A dynamic library is executable code, so configure only a library you trust. A writer able to modify that same file's inode during loading can defeat the integrity check before its post-load verification; prevent concurrent modification.
 
 Configure its path as a JSON string. The helper handles spaces and other characters that need JSON escaping:
 
@@ -169,17 +168,70 @@ Proceed only if the input checksum matches: floating-point math runtimes can aff
 
 For real files, use a separate output folder first and retain an independent backup. See [the CLI contract](../research/CLI_CONTRACT.md) for explicit replacement, restore, nil markers, and failure reporting.
 
+## Rebuilding the recorded release CLI
+
+The following is the recorded macOS arm64 release-build environment, from the
+root of the reviewed public source export. It uses cached locked dependencies,
+a fresh target directory and a fixed source-path remap. It does not install or
+publish anything. Compiler, OS, SDK and dependency changes can change the
+binary; compare the result rather than assuming identity.
+
+```sh
+EXPORT="$(pwd -P)"
+RUN="$(mktemp -d "${TMPDIR:-/tmp}/platinum-release.XXXXXX")"
+mkdir "$RUN/home" "$RUN/tmp"
+env PATH=/opt/homebrew/opt/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin \
+  RUSTUP_TOOLCHAIN=1.99.1 RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" \
+  CARGO_TARGET_DIR="$RUN/target" HOME="$RUN/home" CFFIXED_USER_HOME="$RUN/home" \
+  TMPDIR="$RUN/tmp/" LANG=C LC_ALL=C TZ=UTC \
+  RUSTFLAGS="--remap-path-prefix=$EXPORT=/platinum-source" \
+  cargo build --offline --locked --release --bin platinum
+shasum -a 256 "$RUN/target/release/platinum"
+```
+
+The frozen macOS battery executable SHA-256 was
+`82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`.
+For Linux, run on the target's native Docker host with a prepared offline
+registry cache (`index/` and `cache/`), a new output directory and the
+appropriate v07 image identity:
+
+```sh
+PN_LINUX_REGISTRY_DIR="$REGISTRY" PN_LINUX_RUN_TESTS=1 PN_LINUX_TMP_TARGET=1 \
+  sh tools/linux/build-cli.sh "$IMAGE" "$NEW_OUTPUT"
+# Compare NEW_OUTPUT/target/release/platinum with the target's digest below.
+```
+
+The recorded image IDs were arm64
+`sha256:3ecf1b2c409ce190661f3bc31dd349a6fc2b2c1560c890048bfabb43160cde0c`
+and amd64
+`sha256:e3dfe3526511ab1b640178a65a1fe6a0f11dde0bb4f41c8fabd0585bed9cf8d3`.
+The frozen Linux binary hashes were arm64
+`6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
+and amd64
+`1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`.
+The helper runs the regular all-target tests, too. Its output hashes and logs
+are evidence for that build, not proof of universal audio-file parity.
+
+## Linux and release packages
+
+See [LINUX.md](LINUX.md) for the pinned multi-architecture native image,
+architecture-specific library allowlist, source builds and runtime image. From
+an appropriate native host, `sh tools/linux/package-release.sh PLATFORM
+v0.1.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
+without publishing. The available platform values are `macos-arm64`,
+`linux-arm64` and `linux-amd64`. The Linux allowlist means a locally rebuilt
+library is refused unless its digest matches an approved entry; matching a
+user-configured codec hash alone is insufficient.
+
 ## Licenses and distribution
 
-Project-owned contributions are licensed under the [MIT license](../LICENSE) to the extent their contributors can grant those rights. This does not change third-party terms or grant rights to the reference application. Review the upstream source packages and their license files before distribution: TagLib includes `COPYING.LGPL` and `COPYING.MPL`, FLAC includes `COPYING.Xiph`, and LAME includes `COPYING`; Rust dependencies have their own terms. In particular, the static TagLib linkage and the LAME export-list modification are facts to account for when evaluating distribution obligations. No reference-app binaries or audio are needed for this build.
-
-The pinned upstream license files identify TagLib's LGPL 2.1 and MPL alternatives,
-the Xiph/BSD-style libFLAC grant, and LAME's Library GPL version 2 text. The
-macOS-arm64 Cargo metadata inventory has 37 packages with declared license
-expressions, including MIT/Apache alternatives, ISC, Zlib and Unicode terms.
-An unfiltered offline inventory could not inspect an uncached Windows-only
-dependency; this is a host-target audit, not a cross-platform license clearance.
-The curated source snapshot does not bundle those native libraries or a compiled
-release executable. Anyone distributing a compiled bridge, codec or CLI must
-also meet the applicable dependency notices and other terms; the project MIT
-file does not replace them.
+Project-owned contributions are licensed under [LICENSE](../LICENSE), subject
+to third-party terms. The separate bridge statically links TagLib (LGPL-2.1);
+FLAC uses BSD-3-Clause terms and LAME LGPL-2.0-or-later. Linux codec patches
+and source/relink materials are supplied in release packages; the independently
+written portable ALAC implementation was informed by Apple's Apache-2.0
+reference. See [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) and
+[NOTICE](../NOTICE), plus the package's `licenses/` and
+`corresponding-source/RELINK.txt`. Review the actual distribution and its
+dependencies; these notices do not constitute legal clearance or grant rights
+to the reference application.

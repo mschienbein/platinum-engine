@@ -1,0 +1,136 @@
+{
+  "schema": "platinum-release-acceptance-v2",
+  "title": "Platinum Engine v0.1.0 bounded release evidence",
+  "supersedes": "The 2026-10-27 release-acceptance-v1 proposal, retained literally in the private research tree; this document does not rewrite its historical observations.",
+  "status": "bounded-evidence-index",
+  "author": {"family": "Anthropic", "model": "claude-opus-5-5", "reasoning": "xhigh", "identity_note": "Assigned role; workstation metadata separately reports openai-codex/gpt-6.1-terra; runtime model identity not independently verified."},
+  "contract": {
+    "target": "For identical source bytes and independently established effective settings, compare complete unmodified output files including encoded audio, headers, tags, padding, markers and relevant timestamps; do not normalize to manufacture a match.",
+    "reference": "Platinum Notes 10.5.0.1256, macOS arm64; portable component reference Apple M4 with SME, macOS 27.2 build 26B123 where the component receipt says so.",
+    "linux": "Linux aarch64 and x86_64 target macOS byte identity on admitted paths; named unsupported operations are refused or reported unavailable. Finite evidence does not prove every input, and known x86 floating-point residuals are not all guarded at runtime.",
+    "interpretation": "This is a finite evidence index and does not establish universal equivalence, legal clearance, an independent acceptance sign-off, or permission to publish. Historical nondeterminism and user-selected safety divergences are not counted as parity passes.",
+    "overlap": "Component, native replay, workflow and test sets overlap; do not sum them as unique cases.",
+    "full_parity_established": false
+  },
+  "private_receipt_note": "Private receipt paths below are relative to the private evidence root, which is not distributed in the public snapshot.",
+  "review_rounds": {
+    "sequence": ["ReviewMacDefault", "ReviewPortable", "ReviewSecurity", "fixes", "ReReview", "FinalReview", "LastRegressionReview", "FixWorkflow-regression-04"],
+    "engine_verdict": "PASS_WITH_QUALIFICATIONS for its reviewed snapshot, not an overall security or release sign-off",
+    "engine_review": "review-fixes-01/FinalReviewEngine/review.json",
+    "conditional_mpeg_mp4_collision": "Addressed by bounded atom validation; six decoder-admitted synthetic collision cases matched the review baseline.",
+    "regression_fixes": "review-fixes-01/FixWorkflow-regression-04/final-receipt.json"
+  },
+  "final_source_freeze": {
+    "source_manifest_sha256": "5b05c38952406b2e21e6c5e7397e29d3d9140d3d0963ad675569c5e7548f72d5",
+    "receipt": "portable-parity/full-build-v07-regression-fix-01/receipt.json",
+    "receipt_sha256": "305b875b20f13329de87a5d6c1ad1cc02a9cdfe62901e68cc54c15120719f280",
+    "linux_aarch64": {"binary_sha256": "6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e", "passed": 400, "failed": 0, "ignored": 97, "suites": 44},
+    "linux_x86_64": {"binary_sha256": "1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff", "passed": 398, "failed": 0, "ignored": 95, "suites": 44},
+    "macos_remapped_binary_sha256": "82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d",
+    "scope": "The freeze records the complete tree at that point. Later documentation and export-related edits are not represented by its full-tree manifest."
+  },
+  "macos_battery": {
+    "binary_sha256": "82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d",
+    "primary_receipt": "hash-parity/release-final-82d8b489.json",
+    "primary_receipt_sha256": "d3ea14d5064b02f9b390755f634f1dd0716706d9741ef2ff2938702939b93b1a",
+    "supplement_receipt": "hash-parity/release-final-82d8b489-supplement.json",
+    "supplement_receipt_sha256": "33add854616ac356fc33759ce04fcc308540c92a83b4db3b8dde2eba22381588",
+    "counts_addendum": "hash-parity/release-final-82d8b489-counts-addendum.json",
+    "counts_addendum_sha256": "7cb2eca91c0ffcdaacc58c7336d808c5d8f9619356429335180823641ab5a434",
+    "regular_tests": {"passed": 440, "failed": 0, "ignored": 181, "suites": 44},
+    "count_correction": "The original 444/48 aggregate included four filtered nested subprocess summaries; the additive counts addendum corrects the unfiltered top-level command to 440/44. Original receipts are unchanged.",
+    "public_dependency_tests": {"passed": 38, "failed": 0},
+    "full_file_sets": {"stable_cases": 71, "dynamics_pitch_cases": 8, "mp4_recorded_seconds": 10, "boundary_files": 15, "extended_cases": 6, "relocated_family_cases": 9, "c04_controlled_exports": 2},
+    "w04_exact_path": "bounded-complete-file-match",
+    "family_context": "The unmodified strict toolkit rejected relocated output folders. A separate relocated review validated both paths and substituted only that setting; it did not normalize file bytes or alter native observations. This is not the earlier identical-path strict context."
+  },
+  "linux_battery": {
+    "receipt": "portable-parity/linux-battery-01/receipt-final-regression-01.json",
+    "receipt_sha256": "c0d49ffb934e13074fc61c0d2eb0ad700973cb8821016a93ab7c4dd234dc498b",
+    "status": "pass",
+    "per_arch_native": {"cases": 132, "exact_matches": 104, "documented_typed_refusals": 25, "native_error_no_output": 3, "workflow_matches": 16},
+    "stress_per_portable_or_linux_platform": {"cases": 575, "exact_matches": 535, "documented_refusals": 40},
+    "supplemental_pitch_cases_equal_all_four_platforms": 30,
+    "docker_desktop_bind_subset": {"exact_byte_matches": 44, "exact_native_matches": 1, "documented_refusals": 2, "workflow_matches": 16},
+    "limitations": "Finite synthetic comparisons overlap. Low-level and nonfinite inputs were uninstrumented; matching files do not establish that the x86 FTZ or NaN-sign boundary was exercised or repaired."
+  },
+  "historical_v07_fixes_source_freeze": {
+    "source_manifest_sha256": "dc82b4a030c620c1d3b80a495078613c2736690dfbea251fbd8c5ca26fcceb55",
+    "receipt": "portable-parity/full-build-v07-final-fixes-01/receipt.json",
+    "receipt_sha256": "f69c62815f184851ba9a245156e758e75b3049bdef47ccbbf012d4965125b3aa",
+    "top_level_test_counts": "portable-parity/full-build-v07-final-fixes-01/top-level-test-counts.json",
+    "top_level_test_counts_sha256": "69bae49ffef8b8bbf75edb3135d827b4e26bbeb04435a50b7716c51f5a30d110",
+    "count_correction": "The original receipt counted three nested filtered subprocess summaries in the x86 total, reporting 399 passes and 47 suites; the authoritative top-level counts below are 396 passes and 44 suites. Exit codes and binary hashes are unaffected; the original receipt is preserved.",
+    "linux_aarch64": {"binary_sha256": "8954dd025e34395ceda24cabcfbbd3687677ab236199d6b96d097821e6775bf7", "passed": 398, "failed": 0, "ignored": 97, "suites": 44},
+    "linux_x86_64": {"binary_sha256": "e7b837ecb4ed4873ba23791a24d7786b3b45a09abeec75527bca2b364972a8dc", "passed": 396, "failed": 0, "ignored": 95, "suites": 44},
+    "macos_remapped_binary_sha256": "3f2c19c4705ad892e6c03f202416ab25b714b4aaa1b0d6ae8765ed559431f8b6",
+    "scope": "This freeze predates subsequent regression fixes and does not identify the final source or public export."
+  },
+  "historical_v07_build": {
+    "source_manifest_sha256": "855445719d235d4ca14cda8294bd1c8aef2283679e5ea0d967adbd70c8c9d186",
+    "receipt": "portable-parity/full-build-v07-registry-stage-01/receipt.json",
+    "scope": "This historical candidate predates subsequent code fixes and documentation, notice, export and package-notice wording changes; do not claim the later public tree has this full-tree manifest.",
+    "linux_aarch64": {"binary_sha256": "6826ecbed9c463550c65d95c6179c397f7355e40fc3e7daa9487828be7c76005", "passed": 386, "failed": 0, "ignored": 96},
+    "linux_x86_64": {"binary_sha256": "6ecd7c4e57b9acb1f8cda80da4d1c74447cd501e88c616574a1b6ef42c4094b4", "passed": 384, "failed": 0, "ignored": 94}
+  },
+  "historical_v07_macos_battery": {
+    "binary_sha256": "c9f19077c91fb975f9d375f4aae3c7024becce2416d3211e9ed971e7ad1830a7",
+    "primary_receipt": "hash-parity/release-final-c9f19077.json",
+    "primary_receipt_sha256": "c98e64e8be4faeb9b954a198ce2e696506b59526e64f4085395daace21a8c3b4",
+    "supplement_receipt": "hash-parity/release-final-c9f19077-supplement.json",
+    "supplement_receipt_sha256": "a175a21d0aaf6e9f96a94a579d7793c275e6b2b39c38bb9d082b3ab853609729",
+    "regular_tests": {"passed": 426, "failed": 0, "ignored": 179, "suites": 44},
+    "public_dependency_tests": {"passed": 37, "failed": 0},
+    "full_file_sets": {"stable_cases": 71, "dynamics_pitch_cases": 8, "mp4_recorded_seconds": 10, "extended_cases": 6, "relocated_family_cases": 9, "c04_controlled_exports": 2},
+    "w04_exact_path": "bounded-complete-file-match",
+    "family_context": "The unmodified strict toolkit rejected relocated output folders. A separate relocated review validated both paths and substituted only that setting; it did not normalize file bytes or alter native observations. This is not the earlier identical-path strict context."
+  },
+  "reviewed_binary_dependencies": {
+    "src/portable/fft_sme_coefficients.bin": "56f3f44c5abdc53055c34af8f643486a0595aac842081843d2d42880da3449cd",
+    "tools/portable/fft_sme/smoke.bin": "3df2e3b7de54d3315dec1094eacfb228d080060c79941520c9ba2b557db46d7d",
+    "tools/portable/fft_sme/structured.bin": "d80df7c4d533f4a2e0bfb73326889265dfcdb6b1f68b58e81f4deb415c6458e1"
+  },
+  "component_evidence": [
+    {"area": "portable math", "scope": "46 components; 131072 inputs per component per FZ mode on three hosts", "mismatches": 0, "private_receipt": "portable-parity/math-01/final-receipt.json"},
+    {"area": "ARM scalar helpers", "scope": "100000000 random and 32768 special triples per precision/FZ per host matched the scalar oracle; x86 vectorized FMA shapes retained 210 NaN payload mismatches", "private_receipt": "portable-parity/arm-scalar-01/REPORT.md"},
+    {"area": "vDSP", "scope": "11 routines and 686 lengths in element grid; 54342720 non-FFT words per FZ mode on three hosts", "mismatches": 0, "private_receipt": "portable-parity/vdsp-01/acceptance-frozen-01.txt"},
+    {"area": "vForce", "scope": "Mac exhaustive binary32 sweeps for specified body and tail classes; Linux finite general and boundary replay", "mismatches": 0, "private_receipt": "portable-parity/vforce-01/REPORT.md"},
+    {"area": "FFT", "scope": "per Linux architecture 3052 vectors and 28350464 words; aligned-0 M4 profile", "mismatches": 0, "private_receipt": "portable-parity/fft-01/final-v3-summary.json"},
+    {"area": "SME FFT", "scope": "100000 random and 12 structured vectors per size/direction/FZ", "mismatches": 0, "private_receipt": "portable-parity/fft-sme-01/verification.json"},
+    {"area": "audio", "scope": "per Linux architecture 9540 PCM-reader and 2424 PCM-writer cases, plus ALAC, CAF, channel and FLAC subsets", "mismatches": 0, "private_receipt": "portable-parity/audio-01/inventory-update-05.json"},
+    {"area": "ALAC", "scope": "73951 integer rates at one sample; 2240 fractional-rate cases with 2095 complete matches and 145 native-loss refusals", "private_receipt": "portable-parity/alac-01/REPORT-04.md and REPORT-05.md"},
+    {"area": "GSM", "scope": "117 packet cases/13522560 samples and a 12288-mask corpus per optimized-snapshot host; 179 reserved-mask refusals", "mismatches": 0, "private_receipt": "portable-parity/gsm-01/optimized-final.json"},
+    {"area": "FLAC and MP3 codecs", "scope": "per Linux architecture: 540 FLAC and 320 MP3 retained, 7488 FLAC and 2880 MP3 expanded; 2988408 one-frame FLAC rate grid records; 5244 additional FLAC stress/recovered-PCM cases", "mismatches": 0, "private_receipt": "portable-parity/codec-03/report.json and codec-04/report.json"},
+    {"area": "bridge v07", "scope": "per Linux architecture: 604 transfers, 86 inspections, 232 status cases, 37 fault runs and 9 permission cases; macOS 690 native/portable matrix cases including 112 artwork refusals", "unexpected_failures": 0, "private_receipt": "review-fixes-01/FixBridge/report.json"},
+    {"area": "MP3 postflight", "scope": "17120 unique files and ten stream-description and length fields, including final-battery outputs", "mismatches": 0, "private_receipt": "portable-parity/mp3-postflight-overwritestore-01/regression-gate-index.json", "private_receipt_sha256": "6ac31d918859901457ce3617a57344e8b8f63e761bf2b14ed026b8b87b3c09d8"}
+  ],
+  "historical_correction": {
+    "scope": "f01, f02 and f03 native observations for PID 99320",
+    "incorrect_parenthetical_utc": "2026-10-27T21:36:13Z",
+    "correct_launch_utc": "2026-10-28T12:27:07Z",
+    "lstart": "Wed Oct 28 07:27:07 2026 CDT",
+    "policy": "Correction note only; original observation files remain untouched."
+  },
+  "v1_blocker_updates": [
+    {"v1_ids": ["B01"], "update": "MP4 originals still differ by header seconds; the selected diagnostic contract compares each export at its recorded second. The historical dd4b5fd0 binary matched ten such exports. No clock-phase or general repeatability claim follows."},
+    {"v1_ids": ["B02"], "update": "The nonzero Xing caller-byte branch is supported by static in-process handle analysis and matched the retained E05 exports; the actual running native caller byte was not observed."},
+    {"v1_ids": ["B03"], "update": "An unsynchronized native dispatch-table reset can explain the documented batch pitch-marker outliers; the selected target is the race-free native value. Historical outliers remain nondeterministic observations, not matches."},
+    {"v1_ids": ["B04"], "update": "All captured alignment-sensitive native exports match the aligned-0 FFT profile, now explicitly used by the engine; literal GUI scratch addresses and every future allocation profile remain unobserved."},
+    {"v1_ids": ["B05"], "update": "Nine representative families had no-flag strict reviews for the historical dd4b5fd0 binary. Later replays with relocated output directories have their own context limitations and are not identical-path strict reviews."},
+    {"v1_ids": ["B07"], "update": "Historical Ogg/OGA picker, folder, bounded drag and explicit-open observations do not establish general drag admission or decoder invocation. Collision refusal without explicit overwrite is an Engine safety policy."},
+    {"v1_ids": ["B08"], "update": "The historical dd4b5fd0 release matched six nonzero-width dynamics-gate cases and nine pitch-threshold counterparts; these finite cases do not cover all controls."},
+    {"v1_ids": ["B09"], "update": "The historical dd4b5fd0 replay did not use the exact native backup path; replacement markers include that path. The later c9f19077 candidate matched the bounded W04 exact-path replacement/restore comparison."},
+    {"v1_ids": ["B10", "B11"], "update": "Waveform and workflow evidence remains bounded; independently signed acceptance, exhaustive parity and legal clearance are not inferred."}
+  ],
+  "known_limits": [
+    "x86_64 ordinary FTZ tininess-after-rounding versus ARM tininess-before-rounding; default-NaN sign; NaN payload selection including vectorized FMA operand order; sampled min/max signed-zero and NaN behavior. Not every affected runtime input is detected; Linux aarch64 is stricter.",
+    "Accelerate FFT/vDSP dispatch varies by Apple hardware and alignment; other Apple Silicon or macOS versions and AudioToolbox AAC stack context may produce different reference bits.",
+    "Linux refuses MP3/AAC decoding, AAC encoding, unmodeled sample-rate conversion, required artwork transcoding, unverified codec variants/GSM masks, ALAC native-loss cases, unapproved libraries and ambiguous marker/container cases. Non-44.1 kHz waveforms are reported unavailable.",
+    "Conservative source-status-3, unknown-container, malformed candidate-marker and duplicate AIFF ID3 handling are safety policies, not claims of native admission parity.",
+    "Deliberately conflicting GEOBs within one ID3 tag, duplicate MP4 freeform items or FLAC Xiph-versus-ID3 markers may hide a later processed marker; sync-like junk or separated ID3 tags may also evade prefix discovery. These are accepted source-review scenarios; exact decoder admission was not established.",
+    "A library identity check cannot prevent a concurrently writable library inode from changing before native initialization; use trusted, immutable-to-other-writers storage. Docker Desktop bind-mount identity mismatches were reported; use in-image libraries and volume/tmpfs state.",
+    "No new native GUI drag-and-drop admission test was performed in this release cycle without desktop-control approval; picker/open routes were observed. Historical bounded Ogg/OGA drags are separate.",
+    "MP4 reference exports contain wall-clock seconds; controlled-clock comparisons use each reference's recorded second. Batch pitch-marker outliers, native process variability, and user-selected refusal of invalid 32 kHz AAC remain explicit limits.",
+    "Distribution packages and source/relink materials require maintainer license and derivative-status review; nothing here is a legal clearance or publication authorization."
+  ]
+}

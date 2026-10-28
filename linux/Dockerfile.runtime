@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# Build context: linux-amd64/ and linux-arm64/ are extracted, verified release
+# payloads with the same layout as the corresponding tarballs. This image does
+# not build code, auto-configure libraries, or imply codec parity acceptance.
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/mschienbein/platinum-engine"
+COPY linux-${TARGETARCH}/ /opt/platinum-engine/
+RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; esac \
+ && test -x /opt/platinum-engine/bin/platinum \
+ && test -f /opt/platinum-engine/lib/libpn-tag-bridge.so \
+ && test -e /opt/platinum-engine/lib/libFLAC.so.12 \
+ && test -e /opt/platinum-engine/lib/libmp3lame.so.0 \
+ && cd /opt/platinum-engine && sha256sum -c SHA256SUMS \
+ && mkdir -p /state /music /output && chown 65532:65532 /state /music /output
+ENV HOME=/state \
+    LD_LIBRARY_PATH=/opt/platinum-engine/lib
+USER 65532:65532
+WORKDIR /music
+ENTRYPOINT ["/opt/platinum-engine/bin/platinum"]

@@ -1,0 +1,33 @@
+--- a/libmp3lame/util.c
++++ b/libmp3lame/util.c
+@@ -238,8 +238,8 @@
+     f = Min(f_max, f);
+ 
+     ath = 3.640 * pow(f, -0.8)
+-        - 6.800 * exp(-0.6 * pow(f - 3.4, 2.0))
+-        + 6.000 * exp(-0.15 * pow(f - 8.7, 2.0))
++        - 6.800 * exp(-0.6 * ((f - 3.4) * (f - 3.4)))
++        + 6.000 * exp(-0.15 * ((f - 8.7) * (f - 8.7)))
+         + (0.6 + 0.04 * value) * 0.001 * pow(f, 4.0);
+     return ath;
+ }
+--- a/libmp3lame/quantize.c
++++ b/libmp3lame/quantize.c
+@@ -755,7 +755,7 @@
+     case 1:
+         /* amplify bands within 50% of max (on db scale) */
+         if (trigger > 1.0)
+-            trigger = pow(trigger, .5);
++            trigger = sqrtf(trigger);
+         else
+             trigger *= .95;
+         break;
+--- a/libmp3lame/VbrTag.c
++++ b/libmp3lame/VbrTag.c
+@@ -724,5 +724,5 @@
+     if (cfg->findPeakSample)
+         nPeakSignalAmplitude =
+-            abs((int) ((((FLOAT) gfc->ov_rpg.PeakSample) / 32767.0) * pow(2, 23) + .5));
++            abs((int) ((((FLOAT) gfc->ov_rpg.PeakSample) / 32767.0) * 8388608.0 + .5));
+ 
+     /*nogap */

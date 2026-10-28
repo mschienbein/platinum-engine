@@ -2,9 +2,19 @@
 
 A Rust command-line audio processor that reproduces Platinum Notes 10.5 processing and file workflows, writing byte-identical output files in every verified reference case. It is a headless engine, not a graphical clone or a generic loudness normalizer. Platinum Engine is not affiliated with the vendor.
 
-## Current state
+## v0.1.0 at a glance
 
-**Byte-identical to Platinum Notes 10.5.0.1256 in more than 100 verified reference cases.** For generated inputs, the final release reproduces the original app's complete output files, including audio, container fields, tags, artwork and processing markers, with no normalization. Verified coverage includes:
+Platinum Engine supports **macOS arm64**, the reference platform, and Linux
+**aarch64** and **x86_64**. The portability target is complete-file byte identity
+with the measured macOS reference on supported paths; unsupported paths are
+refused or reported unavailable. The implementation is not a proof of
+identity for every input: see the x86 floating-point residual and the other
+boundaries below. The recorded Apple M4/SME component reference was macOS 27.2
+build 26B123; other captures used the builds stated in the verification guide.
+
+In earlier verified reference cases the engine reproduced complete original
+output files, including audio, container fields, tags, artwork and processing
+markers, with no normalization. The observed coverage includes:
 
 - all three built-in templates and custom templates;
 - pitch correction in both modes and directions, warmth, expansion, compression and their gates;
@@ -13,26 +23,36 @@ A Rust command-line audio processor that reproduces Platinum Notes 10.5 processi
 - silence, short, long and odd-length signals, and metadata;
 - folder, mirror and same-folder output, cancellation, error, and replacement/restore workflows.
 
-Nine representative format and feature families also pass a strict review of the original app's full runtime context. The first pinned case, Official/WAV, matched in all 3,076,786 bytes (SHA-256 `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`).
+Nine representative format and feature families passed a strict review for the earlier `dd4b5fd0` build in the recorded original-app context. Later path-relocated replays have their own documented context limits. The first pinned Official/WAV case matched in all 3,076,786 bytes (SHA-256 `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`).
 
-A finite test set cannot prove identical output for every possible input or setting. [VERIFICATION.md](docs/VERIFICATION.md) lists exactly what was compared and the known limits. The runtime uses Rust DSP, macOS system frameworks and separately built public libraries; it does not call the original application or its proprietary components, which are used only for optional reference comparisons.
+A finite test set cannot prove identical output for every possible input, setting or runtime. [VERIFICATION.md](docs/VERIFICATION.md) separates final-build, component and historical results. The runtime uses Rust DSP and separately built public libraries; macOS additionally uses system frameworks, while Linux uses portable implementations. It does not call the original application or its proprietary components, which are used only for optional reference comparisons.
 
 ### Measured progress
 
 | Area | Verified result or remaining gate |
 | --- | --- |
+| Frozen macOS build | `82d8b489…` passed 440 top-level regular tests (181 ignored) and 38 selected public-dependency tests. It matched 71/71 retained full-file cases, eight dynamics/pitch cases, ten controlled-second MP4 exports, 15 boundary files and the W04 exact-path workflow. Nine family cases matched in a path-relocated review, not the earlier identical-path strict context. Sets overlap. |
+| Linux battery | On each architecture, 104 native cases matched completely, 25 were documented refusals and three matched native error/no-output behavior; 16 workflows matched recorded behavior. Of 575 stress cases, 535 matched macOS bytes and 40 were documented refusals; 30 additional pitch cases matched. These bounded sets overlap and do not establish universal parity. |
+| Earlier macOS candidate | The `c9f19077…` candidate passed 426 regular tests (179 ignored) and 37 selected public-dependency tests; it matched 71/71 retained full-file cases, 8/8 dynamics/pitch cases, 10/10 controlled-second MP4 exports and six extension cases. Nine family cases also matched in a **path-relocated** review, not the earlier identical-path strict context. Sets overlap; this candidate predates later fixes. |
 | Clip repair | 32 generated native cases matched every sample bit and captured event property. |
 | Wrapper phase correction | 40 generated native cases matched coefficients, samples, latency and state transitions in debug and release builds. |
 | Shipped multiband graphs | All four graphs match captured phase-off output/intermediates and long phase-enabled output, including current-template controls and native shared-buffer warmup. |
 | Limiter | All 112,384 sample words in the captured 56,192-frame stereo impulse/tail case match after replaying the observed host defaults. |
 | Pitch correction | Four original AU audio captures and controlled scheduler checkpoints match in both modes, and every pitch-active native export matches the FFT alignment profile the CLI uses. |
 | Analysis | Original tuning, sinc-table, partitioned-resampler and harmonic-removal leaves pass. The whitening boundary has a regular synthetic native-golden regression; restoring the old boundary makes it fail. The original-app tuning and pinned complete-file comparisons pass. |
-| Rust test runs | The final private snapshot passed 317 regular tests, with 92 opt-in tests ignored. Separately, 20 public-library integration tests, the Xing caller-byte oracle and three native waveform-reducer capture cases passed. Counts overlap and do not establish universal parity. |
-| Codecs and tags | Public FLAC/LAME paths and all 38 original metadata/container cases have bounded matches. The lower-level original and Rust Ogg decoders matched 96 generated cases. An interleaved AAC fixture varied across fresh native processes, while original and direct system reads matched within each sampled process. |
-| Final-binary files | The final optimized release (SHA-256 `dd4b5fd0…`) matches both native references in nine strict full-context family captures, eight retained dynamics/pitch cases, 71 selected format/metadata/DSP/boundary cases, all ten MP4 exports given their recorded seconds, the Xing E05 case, six nonzero-width dynamics-gate cases and nine pitch-threshold counterparts, including complete headers and markers. Case sets overlap; variable originals remain explained exclusions, not passes. |
+| Earlier Rust test runs | An earlier private snapshot passed 317 regular tests, with 92 opt-in tests ignored. Separately, 20 public-library integration tests, the Xing caller-byte oracle and three native waveform-reducer capture cases passed. These are historical, overlapping counts. |
+| Codecs and tags | Public FLAC/LAME paths and 38 original metadata/container cases have bounded matches. The lower-level original and Rust Ogg decoders matched 96 generated cases. An AAC fixture varied across fresh native processes, while original and direct system reads matched within each sampled process. |
+| Earlier final-binary files | Release `dd4b5fd0…` matched both native references in nine full-context family captures, eight dynamics/pitch cases, 71 selected cases, all ten controlled-second MP4 exports, the Xing E05 case and 15 dynamics/pitch-gate cases. These sets overlap and are historical, not a claim about a later binary. |
 | File safety | Review corrections passed: retained preflight identities, metadata/resource-fork/ACL-preserving backups, collision reservations, decoder-independent restore, native nil markers, synchronized cancellation/publication, identity- and digest-checked `--overwrite` swaps that retain rollback files, and backup consumption only after a synced, verified restore. Real CLI SIGINT exited 130 without publishing; replacement/restore preserved generated source bytes and metadata. |
 
-**Known limits:** production pitch correction uses the observed aligned-0 FFT profile; the original GUI's active allocation context is not established. A Xing MP3 source without a recognized LAME tag makes the native updater read a reused caller byte; the CLI applies the nonzero branch established by static analysis of the in-process limiter handle, which reproduced the retained native exports, but the byte was not observed in the running app. AAC/ALAC outputs store the export's wall-clock second in their MP4 headers, so native repeats differ from each other; a hidden diagnostic option sets that second, and with each native export's recorded value the CLI reproduced all ten retained MP4 exports. AAC decoding targets the native same-process result; one historical fixture varied across native processes. The reference's recovered normal extension filter excludes `.ogg` and `.oga` despite vendor advertising; the CLI explicitly rejects `.ogg`. Protected sources are rejected.
+**Known limits:** Pitch correction uses the observed aligned-0 FFT profile; the original GUI's literal allocation context was not observed. AudioToolbox AAC decoding can depend on stack context and original process; AAC and ALAC MP4 headers also contain the export second. Linux refuses MP3/AAC input decoding, AAC encoding, unreproduced sample-rate conversion (including non-44.1 kHz waveforms), artwork transcoding, unverified codec/container variants and ALAC native-loss cases. Linux aarch64 is the stricter cross-platform target. On x86_64, ordinary operations can retain a minimum normal result where ARM flushes before rounding; invalid-operation NaN signs and NaN payload selection, including vectorized FMA operand order, can also differ. These are known residual classes, not a promise that every affected input is detected and refused. Other Apple Silicon generations or OS versions may dispatch Accelerate differently or change AudioToolbox behavior. See [Linux](docs/LINUX.md) and [verification](docs/VERIFICATION.md) for precise scope.
+
+**Marker limitation:** Duplicate AIFF ID3 chunks are refused, but source
+review found that deliberately conflicting markers inside a single ID3 tag,
+duplicate MP4 items, or FLAC Xiph-versus-ID3 markers may conceal a later
+processed marker. Sync-like junk or separated ID3 tags may do so as well.
+These are source-derived scenarios; the reviewer did not establish that the
+exact crafted inputs decode. Use trusted inputs and retain independent backups.
 
 Historical records retain earlier failures, the whitening correction and the crossover-ramp correction. Component results, observed file matches and strict-context acceptance are separate claims; see [VERIFICATION.md](docs/VERIFICATION.md).
 
@@ -40,20 +60,73 @@ Historical records retain earlier failures, the whitening correction and the cro
 
 The implementation exposes volume and pitch analysis, clipping repair, pitch correction, warmth, multiband expansion/compression, output limiting, built-in/custom templates, encoding, tags and artwork. It also supports batch status and cancellation, processed-file detection, separate output folders, explicit replacement with backups, restore, cumulative Engine-owned statistics, and machine-readable analysis and waveform reports. `--allow-ambiguous-marker` is a process-only opt-in for specific ambiguous WAV markers; it can reprocess a file and does not relax restore or no-clobber safety. Implemented controls are not a claim that every combination matches the reference.
 
-The [CLI contract](research/CLI_CONTRACT.md) specifies the commands, settings, safety behavior and verification boundary. The reference comparison target is Platinum Notes 10.5.0.1256 for macOS arm64; no reference installation is required to run the CLI.
+The [CLI contract](research/CLI_CONTRACT.md) specifies commands, settings,
+refusals, safety behavior and the verification boundary. The reference is
+Platinum Notes 10.5.0.1256 for macOS arm64; no reference installation is
+required to run the CLI.
 
-## Run the CLI
+## Install and run
 
-Build and usage are currently scoped to **macOS arm64**. You need the pinned Rust toolchain and Apple developer tools; processing also requires the ABI-5 bridge built against public TagLib 1.11.1. FLAC input or output requires an explicitly configured public libFLAC 1.4.2 and SHA-256 pin. MP3 output—including the default output format—requires explicitly configured LAME 3.100 and a SHA-256 pin. The libraries are not silently taken from the reference app.
+Release archives are named `platinum-engine-v0.1.0-macos-arm64.tar.gz`,
+`platinum-engine-v0.1.0-linux-arm64.tar.gz`, and
+`platinum-engine-v0.1.0-linux-amd64.tar.gz`. Obtain the appropriate archive and
+the accompanying `SHA256SUMS` from the
+[GitHub Releases page](https://github.com/mschienbein/platinum-engine/releases)
+when published, verify its digest using a trusted release checksum, and unpack
+it in a new directory. The archive's `README.txt` gives commands to verify its
+internal checksums and explicitly configure its library paths and codec
+digests; it does not configure them automatically. Checksums alone do not
+authenticate an untrusted download.
+
+After downloading the selected archive and the release's `SHA256SUMS` into
+the current directory, set `ARCHIVE` to its filename. This example refuses an
+existing installation directory and verifies the package before using it:
 
 ```sh
-cargo build --locked --bin platinum
-target/debug/platinum --help
-target/debug/platinum --state-dir "$PWD/local-artifacts/example-state" --json templates list
-target/debug/platinum --state-dir "$PWD/local-artifacts/example-state" --json config show
+(
+  set -eu
+  python3 - "$ARCHIVE" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+archive = Path(sys.argv[1])
+suffix = "  " + archive.name
+matches = [line[:-len(suffix)] for line in Path("SHA256SUMS").read_text().splitlines()
+           if line.endswith(suffix)]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one checksum for the selected archive")
+digest = hashlib.sha256()
+with archive.open("rb") as file:
+    for chunk in iter(lambda: file.read(1024 * 1024), b""):
+        digest.update(chunk)
+if digest.hexdigest() != matches[0]:
+    raise SystemExit("release archive checksum mismatch")
+PY
+  mkdir "$HOME/platinum-engine-v0.1.0"
+  tar -xzf "$ARCHIVE" -C "$HOME/platinum-engine-v0.1.0"
+  cd "$HOME/platinum-engine-v0.1.0"
+  if [ "$(uname -s)" = Darwin ]; then shasum -a 256 -c SHA256SUMS
+  else sha256sum -c SHA256SUMS; fi
+  ./bin/platinum --help
+  ./bin/platinum --state-dir "$HOME/platinum-state" --json templates list
+)
 ```
 
-The [build guide](docs/BUILD.md) contains source URLs and checksums, native build commands, configuration, and a generated-audio processing example. Use `--state-dir` to isolate settings and an existing, separate output directory for initial processing. An existing output is refused unless `--overwrite` is given. Replacement requires explicit flags and an existing backup directory on every run; retain an independent backup as well. Restore requires the exact recorded backup path and, like the original, consumes that backup after a verified restore; some nil-marker outputs cannot authorize CLI restore. See the [CLI contract](research/CLI_CONTRACT.md) before using replacement or restoration.
+The intended multi-architecture container image is
+`ghcr.io/mschienbein/platinum-engine:v0.1.0` when published. The image runs as
+an unprivileged user, does not auto-configure libraries, and needs durable state
+and deliberately selected input/output mounts. In Docker Desktop on macOS, use
+a container volume or tmpfs for state, and use the libraries already inside
+the image, rather than bind-mounted libraries. See [LINUX.md](docs/LINUX.md)
+for complete setup, volume ownership, example commands and platform limits.
+
+For source builds, see [BUILD.md](docs/BUILD.md). Use `--state-dir` to isolate
+settings and a separate output directory for initial processing. Existing
+outputs are refused unless `--overwrite` is given. Replacement requires
+explicit flags and an existing backup directory on every run; retain an
+independent backup. Restore requires the exact recorded backup and consumes
+that backup after a verified restore; some nil markers cannot authorize
+restore. Read the [CLI contract](research/CLI_CONTRACT.md) first.
 
 ## Reference evidence and limits
 
@@ -65,7 +138,7 @@ The analyzer is identified from static evidence as K-weighted integrated LUFS-st
 
 ## Licensing
 
-Project-owned contributions are available under the [MIT license](LICENSE), to the extent their contributors can grant those rights. It permits use, modification and distribution, including commercially, provided the copyright and permission notices are retained. Third-party dependencies have their own terms; consult their upstream packages and the [build guide](docs/BUILD.md) before distributing them. This license does not grant rights to the reference application or its artifacts.
+Project-owned contributions are available under the [MIT license](LICENSE), to the extent their contributors can grant those rights. Third-party terms apply: the separate bridge statically links LGPL-2.1 TagLib 1.11.1, LAME 3.100 is LGPL-2.0-or-later, and libFLAC 1.4.2 uses BSD-3-Clause terms. Apple's Apache-2.0 ALAC reference was studied for the independently written Rust implementation. See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) and [NOTICE](NOTICE) for attribution, sources, package source/relink materials, and limitations. Neither the MIT license nor these notices grant rights to the reference application or constitute legal clearance.
 
 This reconstruction was informed by static binary analysis and measured reference behavior; it is not a clean-room provenance claim. Compatibility names, identifiers and typed parameter values retain their reference-derived provenance. The public snapshot excludes original serialized preset blobs, raw decompiler/disassembly exports, compiled resources, screenshots and the private research history.
 

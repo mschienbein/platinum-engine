@@ -14,6 +14,7 @@ use crate::multipass::{
     ShippedTransientParameters, SleepDispatch, TransientModelField,
 };
 use crate::transient::{TransientParameters, TransientShaper};
+use crate::portable::arm_scalar::ArmFloat;
 
 const MAX_FRAMES: usize = 64;
 const QUIET_RATE: f32 = f32::from_bits(0x3580_0000);
@@ -230,7 +231,7 @@ impl DynamicsEffect {
         Ok(())
     }
     fn set_normalized(&mut self, field: DynamicsField, normalized: f32) {
-        let v = field.model_physical_from_normalized(normalized.max(0.0).min(1.0));
+        let v = field.model_physical_from_normalized(normalized.arm_max(0.0).arm_min(1.0));
         match field {
             DynamicsField::InputGain => self.parameters.input_gain_db = v,
             DynamicsField::OutputGain => self.parameters.output_gain_db = v,
@@ -410,7 +411,7 @@ impl MultipassGraph {
         // version-1058 route records and 0x6230d0. Source is macro0, loaded
         // through its own [0,1] descriptor, not an arbitrary effective lane.
         let macro_raw = snapshot.macro_value;
-        let macro_value = macro_raw.max(0.0).min(1.0);
+        let macro_value = macro_raw.arm_max(0.0).arm_min(1.0);
         let source = native_macro_source(macro_value, 0);
         let depths = [0x3f7f_15f2, 0x3f7f_ffc8, 0x3f7f_fff8, 0x3f7f_ffd8, 0xbe83_a8c8];
         let mut modulation = [[0.0_f32; 4]; 7];
@@ -464,7 +465,7 @@ impl MultipassGraph {
         // Initial editor source values precede host events and are not child
         // DSP fields; apply the same source descriptor clamp as before.
         let automation = std::array::from_fn(|slot| {
-            AutomationRamp::new(snapshot.automation_values[slot].max(0.0).min(1.0))
+            AutomationRamp::new(snapshot.automation_values[slot].arm_max(0.0).arm_min(1.0))
         });
         Ok(Self {
             rate: sample_rate, preset, crossover_scale,
@@ -504,11 +505,11 @@ impl MultipassGraph {
                 34 | 40 => {
                     let index = if write.id == 34 { 5 } else { 6 };
                     let raw = lane_gain_from_normalized(write.value);
-                    self.lanes[index].model.gain = lane_gain_from_normalized(lane_gain_to_normalized(raw).max(0.0).min(1.0));
+                    self.lanes[index].model.gain = lane_gain_from_normalized(lane_gain_to_normalized(raw).arm_max(0.0).arm_min(1.0));
                 }
                 id => {
                     let slot = automation_slot_for_host_parameter(id).unwrap();
-                    let normalized = write.value.max(0.0).min(1.0);
+                    let normalized = write.value.arm_max(0.0).arm_min(1.0);
                     self.automation[slot].schedule(normalized, segment_remaining);
                 }
             }

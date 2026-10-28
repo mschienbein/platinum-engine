@@ -95,10 +95,13 @@ fn hermite_leaf_matches_native_component() {
     }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     #[link_name = "sin"]
     fn system_sin(value: f64) -> f64;
 }
+#[cfg(target_os = "linux")]
+use platinum_engine::portable::math::sin as system_sin;
 
 fn oracle_sample(signal: &str, rate: f64, source_frames: u64, frame: u64, channel: usize) -> f32 {
     if frame >= source_frames { return 0.0; }

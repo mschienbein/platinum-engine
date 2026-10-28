@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test with the repository toolchain
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          unset RUSTUP_TOOLCHAIN
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          compiler="$(rustc --version)"
+          case "$compiler" in
+            "rustc $channel "*) ;;
+            *) printf 'Unexpected compiler: %s (expected %s)\n' "$compiler" "$channel" >&2; exit 1 ;;
+          esac
+          rustup show active-toolchain
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
+          cargo test --locked --all-targets
+
+  linux:
+    name: Linux ${{ matrix.uname }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            uname: x86_64
+            oci_arch: amd64
+            rust_host: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            uname: aarch64
+            oci_arch: arm64
+            rust_host: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      CI_UNAME: ${{ matrix.uname }}
+      CI_OCI_ARCH: ${{ matrix.oci_arch }}
+      CI_RUST_HOST: ${{ matrix.rust_host }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build the native dependency and bridge image
+        shell: bash
+        run: |
+          test "$(uname -m)" = "$CI_UNAME"
+          daemon_arch="$(docker info --format '{{.Architecture}}')"
+          case "$daemon_arch:$CI_OCI_ARCH" in
+            x86_64:amd64|amd64:amd64|aarch64:arm64|arm64:arm64) ;;
+            *) printf 'Unexpected Docker daemon architecture: %s\n' "$daemon_arch" >&2; exit 1 ;;
+          esac
+          docker build --platform "linux/$CI_OCI_ARCH" --target bridge \
+            --file linux/Dockerfile --tag platinum-ci-native .
+          test "$(docker image inspect --format '{{.Architecture}}' platinum-ci-native)" = "$CI_OCI_ARCH"
+      - name: Build and test in the native image
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/platinum-ci"/{cargo,home,target}
+          docker run --rm --interactive --read-only --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:exec,mode=1777 \
+            -e HOME=/out/home -e CARGO_HOME=/out/cargo -e CARGO_TARGET_DIR=/out/target \
+            -e CI_UNAME -e CI_RUST_HOST \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/platinum-ci:/out" \
+            -w /src platinum-ci-native sh -eu <<'SCRIPT'
+          test "$(uname -m)" = "$CI_UNAME"
+          # The image pins the same Rust release as the repository; fail if they diverge.
+          RUSTUP_TOOLCHAIN="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          export RUSTUP_TOOLCHAIN
+          compiler="$(rustc --version)"
+          case "$compiler" in
+            "rustc $RUSTUP_TOOLCHAIN "*) ;;
+            *) printf 'Unexpected compiler: %s (expected %s)\n' "$compiler" "$RUSTUP_TOOLCHAIN" >&2; exit 1 ;;
+          esac
+          rustc -vV | grep -Fx "host: $CI_RUST_HOST"
+
+          export LD_LIBRARY_PATH=/opt/platinum-native/lib
+          export PN_TAG_BRIDGE=/opt/platinum-native/lib/libpn-tag-bridge.so
+          export PLATINUM_TEST_TAG_BRIDGE="$PN_TAG_BRIDGE"
+          export PN_FLAC_LIB=/opt/platinum-native/lib/libFLAC.so
+          export PN_FLAC_LIBRARY="$PN_FLAC_LIB"
+          export PN_LAME_LIB=/opt/platinum-native/lib/libmp3lame.so
+          test -f /opt/platinum-native/lib/libFLAC.so.12
+          test -f /opt/platinum-native/lib/libmp3lame.so.0
+          flac_sum="$(sha256sum "$PN_FLAC_LIB")"
+          lame_sum="$(sha256sum "$PN_LAME_LIB")"
+          export PN_FLAC_SHA256="${flac_sum%% *}" PN_FLAC_LIBRARY_SHA256="${flac_sum%% *}"
+          export PN_LAME_SHA256="${lame_sum%% *}"
+          export PN_MP3_LAME_PATH="$PN_LAME_LIB" PN_MP3_LAME_SHA256="$PN_LAME_SHA256"
+          python3 -c '
+          import ctypes, os
+          bridge = ctypes.CDLL(os.environ["PN_TAG_BRIDGE"])
+          bridge.pn_tag_bridge_abi.restype = ctypes.c_uint32
+          abi = bridge.pn_tag_bridge_abi()
+          if abi != 5:
+              raise SystemExit(f"expected tag bridge ABI 5, got {abi}")
+          ctypes.CDLL(os.environ["PN_FLAC_LIB"])
+          ctypes.CDLL(os.environ["PN_LAME_LIB"])
+          '
+
+          cargo build --locked --release --bin platinum --features portable
+          cargo test --locked --all-targets
+          cargo test --locked --all-targets --features portable
+
+          # These opt-in tests need only the public libraries built in this image.
+          cargo test --locked --test flac_reference --features portable -- --ignored
+          for name in \
+            candidate_bridge::unreadable_source_copies_no_tags_but_still_writes_marker \
+            candidate_bridge::portable_artwork_refusal_does_not_save_a_marker_fallback
+          do
+            listed="$(cargo test --locked --test tags_reference --features portable -- "$name" --ignored --exact --list)"
+            printf '%s\n' "$listed" | grep -Fx "$name: test"
+            cargo test --locked --test tags_reference --features portable -- "$name" --ignored --exact
+          done
+          SCRIPT

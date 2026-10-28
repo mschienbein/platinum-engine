@@ -175,6 +175,35 @@ mod oracle {
     }
 
     #[test]
+    #[ignore = "requires PN_FLAC_LIBRARY and PN_FLAC_LIBRARY_SHA256 for public libFLAC"]
+    fn portable_flac_planes_match_generated_integer_samples() {
+        let library = env_path("PN_FLAC_LIBRARY");
+        let libraries = InputLibraries { flac: Some(library.clone()),
+            flac_sha256: Some(std::env::var("PN_FLAC_LIBRARY_SHA256").unwrap()) };
+        let dir = TestDir::new();
+        for bits in [8u32, 16, 24, 32] {
+            for channels in [1u32, 2, 6] {
+                let path = dir.path(&format!("{bits}-{channels}.flac"));
+                encode_fixture(&library, &path, 44_100, channels, bits, 257);
+                let mut reader = AudioReader::open(&path, None, &libraries).unwrap();
+                let mut samples = vec![f32::NAN; 257 * channels as usize];
+                assert_eq!(reader.read(&mut samples).unwrap(), 257);
+                let emitted = (channels as usize).min(2);
+                let scale = 1.0f32 / (1u64 << (bits - 1)) as f32;
+                for frame in 0..257 {
+                    for channel in 0..emitted {
+                        let expected = integer_sample(frame, channel, bits) as f32 * scale;
+                        assert_eq!(samples[frame * emitted + channel].to_bits(), expected.to_bits(),
+                            "depth {bits}, channels {channels}, frame {frame}, channel {channel}");
+                    }
+                }
+                assert!(samples[257 * emitted..].iter().all(|value| value.is_nan()));
+                reader.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires PN_FLAC_LIBRARY, PN_FLAC_LIBRARY_SHA256, PN_FLAC_INPUT_ORACLE and PN_MIKAUDIO_REFERENCE"]
     fn generated_flac_matches_original_mikaudio_across_depths_channels_and_partitions() {
         let library = env_path("PN_FLAC_LIBRARY");

@@ -2,6 +2,242 @@
 
 The project uses complete-file identity as its reference-comparison criterion: audio, container headers, encoder output and metadata all count. Component tests and decoded PCM comparisons help locate differences; they do not substitute for a complete-file match.
 
+## v0.1.0 source freeze
+
+The regression-fixed source freeze has source-manifest SHA-256
+`5b05c38952406b2e21e6c5e7397e29d3d9140d3d0963ad675569c5e7548f72d5`
+and a private build receipt at
+`portable-parity/full-build-v07-regression-fix-01/receipt.json`. In the v07
+native-library images its offline locked all-target suite passed **400**, failed
+**0**, ignored **97** on Linux aarch64 and passed **398**, failed **0**, ignored
+**95** on Linux x86_64, each across 44 top-level suites. The respective Linux
+executable SHA-256 values were
+`6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
+and `1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`.
+The remapped optimized macOS binary SHA-256 was
+`82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`.
+These architecture-specific binary hashes and test results do not themselves
+establish complete-file parity. The freeze's full-tree manifest records the
+tree at that point, not later documentation or export-related edits.
+
+### macOS identity-gated battery
+
+The binary above (LC_UUID `5348303E-C012-3ECD-9023-D9A444C57F73`) passed
+**440** top-level regular tests, with **0 failed** and **181 ignored**, in
+44 suites. A separate selected public-dependency run passed 38 tests; the
+native waveform replay and Xing caller-byte oracle each passed one. The
+original Mac receipt aggregated four nested filtered subprocess summaries and
+reported 444/48; the create-only count addendum corrects this to 440/44
+without changing the original receipts, test exit or binary identity. Counts
+overlap and ignored tests are not passes.
+
+Without normalizing file bytes, the binary matched 71/71 selected stable cases,
+8/8 dynamics/pitch cases, 10/10 MP4 exports using each recorded header second,
+15 boundary files and all six x01–x06 extension cases. The retained Xing E05
+case and W04 exact-backup-path replacement/restore comparison also matched.
+Nine family cases matched in a **path-relocated context review**; both c04
+ALAC exports matched separately at their recorded seconds. The unmodified
+strict toolkit rejected the different output folders; the adapted review
+validated both paths and substituted only that setting. It did not alter
+native observations or output bytes. This is not the earlier `dd4b5fd0`
+identical-path strict-context result. These sets overlap and cover only the
+tested synthetic cases.
+
+The supplemental workflow replay matched the recorded gauge/statistics and
+waveform checks; timed W03 cancellation landed in healing rather than the
+historical native analysis stage. The native application was not launched or
+controlled during this battery. The primary, supplement and counts addendum
+are retained under the private evidence root as
+`hash-parity/release-final-82d8b489.json`,
+`hash-parity/release-final-82d8b489-supplement.json`, and
+`hash-parity/release-final-82d8b489-counts-addendum.json`, with SHA-256
+`d3ea14d5064b02f9b390755f634f1dd0716706d9741ef2ff2938702939b93b1a`,
+`33add854616ac356fc33759ce04fcc308540c92a83b4db3b8dde2eba22381588`, and
+`7cb2eca91c0ffcdaacc58c7336d808c5d8f9619356429335180823641ab5a434`.
+
+### Linux end-to-end battery
+
+The regression-fixed source snapshot was tested on both Linux architectures.
+Per architecture, 132 native-comparison cases comprised **104 exact complete
+file matches**, **25 documented typed refusals**, and **3 matching native
+error/no-output cases**. Each architecture matched all 16 recorded workflow
+cases. Refusals and no-output outcomes are not counted as byte matches.
+
+For a separate 575-case stress corpus, the macOS default build produced 575
+outputs; macOS portable, Linux aarch64 and Linux x86_64 each had **535 exact
+byte matches and 40 documented refusals**. All four platforms matched all
+30 supplemental pitch cases. A separate Docker Desktop bind-mount subset
+reported 44 byte matches, one native match, two documented refusals and 16
+matching workflows; it does not replace the main Linux tmpfs battery.
+
+There were no unexplained mismatches in these runs. Low-level and nonfinite
+inputs were not instrumented, so successful files do not establish that the
+x86 FTZ or NaN-sign boundary was exercised or repaired. The private index
+`portable-parity/linux-battery-01/receipt-final-regression-01.json` has SHA-256
+`c0d49ffb934e13074fc61c0d2eb0ad700973cb8821016a93ab7c4dd234dc498b` and
+links the individual native, stress, pitch and bind receipts. These finite,
+overlapping synthetic cases are not a universal parity proof.
+
+
+## Historical v07-fixes source build
+
+That pre-regression-fix freeze's original source-manifest SHA-256 is
+`dc82b4a030c620c1d3b80a495078613c2736690dfbea251fbd8c5ca26fcceb55`.
+In the v07 native-library images, its offline locked all-target suite passed
+**398**, failed **0**, ignored **97** on Linux aarch64 and passed **396**,
+failed **0**, ignored **95** on Linux x86_64; each had 44 top-level suites.
+The Linux executable SHA-256 values were
+`8954dd025e34395ceda24cabcfbbd3687677ab236199d6b96d097821e6775bf7`
+and `e7b837ecb4ed4873ba23791a24d7786b3b45a09abeec75527bca2b364972a8dc`.
+These architecture-specific binaries and passing tests are not themselves
+complete-file end-to-end parity evidence.
+
+The original build receipt counted three nested filtered test subprocess
+summaries as additional x86 suites and passes (399/47); the separate
+`top-level-test-counts.json` corrects that aggregation to 396/44 without
+changing the recorded exit codes or executable hashes. The original receipt
+is preserved. Both are under the private evidence root in
+`portable-parity/full-build-v07-final-fixes-01/`. Its remapped macOS binary
+SHA-256 is `3f2c19c4705ad892e6c03f202416ab25b714b4aaa1b0d6ae8765ed559431f8b6`.
+Later documentation and export-related edits are not represented by the
+original full-tree manifest; do not describe that manifest as the public
+export's identity.
+
+
+## Historical v07 frozen candidate
+
+The pre-fix, pre-documentation candidate snapshot has source-manifest SHA-256
+`855445719d235d4ca14cda8294bd1c8aef2283679e5ea0d967adbd70c8c9d186`.
+The remapped optimized macOS executable SHA-256 was
+`c9f19077c91fb975f9d375f4aae3c7024becce2416d3211e9ed971e7ad1830a7`
+(LC_UUID `5AE44579-7B18-3355-83BD-AFBEAAEF5E9E`). Its frozen private
+all-target suite passed **426**, failed **0**, and ignored **179** tests
+across 44 suites. A separate selected public-dependency run passed 37 tests;
+the opt-in native waveform replay and Xing caller-byte oracle each passed one.
+These runs overlap and ignored tests are not counted as passes.
+
+Without normalizing file bytes, this binary matched the retained references in
+71/71 selected stable cases, 8/8 dynamics/pitch cases, 10/10 MP4 exports using
+each recorded header second, and all six additional x01–x06 cases. It also
+matched the retained Xing E05 case and the W04 exact-backup-path
+replacement/restore comparison. Nine family cases matched in a **path-relocated
+context review**; both c04 ALAC exports matched separately with their recorded
+seconds. The unmodified strict toolkit rejected the relocated output folders:
+the adapted review substitutes only that setting after validating both paths,
+and does not normalize any audio bytes or change native observations. This is
+not the earlier `dd4b5fd0` identical-path strict-context result. These case sets
+overlap and establish only the tested synthetic cases.
+
+The same source freeze built and ran the offline locked all-target suite on
+Linux aarch64 (**386 passed, 0 failed, 96 ignored**) and x86_64 (**384 passed,
+0 failed, 94 ignored**) in the v07 native-library images. Their executable
+SHA-256 values were `6826ecbed9c463550c65d95c6179c397f7355e40fc3e7daa9487828be7c76005`
+and `6ecd7c4e57b9acb1f8cda80da4d1c74447cd501e88c616574a1b6ef42c4094b4`
+respectively. These are architecture-specific binaries and test results, not
+cross-architecture binary identity or an end-to-end parity battery.
+
+The macOS primary and supplement receipts are retained privately as
+`local-artifacts/hash-parity/release-final-c9f19077.json` and
+`local-artifacts/hash-parity/release-final-c9f19077-supplement.json`, SHA-256
+`c98e64e8be4faeb9b954a198ce2e696506b59526e64f4085395daace21a8c3b4`
+and `a175a21d0aaf6e9f96a94a579d7793c275e6b2b39c38bb9d082b3ab853609729`.
+The Linux build receipt is `portable-parity/full-build-v07-registry-stage-01/receipt.json`
+under the private evidence root. The frozen inventory predates the subsequent
+documentation, notices, export list and package-notice wording changes; those
+edits must not be represented as part of the original frozen manifest.
+
+
+## Portable component evidence
+
+These are component or codec comparisons from separately pinned snapshots, not
+additional complete-application passes. Their sets overlap; do not add their
+counts to the release battery. The Accelerate and math component reference
+records Apple M4 with SME, macOS 27.2 build 26B123, round-to-nearest, the
+specified FZ modes and the aligned-0 FFT profile.
+
+| Component | Bounded observation |
+| --- | --- |
+| Math | 46 components × 131,072 inputs per FZ mode replayed on macOS, Linux aarch64 and Linux x86_64 without mismatches; Linux raw-bit sampling is not exhaustive. The math receipt also records separate exhaustive macOS binary32 sweeps. |
+| ARM scalar helpers | The three-host oracle compared 100,000,000 random plus 32,768 special triples per precision/FZ with zero helper mismatches. A separate x86 vectorized-call-shape replay recorded 210 FMA NaN-payload mismatches, a documented residual rather than a pass. |
+| vDSP | Eleven element routines, 686 lengths and both FZ modes were sampled without failures; a three-host non-FFT corpus matched 54,342,720 words per FZ mode. Profiles, lengths, strides and aliases are limited to those in the component receipt. |
+| vForce | Mac `vvlogf`, `vvexpf` and `vvsincosf` sweeps covered all 2^32 binary32 inputs in specified body and tail classes, both FZ modes, without mismatches. Linux replay used finite general and boundary corpora, not exhaustive Linux sweeps. |
+| FFT | The aligned-0 Mac corpus used 10,000 random and seven structured vectors per size, direction and FZ; each Linux architecture replayed 3,052 vectors/28,350,464 words with zero mismatches. SME complex transforms separately used 100,000 random plus 12 structured vectors per size/direction/FZ, with zero recorded word mismatches. |
+| PCM and ALAC | Per Linux architecture, the audio snapshot recorded 9,540 reader cases/179,610,900 sample-bit comparisons, 2,424 PCM writer cases/90,494,042 file bytes, 864 ALAC reader cases and 1,589 ALAC writer cases without mismatches. An ALAC one-sample mono/16 sweep matched file lengths and hashes for all 73,951 integer rates 22,050–96,000; 2,240 fractional-rate cases comprised 2,095 matches and 145 expected native-loss refusals. Sample contents and fractional rates were not exhaustive. |
+| GSM | The three-host optimized snapshot matched 117 packet cases, 42,258 blocks and 13,522,560 samples; its 12,288-mask reader corpus had zero mismatches and 179 reserved-mask cases were typed refusals. Later audio source replay coverage differs by platform as recorded in its inventory; the accepted mask subset is not universal. |
+| FLAC/LAME | Per Linux architecture, codec-03 matched 540 FLAC and 320 MP3 retained cases, 7,488 FLAC and 2,880 MP3 expanded cases, plus a 2,988,408-record one-frame FLAC rate/channel/depth sweep. Codec-04 additionally matched 5,244 FLAC stress/recovered-PCM cases per architecture. These are codec-only results, not all possible streams or full pipeline outputs. |
+| Bridge v07 | Each Linux architecture matched 604 transfers, 86 inspections and 232 source-status cases; 37 fault runs and nine WAV permission/umask cases had no reported failures. The macOS native-versus-portable matrix covered 690 cases, including 112 expected artwork refusals. Status/refusal evidence is not the same as a file-byte match for an accepted output. |
+| MP3 postflight | The final-source gate matched ten stream-description/length fields for 17,120 unique files, including selected final-battery outputs, with zero mismatches. This tests postflight fields, not complete-file encoding equivalence. |
+
+The component reports retain their source pins, commands, historical failures
+and exact scope in the private evidence inventory. The published source includes
+only the reviewed compile-time coefficient table and two compact FFT test
+fixtures, not the private corpus. A different Apple Silicon generation, OS,
+Accelerate dispatch, allocator alignment or AudioToolbox stack context may
+change the reference. On x86, ordinary FTZ tininess, default-NaN sign and NaN
+selection including vectorized FMA order remain known residual classes; no
+claim is made that the runtime detects every affected input. Linux aarch64 is
+the stricter build. See [LINUX.md](LINUX.md) for refusals and loader limits.
+
+Review rounds proceeded through ReviewMacDefault, ReviewPortable and
+ReviewSecurity, fixes, ReReview, FinalReview and LastRegressionReview.
+FinalReviewEngine's verdict for its reviewed snapshot was
+`PASS_WITH_QUALIFICATIONS`, not an overall release or security sign-off. Its
+conditional MPEG/MP4 classification finding was addressed by validating
+atom sizes and structure; six decoder-admitted synthetic collision cases
+matched the review baseline. LastRegressionReview's ACL and restrictive-umask
+findings were addressed in FixWorkflow-regression-04 and the subsequent
+frozen build. These observations remain bounded by their individual receipts.
+
+FinalReviewEngine also recorded accepted limitations for intentionally
+conflicting marker representations. The bridge selects the first relevant
+GEOB or MP4 freeform item and prefers a FLAC Xiph marker over ID3; a later
+processed marker may therefore be concealed. Sync-like junk or nonadjacent
+ID3 tags may also hide a marker from prefix discovery. These are source-derived
+scenarios, not executed proof that the exact crafted inputs are decodable or
+that native behavior is identical. The CLI contract documents their scope.
+
+The v07 review changed bridge handling so read/seek errors do not become a
+source-container-unavailable status or cause a destination callback, and
+verified WAV rewrite modes under nine mode/umask combinations per platform.
+Other review rounds addressed transaction/overwrite and restore safety,
+container sniffing, duplicate ID3 markers, descriptor pinning and postflight
+validation. Their bounded checks and the earlier four-review history do not
+imply that adversarial concurrent modifications are impossible: a library file
+writable by another process is not made immutable by hashing or path pinning.
+Native library initializers may run before a post-load hash detects a change.
+
+Earlier unpatched Linux libFLAC builds differed on 24 retained cases; codec-03
+matched those cases after the FP-order/math corrections. Codec-04 traced 12
+later reported ARM battery differences to an obsolete pre-patch library and
+replayed those complete files successfully with codec-03. This is a
+build-provenance explanation for those cases, not proof of arbitrary FLAC
+identity. ALAC's later hostile sample-table review also rejected eight compact
+malformed fixtures on all three hosts before attempting an impossible index
+allocation. The bridge v07 directory-as-MP3 source case now fails instead of
+preserving the older bridge's accidental success; the CLI accepts regular
+source files only.
+
+An earlier `v0.0.0-dryrun` distribution exercise built packages for macOS
+arm64 and both Linux architectures, verified the extracted package checksums,
+and rebuilt both Linux native-library sets from the bundled sources with
+matching library hashes. One 8,192-frame silent WAV produced the same bytes on
+all three platforms. This was a pre-integration packaging experiment, not the
+v0.1.0 release package, universal parity evidence or legal clearance; no
+release or GHCR image was published by that exercise.
+
+### Correction to f01–f03 process time
+
+The original f01/f02/f03 observation files for native PID 99320 contain the
+incorrect parenthetical UTC launch time `(2026-10-27T21:36:13Z)`. The correct
+launch time is **2026-10-28T12:27:07Z**, corresponding to `lstart Wed Oct 28
+07:27:07 2026 CDT`. This note corrects the annotation only; the original
+observations are left unchanged and no missing context is inferred from it.
+
+No new native GUI drag-and-drop admission was tested in this release cycle
+without desktop-control approval. Picker and explicit open-route observations
+were made. Earlier bounded Ogg/OGA drag observations are retained below; they
+do not establish drag admission generally or imply a new test in this cycle.
+
 ## First pinned match
 
 The recorded reference was Platinum Notes 10.5.0.1256 on macOS arm64. Its two same-session exports, A and B, matched each other, and the corrected Rust debug and release outputs matched them as complete files for this case:
@@ -41,7 +277,7 @@ gentle warmth, Big Boost, active pitch, Official baseline and custom pitch.
 Its before/after hash receipts and outputs survive, but its executable bytes
 were not separately archived before that target path was rebuilt.
 
-The current source snapshot, including statistics and waveform changes, was
+That later archived source snapshot, including statistics and waveform changes, was
 built and its executables archived before comparison. Debug SHA-256
 `9575c5184067d0d55a367581a57bc43e3a1849877ed146f340e349f142830db9`
 and optimized release SHA-256
@@ -80,9 +316,9 @@ optimized release, SHA-256
 again matched both native references in all eight dynamics/pitch cases and all
 71 selected stable cases.
 
-## Final release build
+## Historical release build `dd4b5fd0`
 
-The final source adds `process --overwrite` and consumes the backup after a
+The then-final source added `process --overwrite` and consumed the backup after a
 verified restore; see the [CLI contract](../research/CLI_CONTRACT.md). Its
 optimized release, SHA-256
 `dd4b5fd05ac23bbf967e6688b71dee142ecdc1c3b399e42fe9f906ee9c7b9b98`
@@ -111,7 +347,7 @@ the input untouched, source replacement with a verified backup, rejection of an
 interdependent restore without changes, and backup consumption after restore.
 Receipt: `local-artifacts/hash-parity/release-final-dd4b5fd0.json`.
 
-The final binary also repeated the recorded candidate workflows. The W01 mixed
+The `dd4b5fd0` binary also repeated the recorded candidate workflows. The W01 mixed
 folder exited 1 with a partial failure for the Ogg file, and its three WAV
 outputs matched native. The W02 same-folder and mirror-tree outputs matched
 native; the mirror root matched native B, since native A has the known marker
@@ -124,6 +360,34 @@ native export, totals reached one song, eight dB and zero clips, and reset
 behaved as before. CLI waveform bins equaled the composed native decoder and
 reducer words for all four generated WAV fixtures. Receipt:
 `local-artifacts/hash-parity/release-final-dd4b5fd0-supplement.json`.
+
+## AAC decoder stack-context regression
+
+Adding a source-tag status field to the process report changed the caller's
+stack layout. On the tested macOS arm64 runtime, the same synthetic AAC input
+then decoded to different float32 samples inside `ExtAudioFileRead`, before
+any healing DSP. In a controlled debugger intervention, shifting only the stack
+pointer by 48 bytes at that call changed 83 of the first 512 decoded samples;
+the input, output buffers and FPCR were unchanged. Which AudioToolbox internals
+cause this is unverified.
+
+The planar reader now keeps its live `AudioBufferList` 64-byte aligned, which
+fixes the stack alignment at the read call regardless of the callers, without
+changing the list ABI or the sample buffers. The E04 and E10 AAC-to-WAV cases,
+tagged AAC-to-MP3 and four controlled-clock AAC-to-AAC exports then matched
+their native references as complete files, and previously matching format and
+DSP controls were replayed unchanged. These are bounded observations, not a
+guarantee for other compiler or macOS versions. Investigation receipts:
+`local-artifacts/hash-parity/aac-regression-01/`.
+
+An opt-in regression test checks exact decoded sample words for the pinned
+generated `aac-repeat-01.m4a` fixture:
+
+```sh
+PN_AAC_REGRESSION_SOURCE="$PWD/local-artifacts/apple-codecs/aac-repeat-01.m4a" \
+  cargo test --offline --locked --release --test apple_codec_reference \
+  pinned_aac_planar_decoder_samples_match_release_context -- --ignored --exact
+```
 
 ## Additional native boundary cases
 
@@ -226,25 +490,37 @@ From the repository root, the regular suite can be run without opting into refer
 cargo test --locked --all-targets
 ```
 
-Tests marked `#[ignore]` are excluded from that command. Some need a separately built public bridge and codecs; others require native reference captures or separate oracle programs. Do not infer that ignored cases passed. After building and configuring the public libraries as described in [BUILD.md](BUILD.md), the following explicitly runs the ignored synthetic engine, codec and CLI tests that use those public libraries, without requiring the proprietary reference application:
+Tests marked `#[ignore]` are excluded from that command. Some need separately
+built public libraries, additional public utilities, native captures or
+separate oracle programs. Do not infer that ignored cases passed. Read each
+test's prerequisites before opting in; running every ignored test is not a
+self-contained public test suite. For example, after building a trusted macOS
+v07 bridge as in [BUILD.md](BUILD.md), one generated-input bridge test can be
+selected explicitly:
 
 ```sh
 PN_TAG_BRIDGE="$DEPS/libpn-tag-bridge.dylib" \
-PLATINUM_TEST_TAG_BRIDGE="$DEPS/libpn-tag-bridge.dylib" \
-PN_FLAC_LIB="$FLAC_LIB" PN_FLAC_SHA256="$FLAC_SHA" \
-PN_LAME_LIB="$LAME_LIB" PN_LAME_SHA256="$LAME_SHA" \
-cargo test --locked --test engine_reference --test engine_codec_reference --test cli --test statistics_cli -- --ignored
+cargo test --locked --test engine_reference \
+  inspection_and_analysis_use_real_source_and_distinguish_malformed_markers \
+  -- --ignored --exact
 ```
 
 These integration tests use generated files and exercise their individual conditions; they do not establish complete original-app parity. Some regular tests also overlap with other reported runs, so do not add test counts as if all executions were distinct.
 
-The final private development snapshot passed 317 regular tests and left 92 opt-in tests ignored. The curated public snapshot passed the same 317 regular tests with 90 ignored; it excludes the two private diagnostic targets `aac_32k_fail_closed.rs` and `aac_writer_warning_probe.rs`, each holding one ignored test. The public-dependency engine/codec/CLI/statistics run passed 20 selected tests on the final source, including explicit marker admission, no-clobber, replacement/restore and post-publication accounting cancellation paths.
+The earlier `dd4b5fd0` private development snapshot passed 317 regular tests and left 92 opt-in tests ignored. Its curated public snapshot passed 317 regular tests with 90 ignored; it excluded the two private diagnostic targets `aac_32k_fail_closed.rs` and `aac_writer_warning_probe.rs`, each holding one ignored test. Its public-dependency engine/codec/CLI/statistics run passed 20 selected tests, including marker admission, no-clobber, replacement/restore and post-publication accounting cancellation paths. These are historical counts, not results for a later source snapshot.
 
 A separate opt-in replay consumed three captured native waveform-component input/output sequences and matched every float word. Four generated PCM16 WAV decoder cases (mono/stereo at 44.1/48 kHz, requesting 44.1 kHz) also matched every returned float byte and read boundary. The actual release CLI's waveform bins match the composition of those captured decoder words and the independently tested reducer. This is not a direct full-file GUI waveform capture, and other formats remain unverified on that path. Four historical pitch checkpoint comparisons and 96 generated Ogg decoder comparisons passed against captured or signed original components; none establishes full application parity.
 
 ## Public source boundary
 
-The public repository starts with independent history. It includes Rust sources, the public TagLib bridge source, synthetic tests, build instructions, typed preset parameters and the transformed human-readable template configuration required by the CLI. It excludes original serialized preset blobs, extracted compiled resources, screenshots, decompiler/disassembly exports, native libraries, audio captures and private research history. Optional reference tests may contain authored probe code or expect separately supplied captures; their presence does not mean those captures or proprietary components are distributed or needed by the production CLI. Static reconstruction and measured values are reference-derived, not a clean-room or licensing-clearance claim.
+The public repository starts with independent history. It includes Rust and portable sources, public TagLib bridge sources, synthetic tests, the reviewed FFT coefficient table and compact test fixtures, Linux build recipes, build instructions, typed preset parameters and the transformed human-readable template configuration required by the CLI. It excludes original serialized preset blobs, extracted compiled resources, screenshots, decompiler/disassembly exports, native libraries, audio captures and private research history. Optional reference tests may contain authored probe code or expect separately supplied captures; their presence does not mean those captures or proprietary components are distributed or needed by the production CLI. Static reconstruction and measured values are reference-derived, not a clean-room or licensing-clearance claim.
+
+Some source comments and explicitly ignored diagnostics intentionally name
+`local-artifacts` paths for private evidence. The ignore file and developer
+dual-host harness also name that directory to exclude generated data and
+constrain scratch outputs. These are historical locators or safety rules, not
+distributed fixtures or prerequisites for the regular public suite. The
+public files do not contain the private artifact directory.
 
 ## Remaining limits
 
@@ -252,9 +528,9 @@ The public repository starts with independent history. It includes Rust sources,
 - A Xing MP3 path without a recognized LAME tag makes the native updater read a reused caller byte. Static analysis shows that byte is part of the limiter AudioUnit handle and is nonzero on the in-process AudioToolbox creation path, so the CLI applies the nonzero branch. With that change the release CLI reproduced the retained original A/B/C export for the generated E05 case (644,959 bytes, SHA-256 `12b12b9ddff607fc9f82e38a25dd212518a6cbd462dc6aa3f44f79c7cf16971d`). The byte was not observed in the running app; see `local-artifacts/hash-parity/xing-nonzero-cutover-omp-01.json`.
 - In one interleaved AAC fixture, original MIKAudio and direct AudioToolbox reads matched within each process but produced different bits across fresh processes with the same recorded conditions. Rust and direct reads also matched in a same-process diagnostic. By user decision, the decoding target is the native same-process result; the cross-process cause remains unknown.
 - A separate direct-system AAC experiment compared untouched FPSR against clearing it before each read: 48 readers across 12 fresh processes all produced identical float streams, despite nonzero untouched FPSR values. It did not reproduce or explain the historical variability; the original app and MIKAudio wrapper were not used.
-- AAC and ALAC outputs store one wall-clock second in all six `mvhd`/`tkhd`/`mdhd` creation and modification fields, so native repeats differ from each other. By user decision, an MP4 case passes when the CLI, given a native export's recorded second through the hidden `--controlled-mp4-time-1904` diagnostic option, reproduces that export's complete bytes. Release `1bd3b8164307a543d4f6c9f8cf9811d167f1cefa4c83e7e8f23fc012ab149ece` did so for all ten retained ALAC, AAC and ALAC-match-input exports (`local-artifacts/hash-parity/mp4-controlled-clock-omp-01.json`), and the final release repeated it. Normal processing keeps the AudioToolbox clock; the native clock-sampling phase is not observed.
+- AAC and ALAC outputs store one wall-clock second in all six `mvhd`/`tkhd`/`mdhd` creation and modification fields, so native repeats differ from each other. By user decision, an MP4 case passes when the CLI, given a native export's recorded second through the hidden `--controlled-mp4-time-1904` diagnostic option, reproduces that export's complete bytes. Historical release `1bd3b8…` did so for all ten retained ALAC, AAC and ALAC-match-input exports (`local-artifacts/hash-parity/mp4-controlled-clock-omp-01.json`), and `dd4b5fd0…` repeated it. Normal processing keeps the AudioToolbox clock; the native clock-sampling phase is not observed.
 - A generated 32 kHz AAC match-input case made the original publish an invalid 28-byte M4A after a warning. The CLI refuses to publish that output by design; the user selected this safety behavior rather than reproducing the invalid file.
-- A replaced file's marker stores the absolute backup path, so replacement output depends on that path. The single native W04 replacement and the candidate's differed only in that string; every other decoded marker field and every non-marker chunk matched. No final-build replacement at the native backup path was compared.
+- A replaced file's marker stores the absolute backup path, so replacement output depends on that path. The single native W04 replacement and an earlier candidate differed only in that string; every other decoded marker field and every non-marker chunk matched. The `dd4b5fd0` build did not compare replacement at the native backup path.
 - The original's normal picker disabled generated `.ogg` and `.oga`, Add Folders omitted them, and later selected drags and explicit-app file opens admitted neither. A supported WAV control was admitted by drag and processed through explicit-app handoff. These are bounded application-admission observations, not proof of decoder invocation. Lower-level original/Rust Ogg decoders matched 96 generated cases; that does not establish whole-application Ogg processing.
 - Additional inputs, templates, correction/compression modes, rates, output formats and process contexts require their own repeatable, complete-file comparisons.
 

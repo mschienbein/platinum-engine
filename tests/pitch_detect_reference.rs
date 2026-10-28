@@ -74,13 +74,10 @@ fn original_tuning_function_matches_synthetic_aggregates() {
 #[ignore = "requires PITCH_APP_REFERENCE_INPUT, the pinned generated WAV used for original captures A and B"]
 fn original_app_tuning_matches_pinned_generated_input() {
     use platinum_engine::apple_codec::Reader;
-    use std::process::Command;
 
     let path = std::env::var_os("PITCH_APP_REFERENCE_INPUT").expect("pinned generated input path");
-    let digest = Command::new("/usr/bin/shasum").args(["-a", "256"]).arg(&path).output().unwrap();
-    assert!(digest.status.success(), "cannot fingerprint generated input");
-    let digest = String::from_utf8(digest.stdout).unwrap();
-    assert_eq!(digest.split_whitespace().next().unwrap(),
+    let digest = platinum_engine::mp3::file_sha256(&path).unwrap();
+    assert_eq!(digest,
         "2de421ff4f080693c78a24947ad856d9db8f86c5909f42252187307aa820f884");
     let mut reader = Reader::open(path, None).unwrap();
     assert_eq!(reader.source_format().sample_rate, 48_000.0);

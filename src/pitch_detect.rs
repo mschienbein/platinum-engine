@@ -11,6 +11,7 @@ use std::ffi::c_void;
 use std::fmt;
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
 const FRAME: usize = 4096;
 const HALF: usize = FRAME / 2;
@@ -27,11 +28,15 @@ const WHITEN_GATE: f32 = f32::from_bits(0x38d1_b717);
 const QUALITY: usize = 6;
 const SINC_TABLE: usize = QUALITY * 256;
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[repr(C)]
 struct SplitComplex {
     real: *mut f32,
     imaginary: *mut f32,
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::vdsp::{SplitComplex, vDSP_ctoz, vDSP_zvabs, vDSP_dotpr, vDSP_rmsqv,
+    vDSP_maxvi, vDSP_vadd, vDSP_vsub, vDSP_vmul, vDSP_vdiv, vDSP_vsmul};
 
 #[repr(C)]
 struct Sincos {
@@ -39,6 +44,7 @@ struct Sincos {
     cosine: f32,
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
     fn vDSP_create_fftsetup(log2n: usize, radix: i32) -> *mut c_void;
@@ -66,12 +72,20 @@ unsafe extern "C" {
                   output: *mut f32, output_stride: isize, length: usize);
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "sinf"] fn host_sinf(value: f32) -> f32;
     #[link_name = "cosf"] fn host_cosf(value: f32) -> f32;
     #[link_name = "atan2f"] fn host_atan2f(y: f32, x: f32) -> f32;
     #[link_name = "fmodf"] fn host_fmodf(x: f32, y: f32) -> f32;
     #[link_name = "__sincosf_stret"] fn host_sincosf(value: f32) -> Sincos;
+}
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{sinf as host_sinf, cosf as host_cosf, atan2f as host_atan2f, fmodf as host_fmodf};
+#[cfg(any(target_os = "linux", feature = "portable"))]
+fn host_sincosf(value: f32) -> Sincos {
+    let pair = crate::portable::math::sincosf(value);
+    Sincos { sine: pair.sine, cosine: pair.cosine }
 }
 
 #[inline] fn sinf(x: f32) -> f32 { unsafe { host_sinf(x) } }
@@ -143,6 +157,30 @@ fn zeros(len: usize) -> Result<Vec<f32>, PitchDetectionError> {
     Ok(data)
 }
 
+#[repr(C, align(64))]
+struct PackedBlock([f32; 16]);
+struct PackedBuffer(Box<[PackedBlock]>);
+impl PackedBuffer {
+    fn new() -> Result<Self, PitchDetectionError> {
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(FRAME / 16).map_err(|_| PitchDetectionError::AllocationFailed)?;
+        blocks.resize_with(FRAME / 16, || PackedBlock([0.0; 16]));
+        Ok(Self(blocks.into_boxed_slice()))
+    }
+}
+impl std::ops::Deref for PackedBuffer {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        // PackedBlock has exactly 16 contiguous initialized f32s and no padding.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast(), FRAME) }
+    }
+}
+impl std::ops::DerefMut for PackedBuffer {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast(), FRAME) }
+    }
+}
+
 // 0x10007d17c/1cc/474: the selected six-lobe sinc/Bessel table and
 // consecutive first differences. The Bessel termination comparison is f64.
 fn sinc_table() -> ([f32; SINC_TABLE], [f32; SINC_TABLE]) {
@@ -209,8 +247,8 @@ impl Resampler {
         }
         // The selected integer phase increment must be positive; otherwise the
         // native inner loop cannot progress. Reject arithmetic overflow as well.
-        let increment = ((ratio * 256.0).min(256.0) * 128.0) as f64 + 0.5;
-        let required = (step.max(1.0) * 7.0) + 1.0;
+        let increment = ((ratio * 256.0).arm_min(256.0) * 128.0) as f64 + 0.5;
+        let required = (step.arm_max(1.0) * 7.0) + 1.0;
         if increment < 1.0 || required > (i32::MAX / 8) as f32 {
             return Err(PitchDetectionError::InvalidSampleRate);
         }
@@ -241,7 +279,7 @@ impl Resampler {
 
     fn process(&mut self, input: &[f32]) {
         // State names correspond to 0x10007d53c's +10,+14,+18,+28,+50.
-        let wanted = ((self.step.max(1.0) * 7.0) + 1.0).max(self.width as f32) as i32;
+        let wanted = ((self.step.arm_max(1.0) * 7.0) + 1.0).arm_max(self.width as f32) as i32;
         let growth = wanted - self.width;
         if growth != 0 {
             self.width = wanted;
@@ -259,7 +297,7 @@ impl Resampler {
             self.first = false;
         }
         self.pending += self.buffered_prefix;
-        let phase_increment = (((self.ratio * 256.0).min(256.0) * 128.0) as f64 + 0.5) as i32;
+        let phase_increment = (((self.ratio * 256.0).arm_min(256.0) * 128.0) as f64 + 0.5) as i32;
         let gain = if self.ratio < 1.0 { self.ratio * f32::from_bits(0x3f7d_70a4) }
                    else { f32::from_bits(0x3f7d_70a4) };
         self.output.clear();
@@ -376,10 +414,13 @@ fn make_bands() -> (Vec<Band>, Vec<f32>) {
 }
 
 struct Spectrum {
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     fft: *mut c_void,
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    fft: crate::portable::fft::FftSetup,
     frame: Vec<f32>,
     window: Vec<f32>,
-    packed: Vec<f32>,
+    packed: PackedBuffer,
     bands: Vec<Band>,
     band_coefficients: Vec<f32>,
     smoothing: [f32; 19],
@@ -397,6 +438,7 @@ struct Spectrum {
     extracted: [f32; BINS],
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 impl Drop for Spectrum {
     fn drop(&mut self) { unsafe { vDSP_destroy_fftsetup(self.fft) }; }
 }
@@ -404,7 +446,7 @@ impl Drop for Spectrum {
 impl Spectrum {
     fn new() -> Result<Self, PitchDetectionError> {
         let frame = zeros(FRAME)?;
-        let packed = zeros(FRAME)?;
+        let packed = PackedBuffer::new()?;
         let mut window = zeros(FRAME)?;
         for (i, w) in window.iter_mut().enumerate() {
             let angle = ((i as f32 + 1.0) * TWO_PI) / 4097.0;
@@ -442,8 +484,14 @@ impl Spectrum {
             *count = ((chosen + 1) as usize).min(20);
         }
         // FFT_RADIX2 == 0; the selected reference calls create_fftsetup(12, 0).
-        let fft = unsafe { vDSP_create_fftsetup(12, 0) };
-        if fft.is_null() { return Err(PitchDetectionError::FftSetupFailed); }
+        #[cfg(all(target_os = "macos", not(feature = "portable")))]
+        let fft = {
+            let fft = unsafe { vDSP_create_fftsetup(12, 0) };
+            if fft.is_null() { return Err(PitchDetectionError::FftSetupFailed); }
+            fft
+        };
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        let fft = crate::portable::fft::FftSetup::new(12);
         Ok(Self { fft, frame, window, packed, bands, band_coefficients,
                   smoothing, smoothing_sum, bin_window, partial_offsets,
                   partial_weights, partial_suppress, partial_count,
@@ -464,18 +512,30 @@ impl Spectrum {
     fn analyze(&mut self, frame: &[f32; FRAME], result: &mut [f32; BINS]) {
         self.frame.copy_from_slice(frame);
         mul_in_place(&mut self.frame, &self.window);
-        let mut split = SplitComplex {
-            real: self.packed.as_mut_ptr(),
-            imaginary: unsafe { self.packed.as_mut_ptr().add(HALF) },
-        };
-        unsafe {
-            vDSP_ctoz(self.frame.as_ptr(), 2, &mut split, 1, HALF);
-            vDSP_fft_zrip(self.fft, &mut split, 1, 12, 1);
+        {
+            // Both planes share one raw provenance; no slice reborrow occurs
+            // until the descriptor and its pointers are out of use.
+            let base = self.packed.as_mut_ptr();
+            let mut split = SplitComplex { real: base, imaginary: unsafe { base.add(HALF) } };
+            unsafe { vDSP_ctoz(self.frame.as_ptr(), 2, &mut split, 1, HALF); }
+            #[cfg(all(target_os = "macos", not(feature = "portable")))]
+            unsafe { vDSP_fft_zrip(self.fft, &mut split, 1, 12, 1); }
+        }
+        #[cfg(any(target_os = "linux", feature = "portable"))]
+        {
+            let (real, imaginary) = self.packed.split_at_mut(HALF);
+            self.fft.forward(real, imaginary);
         }
         scale_in_place(&mut self.packed, 0.5);
         let nyquist = self.packed[HALF];
         self.packed[HALF] = 0.0;
-        unsafe { vDSP_zvabs(&split, 1, self.packed.as_mut_ptr(), 1, HALF) };
+        {
+            // Earlier slice accesses invalidate the old raw pointers. Derive
+            // the in-place destination and both input planes from a fresh base.
+            let base = self.packed.as_mut_ptr();
+            let split = SplitComplex { real: base, imaginary: unsafe { base.add(HALF) } };
+            unsafe { vDSP_zvabs(&split, 1, base, 1, HALF) };
+        }
         self.packed[HALF] = nyquist;
         scale_in_place(&mut self.packed, 2.0 / FRAME as f32);
         for (i, band) in self.bands.iter().enumerate() {
@@ -702,6 +762,31 @@ impl PitchDetector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detector_fft_planes_are_64_byte_aligned() {
+        let packed = super::PackedBuffer::new().unwrap();
+        assert_eq!(packed.as_ptr() as usize % 64, 0);
+        assert_eq!(unsafe { packed.as_ptr().add(super::HALF) } as usize % 64, 0);
+    }
+
+    #[test]
+    fn spectrum_analysis_reuses_both_packed_planes() {
+        let mut spectrum = super::Spectrum::new().unwrap();
+        let mut frame = [0.0f32; super::FRAME];
+        for (i, sample) in frame.iter_mut().enumerate() {
+            *sample = ((i * 37 % 251) as f32 - 125.0) / 128.0;
+        }
+        let mut first = [0.0; super::BINS];
+        let mut second = [0.0; super::BINS];
+        spectrum.analyze(&frame, &mut first);
+        spectrum.packed.fill(123.0);
+        spectrum.analyze(&frame, &mut second);
+        assert!(first.iter().any(|value| *value != 0.0));
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
     #[test]
     fn whitening_right_edge_matches_native_synthetic_output() {
         let mut spectrum = super::Spectrum::new().unwrap();

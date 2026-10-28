@@ -4,9 +4,11 @@
 //! dynamics engine.
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
 const LOG_200: f64 = f64::from_bits(0x4015_317a_1b94_9c53);
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "exp"]
     fn system_exp(value: f64) -> f64;
@@ -22,6 +24,14 @@ unsafe extern "C" {
     fn system_logb(value: f64) -> f64;
     #[link_name = "scalbn"]
     fn system_scalbn(value: f64, exponent: i32) -> f64;
+}
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::{exp as system_exp, sin as system_sin, expf as system_expf,
+    logf as system_logf, logb as system_logb, scalbn as system_scalbn};
+#[cfg(any(target_os = "linux", feature = "portable"))]
+fn system_sincos(value: f64) -> SineCosine {
+    let pair = crate::portable::math::sincos(value);
+    SineCosine { sine: pair.sine, cosine: pair.cosine }
 }
 
 // Darwin arm64 returns this homogeneous two-double aggregate in d0/d1.
@@ -44,8 +54,7 @@ fn crossover_coefficients(
     mode: CrossoverMode,
 ) -> [f64; 5] {
     let rate = f64::from(sample_rate);
-    let cutoff = (rate * f64::from_bits(0x3fdf_5c28_f5c2_8f5c))
-        .min(f64::from(frequency_hz));
+    let cutoff = (rate * f64::from_bits(0x3fdf_5c28_f5c2_8f5c)).arm_min(f64::from(frequency_hz));
     let angle = (cutoff * f64::from_bits(0x4019_21fb_5444_2d18)) / rate;
     // This libSystem primitive returns both values from one range reduction.
     let pair = unsafe { system_sincos(angle) };
@@ -53,11 +62,11 @@ fn crossover_coefficients(
     let alpha = pair.sine / (q + q);
     let (b0, b1, b2) = match mode {
         CrossoverMode::Low => {
-            let edge = (-pair.cosine).mul_add(0.5, 0.5);
+            let edge = (-pair.cosine).arm_mul_add(0.5, 0.5);
             (edge, 1.0 - pair.cosine, edge)
         }
         CrossoverMode::High => {
-            let edge = pair.cosine.mul_add(0.5, 0.5);
+            let edge = pair.cosine.arm_mul_add(0.5, 0.5);
             (edge, -(pair.cosine + 1.0), edge)
         }
         CrossoverMode::SummingAllpass => {
@@ -101,12 +110,12 @@ fn state_variable_coefficients(coefficients: [f64; 5]) -> [f64; 5] {
     } else {
         (0.0, (-second).sqrt())
     };
-    let product = real1.mul_add(real2, -(imaginary1 * imaginary2));
-    let exponent = (unsafe { system_logb(real2.max(imaginary2)) } as i32).wrapping_neg();
+    let product = real1.arm_mul_add(real2, -(imaginary1 * imaginary2));
+    let exponent = (unsafe { system_logb(real2.arm_max(imaginary2)) } as i32).wrapping_neg();
     let scaled_real = unsafe { system_scalbn(real2, exponent) };
     let scaled_imaginary = unsafe { system_scalbn(imaginary2, exponent) };
-    let magnitude = scaled_imaginary.mul_add(scaled_imaginary, scaled_real * scaled_real);
-    let numerator = imaginary1.mul_add(scaled_imaginary, real1 * scaled_real);
+    let magnitude = scaled_imaginary.arm_mul_add(scaled_imaginary, scaled_real * scaled_real);
+    let numerator = imaginary1.arm_mul_add(scaled_imaginary, real1 * scaled_real);
     let g = unsafe { system_scalbn(numerator / magnitude, exponent) };
     let k = (a2 - 1.0) / product;
     let high = ((b0 - b1) + b2) / ((1.0 - a1) + a2);
@@ -151,7 +160,7 @@ impl CrossoverSection {
     fn frame(&mut self, input: [f32; 4]) -> [f32; 4] {
         let [g, k, high_gain, band_gain, low_gain] = self.coefficients;
         let k2_g = (k + k) + g;
-        let scale = 1.0 / k2_g.mul_add(g, 1.0);
+        let scale = 1.0 / k2_g.arm_mul_add(g, 1.0);
         let scale_g = scale * g;
         let twice_g = g + g;
         let negative_twice_k = k * -2.0;
@@ -160,19 +169,19 @@ impl CrossoverSection {
             let x = f64::from(input[channel]);
             let s1 = self.integrator_1[channel];
             let s2 = self.integrator_2[channel];
-            let temporary = x.mul_add(g, s1);
-            let mixed = temporary.mul_add(k2_g, s2);
-            let temporary = (-s2).mul_add(g, temporary);
-            let low = temporary.mul_add(scale_g, s2);
+            let temporary = x.arm_mul_add(g, s1);
+            let mixed = temporary.arm_mul_add(k2_g, s2);
+            let temporary = (-s2).arm_mul_add(g, temporary);
+            let low = temporary.arm_mul_add(scale_g, s2);
             let difference = x - low;
-            let high = (-mixed).mul_add(scale, x);
-            let band = high.mul_add(g, s1);
-            let feedback = band.mul_add(negative_twice_k, difference);
-            self.integrator_1[channel] = feedback.mul_add(twice_g, s1);
-            self.integrator_2[channel] = band.mul_add(twice_g, s2);
+            let high = (-mixed).arm_mul_add(scale, x);
+            let band = high.arm_mul_add(g, s1);
+            let feedback = band.arm_mul_add(negative_twice_k, difference);
+            self.integrator_1[channel] = feedback.arm_mul_add(twice_g, s1);
+            self.integrator_2[channel] = band.arm_mul_add(twice_g, s2);
             let value = low * low_gain;
-            let value = high.mul_add(high_gain, value);
-            output[channel] = band.mul_add(band_gain, value) as f32;
+            let value = high.arm_mul_add(high_gain, value);
+            output[channel] = band.arm_mul_add(band_gain, value) as f32;
         }
         output
     }
@@ -495,8 +504,8 @@ impl ChunkRamp {
     fn advance(&mut self) -> f32 {
         let counter = self.counter;
         self.counter = counter + 1.0;
-        let position = counter.mul_add(self.step, self.step);
-        self.current = position.mul_add(self.target - self.start, self.start);
+        let position = counter.arm_mul_add(self.step, self.step);
+        self.current = position.arm_mul_add(self.target - self.start, self.start);
         self.current
     }
 }
@@ -652,10 +661,10 @@ impl BandRouteMixer {
         } else {
             let mut value = self.ramp.current;
             for index in 0..count {
-                first_left[index] += (-value).mul_add(input_left[index], input_left[index]);
-                first_right[index] += (-value).mul_add(input_right[index], input_right[index]);
-                second_left[index] = input_left[index].mul_add(value, second_left[index]);
-                second_right[index] = input_right[index].mul_add(value, second_right[index]);
+                first_left[index] += (-value).arm_mul_add(input_left[index], input_left[index]);
+                first_right[index] += (-value).arm_mul_add(input_right[index], input_right[index]);
+                second_left[index] = input_left[index].arm_mul_add(value, second_left[index]);
+                second_right[index] = input_right[index].arm_mul_add(value, second_right[index]);
                 value = self.ramp.advance();
             }
         }
@@ -702,8 +711,8 @@ impl LaneDryWetMixer {
         } else if ramp || (!mix.is_nan() && mix > f32::from_bits(0x3580_0000)) {
             let mut value = self.ramp.current;
             for index in 0..count {
-                dry_left[index] = (wet_left[index] - dry_left[index]).mul_add(value, dry_left[index]);
-                dry_right[index] = (wet_right[index] - dry_right[index]).mul_add(value, dry_right[index]);
+                dry_left[index] = (wet_left[index] - dry_left[index]).arm_mul_add(value, dry_left[index]);
+                dry_right[index] = (wet_right[index] - dry_right[index]).arm_mul_add(value, dry_right[index]);
                 value = self.ramp.advance();
             }
         }
@@ -733,7 +742,7 @@ pub fn lane_stereo_gains(
     } else {
         gain
     };
-    let fraction = pan.mul_add(0.5, 0.5);
+    let fraction = pan.arm_mul_add(0.5, 0.5);
     let angle = f64::from(fraction) * f64::from_bits(0x3ff9_21fb_5444_2d18);
     let pair = unsafe { system_sincos(angle) };
     let root_two = f64::from_bits(0x3ff6_a09e_667f_3bcd);
@@ -1488,7 +1497,7 @@ impl CrossoverFrequencyScale {
 
     /// Convert the host's f32 normalized value to the physical split in Hz.
     pub fn from_normalized(&self, normalized: f32) -> f32 {
-        let exponent = (self.log_max - self.log_min).mul_add(normalized, self.log_min);
+        let exponent = (self.log_max - self.log_min).arm_mul_add(normalized, self.log_min);
         let frequency = unsafe { system_expf(exponent) } - 0.0;
         clamp_crossover_frequency(frequency)
     }
@@ -1523,7 +1532,7 @@ fn clamp_crossover_frequency(frequency_hz: f32) -> f32 {
 /// This does not deliver an editor or DSP event.
 pub fn lane_gain_from_normalized(normalized: f32) -> f32 {
     let span = LANE_GAIN_LOG_MAX - LANE_GAIN_LOG_MIN;
-    let exponent = span.mul_add(normalized, LANE_GAIN_LOG_MIN);
+    let exponent = span.arm_mul_add(normalized, LANE_GAIN_LOG_MIN);
     let physical = unsafe { system_expf(exponent) } - LANE_GAIN_SHIFT;
     clamp_lane_gain(physical)
 }
@@ -1558,8 +1567,8 @@ pub(crate) fn native_linear_modulation(
 ) -> [f32; 2] {
     let amount = secondary_depth * depth;
     [
-        amount.mul_add(source[0], previous[0]),
-        amount.mul_add(source[1], previous[1]),
+        amount.arm_mul_add(source[0], previous[0]),
+        amount.arm_mul_add(source[1], previous[1]),
     ]
 }
 
@@ -1579,14 +1588,14 @@ impl LaneModelField {
     pub fn model_event_value(self, raw_physical: f32, normalized_modulation: f32) -> f32 {
         if self == Self::Gain {
             let normalized = lane_gain_to_normalized(raw_physical);
-            let target = (normalized + normalized_modulation).max(0.0).min(1.0);
+            let target = (normalized + normalized_modulation).arm_max(0.0).arm_min(1.0);
             return lane_gain_from_normalized(target);
         }
         let low = if self == Self::Pan { -1.0_f32 } else { 0.0_f32 };
-        let physical = raw_physical.max(low).min(1.0);
+        let physical = raw_physical.arm_max(low).arm_min(1.0);
         let normalized = (physical - low) / (1.0 - low);
-        let target = (normalized + normalized_modulation).max(0.0).min(1.0);
-        (1.0 - low).mul_add(target, low).max(low).min(1.0)
+        let target = (normalized + normalized_modulation).arm_max(0.0).arm_min(1.0);
+        (1.0 - low).arm_mul_add(target, low).arm_max(low).arm_min(1.0)
     }
 }
 
@@ -1611,7 +1620,7 @@ impl TransientModelField {
             Self::Pump => (0.0_f32, 1.0_f32),
             Self::Speed => (f32::from_bits(0x3e4c_cccd), 5.0_f32),
         };
-        let physical = raw_physical.max(low).min(high);
+        let physical = raw_physical.arm_max(low).arm_min(high);
         let normalized = if self == Self::Speed {
             let log_min = f32::from_bits(0xbfce_0210);
             let log_max = f32::from_bits(0x3fce_0210);
@@ -1619,15 +1628,15 @@ impl TransientModelField {
         } else {
             (physical - low) / (high - low)
         };
-        let value = (normalized + normalized_modulation).max(0.0).min(1.0);
+        let value = (normalized + normalized_modulation).arm_max(0.0).arm_min(1.0);
         let mapped = if self == Self::Speed {
             let log_min = f32::from_bits(0xbfce_0210);
             let log_max = f32::from_bits(0x3fce_0210);
-            math::expf((log_max - log_min).mul_add(value, log_min)) - 0.0
+            math::expf((log_max - log_min).arm_mul_add(value, log_min)) - 0.0
         } else {
-            (high - low).mul_add(value, low)
+            (high - low).arm_mul_add(value, low)
         };
-        mapped.max(low).min(high)
+        mapped.arm_max(low).arm_min(high)
     }
 }
 
@@ -1717,11 +1726,10 @@ pub fn dynamics_parameter_writes(
         let threshold_value = controller_clamp((threshold + 50.0) / 50.0);
         let ratio_value = controller_clamp(
             (normalized_ratio(ratio) + -0.39810247645474695) / 0.601897523545253,
-        )
-        .max(1e-8);
+        ).arm_max(1e-8);
         let offset_gain = if gain < -24.0 { gain + 24.0 } else { 0.0 };
-        let input_gain = controller_clamp((offset_gain + 24.0) / 48.0).max(1e-8);
-        let output_gain = controller_clamp((gain + 24.0) / 48.0).max(1e-8);
+        let input_gain = controller_clamp((offset_gain + 24.0) / 48.0).arm_max(1e-8);
+        let output_gain = controller_clamp((gain + 24.0) / 48.0).arm_max(1e-8);
         for (base, value) in [
             (117, threshold_value),
             (121, ratio_value),

@@ -9,6 +9,8 @@
 #import <CommonCrypto/CommonDigest.h>
 
 #include <aifffile.h>
+#include <apefooter.h>
+#include <apetag.h>
 #include <attachedpictureframe.h>
 #include <commentsframe.h>
 #include <flacfile.h>
@@ -31,6 +33,7 @@
 #include <tpropertymap.h>
 #include <wavfile.h>
 #include <xiphcomment.h>
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +50,71 @@ using Frame = ID3v2::Frame;
 using Picture = ID3v2::AttachedPictureFrame;
 using Comment = ID3v2::CommentsFrame;
 using GEOB = ID3v2::GeneralEncapsulatedObjectFrame;
+
+struct SourceContainerUnavailable : std::runtime_error {
+    explicit SourceContainerUnavailable(const char *message) : std::runtime_error(message) {}
+};
+
+
+// Record I/O failures even when TagLib can continue parsing the source.
+class CheckedInputStream : public FileStream {
+    mutable bool failed = false;
+    void observe() const { if (errno != 0) failed = true; }
+public:
+    explicit CheckedInputStream(const char *path) : FileStream(path, true) {}
+    bool had_io_error() const { return failed; }
+    ByteVector readBlock(unsigned long length) override {
+        const long start = tell();
+        const long end = this->length();
+        errno = 0;
+        ByteVector result = FileStream::readBlock(length);
+        observe();
+        if (start >= 0 && end > start) {
+            const auto remaining = static_cast<unsigned long>(end - start);
+            const auto expected = length < remaining ? length : remaining;
+            if (result.size() < expected) failed = true;
+        }
+        return result;
+    }
+    void seek(long offset, Position position = Beginning) override {
+        errno = 0;
+        FileStream::seek(offset, position);
+        if (errno == EINVAL && offset < 0) {
+            // TagLib probes for trailing tags even on files shorter than the
+            // tag; its legacy stream ignores seeks before the start of file.
+            errno = 0;
+            const long base = position == Beginning ? 0 :
+                              position == Current ? FileStream::tell() : FileStream::length();
+            if (base >= 0 && offset < -base) { errno = 0; return; }
+            failed = true;
+            return;
+        }
+        observe();
+    }
+    long tell() const override {
+        errno = 0;
+        long result = FileStream::tell();
+        if (result < 0) failed = true;
+        observe();
+        return result;
+    }
+    long length() override {
+        errno = 0;
+        long result = FileStream::length();
+        if (result < 0) failed = true;
+        observe();
+        return result;
+    }
+};
+
+void check_source(const CheckedInputStream &input) {
+    if (input.had_io_error()) throw std::runtime_error("source tag stream I/O failed");
+}
+
+void require_source(bool condition, const char *message, const CheckedInputStream &input) {
+    check_source(input);
+    if (!condition) throw SourceContainerUnavailable(message);
+}
 
 class WavFile : public RIFF::WAV::File {
 public:
@@ -143,7 +211,8 @@ struct State {
     Ogg::XiphComment *xiph = nullptr;
     MP4::Tag *m4 = nullptr;
 
-    State(int kind, const char *path, bool write, bool normalize_id3 = true) : format(kind), stream(new FileStream(path, !write)) {
+    State(int kind, const char *path, bool write, bool normalize_id3 = true)
+        : format(kind), stream(write ? new FileStream(path, false) : new CheckedInputStream(path)) {
         require(stream->isOpen(), "cannot open tag file");
         switch (kind) {
         case PN_TAG_MP3:
@@ -161,7 +230,9 @@ struct State {
             file.reset(flac); break;
         default: throw std::runtime_error("unknown tag format");
         }
-        require(file->isValid(), "invalid source or destination container");
+        if (write) require(file->isValid(), "invalid source or destination container");
+        else require_source(file->isValid(), "invalid source tag container",
+                            *static_cast<CheckedInputStream *>(stream.get()));
         switch (kind) {
         case PN_TAG_MP3:
             v1 = mp3->ID3v1Tag(false);
@@ -175,9 +246,13 @@ struct State {
         case PN_TAG_FLAC:
             xiph = flac->xiphComment(true); v2 = flac->ID3v2Tag(false); v1 = flac->ID3v1Tag(false); break;
         }
-        require((kind != PN_TAG_MP4 || m4) && (kind != PN_TAG_WAV || v2) &&
-                (kind != PN_TAG_AIFF || v2) && (kind != PN_TAG_FLAC || xiph), "tag object unavailable");
+        bool available = (kind != PN_TAG_MP4 || m4) && (kind != PN_TAG_WAV || v2) &&
+                         (kind != PN_TAG_AIFF || v2) && (kind != PN_TAG_FLAC || xiph);
+        if (write) require(available, "tag object unavailable");
+        else require_source(available, "source tag object unavailable",
+                            *static_cast<CheckedInputStream *>(stream.get()));
     }
+    void check_source() const { ::check_source(*static_cast<CheckedInputStream *>(stream.get())); }
     Tag *primary() const { return format == PN_TAG_MP4 ? static_cast<Tag *>(m4) : static_cast<Tag *>(v2); }
     String id3_string(int which) const {
         String value = String::null;
@@ -478,11 +553,11 @@ std::optional<std::vector<uint8_t>> flac_marker(State &s) {
     return std::nullopt;
 }
 
-std::optional<ByteVector> wav_marker(State &s, bool collect = true) {
-    const long length = s.wav->length();
+std::optional<ByteVector> wav_marker(WavFile &wav, bool collect = true) {
+    const long length = wav.length();
     require(length >= 12, "truncated WAV header");
-    s.wav->seek(0);
-    ByteVector header = s.wav->readBlock(12);
+    wav.seek(0);
+    ByteVector header = wav.readBlock(12);
     require(header.size() == 12 && header.mid(0, 4) == "RIFF" && header.mid(8, 4) == "WAVE", "invalid WAV header");
     const auto *p = reinterpret_cast<const uint8_t *>(header.data());
     const uint32_t riff = uint32_t(p[4]) | (uint32_t(p[5]) << 8) | (uint32_t(p[6]) << 16) | (uint32_t(p[7]) << 24);
@@ -493,8 +568,8 @@ std::optional<ByteVector> wav_marker(State &s, bool collect = true) {
     std::optional<ByteVector> result;
     while (position < end) {
         require(end - position >= 8, "truncated WAV chunk header");
-        s.wav->seek(static_cast<long>(position));
-        ByteVector chunk = s.wav->readBlock(8);
+        wav.seek(static_cast<long>(position));
+        ByteVector chunk = wav.readBlock(8);
         require(chunk.size() == 8, "cannot read WAV chunk header");
         const auto *q = reinterpret_cast<const uint8_t *>(chunk.data());
         // The original WAV parser accepts only ASCII letters, digits and
@@ -507,7 +582,7 @@ std::optional<ByteVector> wav_marker(State &s, bool collect = true) {
         position += 8;
         require(uint64_t(n) + (n & 1) <= end - position, "truncated WAV chunk");
         if (collect && chunk.mid(0, 4) == "PLTN" && (n >= 4 || !substantial_seen)) {
-            ByteVector bytes = s.wav->readBlock(n);
+            ByteVector bytes = wav.readBlock(n);
             require(bytes.size() == n, "cannot read WAV PLTN payload");
             result = bytes;
             if (n >= 4) substantial_seen = true;
@@ -527,6 +602,59 @@ std::optional<ByteVector> id3_marker(ID3 *tag) {
     return std::nullopt;
 }
 
+void validate_aiff(RIFF::AIFF::File &aiff, bool source, const CheckedInputStream *input = nullptr) {
+    auto check = [source, input](bool condition, const char *message) {
+        if (source) require_source(condition, message, *input);
+        else require(condition, message);
+    };
+    check(aiff.length() >= 12, "truncated AIFF header");
+    aiff.seek(0);
+    ByteVector header = aiff.readBlock(12);
+    check(header.size() == 12 && header.mid(0, 4) == "FORM" &&
+          (header.mid(8, 4) == "AIFF" || header.mid(8, 4) == "AIFC"), "invalid AIFF header");
+    const auto *p = reinterpret_cast<const uint8_t *>(header.data());
+    const uint32_t size = (uint32_t(p[4]) << 24) | (uint32_t(p[5]) << 16) |
+                          (uint32_t(p[6]) << 8) | uint32_t(p[7]);
+    check(size >= 4 && uint64_t(size) + 8 <= static_cast<uint64_t>(aiff.length()), "invalid AIFF FORM length");
+}
+
+// A sync-like word may occur inside another format, notably Ogg. Check every
+// frame through the end of audio, excluding recognized trailing ID3v1/APE tags.
+bool valid_mpeg_destination(MPEG::File &file) {
+    long end = file.length();
+    if (end < 0) return false;
+    if (file.hasID3v1Tag()) {
+        if (end < 128) return false;
+        end -= 128;
+    }
+    if (file.hasAPETag()) {
+        APE::Tag *tag = file.APETag(false);
+        if (!tag || !tag->footer()) return false;
+        const unsigned size = tag->footer()->completeTagSize();
+        if (size > static_cast<unsigned long>(end)) return false;
+        end -= size;
+    }
+    long offset = file.firstFrameOffset();
+    while (offset >= 0 && offset < end) {
+        MPEG::Header first(&file, offset, false);
+        if (first.isValid()) {
+            const auto version = first.version();
+            const int layer = first.layer(), rate = first.sampleRate();
+            while (offset < end) {
+                MPEG::Header frame(&file, offset, false);
+                const int length = frame.frameLength();
+                if (!frame.isValid() || frame.version() != version || frame.layer() != layer ||
+                    frame.sampleRate() != rate || length <= 0 || length > end - offset) return false;
+                offset += length;
+            }
+            return offset == end;
+        }
+        if (offset >= end - 1) break;
+        offset = file.nextFrameOffset(offset + 1);
+    }
+    return false;
+}
+
 void validate_source(State &source) {
     if (source.mp3) {
         // MPEG::File::isValid() checks its stream, not the presence of audio.
@@ -540,21 +668,11 @@ void validate_source(State &source) {
                 offset <= source.mp3->length() - header.frameLength()) { found = true; break; }
             offset = source.mp3->nextFrameOffset(offset + 1);
         }
-        require(found, "invalid or truncated MPEG audio");
+        require_source(found, "invalid or truncated MPEG audio",
+                       *static_cast<CheckedInputStream *>(source.stream.get()));
     }
-    if (source.aiff) {
-        require(source.aiff->length() >= 12, "truncated AIFF header");
-        source.aiff->seek(0);
-        ByteVector header = source.aiff->readBlock(12);
-        require(header.size() == 12 && header.mid(0, 4) == "FORM" &&
-                (header.mid(8, 4) == "AIFF" || header.mid(8, 4) == "AIFC"),
-                "invalid AIFF header");
-        const auto *p = reinterpret_cast<const uint8_t *>(header.data());
-        const uint32_t size = (uint32_t(p[4]) << 24) | (uint32_t(p[5]) << 16) |
-                              (uint32_t(p[6]) << 8) | uint32_t(p[7]);
-        require(size >= 4 && uint64_t(size) + 8 <= static_cast<uint64_t>(source.aiff->length()),
-                "invalid AIFF FORM length");
-    }
+    if (source.aiff) validate_aiff(*source.aiff, true, static_cast<CheckedInputStream *>(source.stream.get()));
+    source.check_source();
 }
 
 void read_marker(int format, const char *path, pn_tag_receive_marker receive, void *context) {
@@ -563,13 +681,14 @@ void read_marker(int format, const char *path, pn_tag_receive_marker receive, vo
     validate_source(source);
     if (source.flac) {
         auto xiph = flac_marker(source);
+        source.check_source();
         if (xiph) {
             require(receive(context, xiph->data(), xiph->size(), 1) == 0, "marker receiver failed");
             return;
         }
     }
     std::optional<ByteVector> value;
-    if (source.wav) value = wav_marker(source);
+    if (source.wav) value = wav_marker(*source.wav);
     else if (source.m4) {
         auto &items = source.m4->itemListMap();
         const String key("----:com.mixedinkey.platinumnotes:data");
@@ -579,6 +698,7 @@ void read_marker(int format, const char *path, pn_tag_receive_marker receive, vo
             value = item.toStringList().toString(" ").data(String::UTF8);
         }
     } else value = id3_marker(source.v2);
+    source.check_source();
     const auto *bytes = value && !value->isEmpty() ? reinterpret_cast<const uint8_t *>(value->data()) : nullptr;
     require(receive(context, bytes, value ? value->size() : 0, value.has_value() ? 1 : 0) == 0, "marker receiver failed");
 }
@@ -789,7 +909,7 @@ void inspect_source(int format, const char *path, pn_tag_receive_inspection rece
     // as parsed, not the in-memory genre rewrite used by transfer.
     State source(format, path, false, false);
     validate_source(source);
-    if (source.wav) (void)wav_marker(source, false);
+    if (source.wav) (void)wav_marker(*source.wav, false);
 
     PropertyMap map = source_properties(source);
     NSMutableDictionary *properties = [NSMutableDictionary dictionary];
@@ -848,6 +968,7 @@ void inspect_source(int format, const char *path, pn_tag_receive_inspection rece
     NSError *error = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:result options:0 error:&error];
     require(json != nil && error == nil, "cannot serialize source inspection");
+    source.check_source();
     require(receive(context, static_cast<const uint8_t *>(json.bytes), json.length) == 0, "inspection receiver failed");
 }
 
@@ -888,25 +1009,34 @@ void copy_mp4_to_id3(MP4::Tag *source, ID3 *destination) {
 }
 
 void direct_copy(int operation, const char *src, const char *dst) {
-    FileStream source_stream(src, true), destination_stream(dst, false);
+    CheckedInputStream source_stream(src);
+    FileStream destination_stream(dst, false);
     require(source_stream.isOpen() && destination_stream.isOpen(), "cannot open source or destination tag file");
     switch (operation) {
     case PN_COPY_ID3: {
         MPEG::File source(&source_stream, ID3v2::FrameFactory::instance(), false);
         MPEG::File destination(&destination_stream, ID3v2::FrameFactory::instance(), false);
-        require(source.isValid() && destination.isValid(), "invalid MPEG source or destination");
+        require(destination.isValid(), "invalid MPEG destination");
+        if (!source.isValid()) {
+            require(!destination_stream.readOnly(), "cannot write destination tag file");
+            require(valid_mpeg_destination(destination), "invalid or truncated MPEG destination");
+        }
+        require_source(source.isValid(), "invalid MPEG source", source_stream);
         ID3v1::Tag *v1 = source.ID3v1Tag(false);
-        bool has_v1 = v1 && !v1->isEmpty();
-        if (has_v1) Tag::duplicate(v1, destination.ID3v1Tag(true), true);
         ID3 *v2 = source.ID3v2Tag(false);
+        bool has_v1 = v1 && !v1->isEmpty();
         bool has_v2 = v2 && !v2->isEmpty();
+        check_source(source_stream);
+        if (has_v1) Tag::duplicate(v1, destination.ID3v1Tag(true), true);
         if (has_v2) move_frames(v2, destination.ID3v2Tag(true));
         if (has_v1 || has_v2) require(destination.save(has_v1 ? 3 : 2, true, 4, false), "MPEG direct save failed");
         break;
     }
     case PN_COPY_MP4: {
         MP4::File source(&source_stream, false), destination(&destination_stream, false);
-        require(source.isValid() && destination.isValid() && source.tag() && destination.tag(), "invalid MP4 source or destination");
+        require(destination.isValid() && destination.tag(), "invalid MP4 destination");
+        if (!source.isValid() || !source.tag()) require(!destination_stream.readOnly(), "cannot write destination tag file");
+        require_source(source.isValid() && source.tag(), "invalid MP4 source", source_stream);
         auto &s = source.tag()->itemListMap(); auto &d = destination.tag()->itemListMap(); d.clear();
         for (auto i = s.begin(); i != s.end(); ++i)
             if (i->first != "----:com.apple.iTunes:iTunNORM" && i->first != "----:com.apple.iTunes:iTunSMPB") d.insert(i->first, i->second);
@@ -914,10 +1044,16 @@ void direct_copy(int operation, const char *src, const char *dst) {
     }
     case PN_COPY_WAV: {
         WavFile source(&source_stream), destination(&destination_stream);
-        require(source.isValid() && destination.isValid(), "invalid WAV source or destination");
+        require(destination.isValid(), "invalid WAV destination");
+        if (!source.isValid()) {
+            require(!destination_stream.readOnly(), "cannot write destination tag file");
+            (void)wav_marker(destination, false);
+        }
+        require_source(source.isValid(), "invalid WAV source", source_stream);
         bool has_id3 = source.tag() && !source.tag()->isEmpty() && destination.tag();
-        if (has_id3) move_frames(source.tag(), destination.tag());
         ByteVector list = source.firstList();
+        check_source(source_stream);
+        if (has_id3) move_frames(source.tag(), destination.tag());
         if (!list.isEmpty()) destination.setFirstList(list);
         if (has_id3 || !list.isEmpty())
             require(destination.save(static_cast<RIFF::WAV::File::TagTypes>(has_id3 ? 3 : 2), true, 4), "WAV direct save failed");
@@ -925,7 +1061,12 @@ void direct_copy(int operation, const char *src, const char *dst) {
     }
     case PN_COPY_AIFF: {
         RIFF::AIFF::File source(&source_stream, false), destination(&destination_stream, false);
-        require(source.isValid() && source.tag(), "invalid AIFF source");
+        if (!source.isValid() || !source.tag()) {
+            require(destination.isValid() && destination.tag() && !destination_stream.readOnly(), "invalid AIFF destination");
+            validate_aiff(destination, false);
+            require_source(false, "invalid AIFF source", source_stream);
+        }
+        check_source(source_stream);
         if (source.tag()->isEmpty()) break;
         require(destination.isValid() && destination.tag(), "invalid AIFF destination");
         move_frames(source.tag(), destination.tag()); require(destination.save(), "AIFF direct save failed"); break;
@@ -933,7 +1074,9 @@ void direct_copy(int operation, const char *src, const char *dst) {
     case PN_COPY_FLAC: {
         FLAC::File source(&source_stream, ID3v2::FrameFactory::instance(), false);
         FLAC::File destination(&destination_stream, ID3v2::FrameFactory::instance(), false);
-        require(source.isValid() && destination.isValid(), "invalid FLAC source or destination");
+        require(destination.isValid(), "invalid FLAC destination");
+        if (!source.isValid()) require(!destination_stream.readOnly(), "cannot write destination tag file");
+        require_source(source.isValid(), "invalid FLAC source", source_stream);
         std::string rejected;
         auto *x = source.xiphComment(false);
         if (x && !x->isEmpty()) {
@@ -954,6 +1097,7 @@ void direct_copy(int operation, const char *src, const char *dst) {
             auto *d = destination.ID3v2Tag(true);
             if (d) move_frames(v2, d); else rejected += " [ID3v2 creation failed]";
         }
+        check_source(source_stream);
         require(destination.save(), "FLAC direct save failed");
         if (!rejected.empty()) throw std::runtime_error("FLAC fields or tags not copied: " + rejected);
         break;
@@ -961,7 +1105,13 @@ void direct_copy(int operation, const char *src, const char *dst) {
     case PN_COPY_MP4_TO_ID3: {
         MP4::File source(&source_stream, false);
         MPEG::File destination(&destination_stream, ID3v2::FrameFactory::instance(), false);
-        require(source.isValid() && destination.isValid() && source.tag(), "invalid MP4 or MPEG container");
+        require(destination.isValid(), "invalid MPEG destination");
+        if (!source.isValid() || !source.tag()) {
+            require(!destination_stream.readOnly() && destination.ID3v2Tag(true), "invalid MPEG destination");
+            require(valid_mpeg_destination(destination), "invalid or truncated MPEG destination");
+            require_source(false, "invalid MP4 source", source_stream);
+        }
+        check_source(source_stream);
         ID3 *d = destination.ID3v2Tag(true); require(d, "cannot create destination ID3 tag");
         copy_mp4_to_id3(source.tag(), d); require(destination.save(), "MP4-to-ID3 direct save failed"); break;
     }
@@ -1005,6 +1155,7 @@ template<class F> int guarded(char *error, size_t cap, F &&fn) noexcept {
     if (error && cap) error[0] = '\0';
     @try {
         try { @autoreleasepool { fn(); } return 0; }
+        catch (const SourceContainerUnavailable &e) { if (error && cap) std::snprintf(error, cap, "%s", e.what()); return 3; }
         catch (const std::exception &e) { if (error && cap) std::snprintf(error, cap, "%s", e.what()); return 1; }
         catch (...) { if (error && cap) std::snprintf(error, cap, "unknown C++ exception"); return 1; }
     } @catch (NSException *e) {
@@ -1026,12 +1177,28 @@ extern "C" int pn_tag_copy_direct(int operation, const char *src, const char *ds
 extern "C" int pn_tag_copy_generic(int sf, int df, const char *src, const char *dst, pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context, char *error, size_t cap) {
     return guarded(error, cap, [&] {
         require(src && dst, "null source or destination path");
-        State source(sf, src, false), destination(df, dst, true);
+        std::optional<State> source_storage;
+        try { source_storage.emplace(sf, src, false); }
+        catch (const SourceContainerUnavailable &) {
+            State destination(df, dst, true);
+            require(!destination.stream->readOnly(), "cannot write destination tag file");
+            if (destination.mp3) require(valid_mpeg_destination(*destination.mp3), "invalid or truncated MPEG destination");
+            if (destination.wav) (void)wav_marker(*destination.wav, false);
+            if (destination.aiff) validate_aiff(*destination.aiff, false);
+            if (destination.flac) (void)flac_marker(destination);
+            throw;
+        }
+        State &source = *source_storage;
+        State destination(df, dst, true);
         PNTagValues *from = [[PNTagValues alloc] initWithState:&source];
         PNTagValues *to = [[PNTagValues alloc] initWithState:&destination];
         NSArray *keys = @[@"artist", @"album", @"year", @"title", @"comment", @"tempo", @"initialKey"];
-        [to setValuesForKeysWithDictionary:[from dictionaryWithValuesForKeys:keys]];
-        if (destination.supports_images() && source.has_images()) destination.set_images(source.images());
+        NSDictionary *values = [from dictionaryWithValuesForKeys:keys];
+        bool copy_images = destination.supports_images() && source.has_images();
+        NSArray<NSImage *> *images = copy_images ? source.images() : nil;
+        source.check_source();
+        [to setValuesForKeysWithDictionary:values];
+        if (copy_images) destination.set_images(images);
         set_marker(destination, serialize, context);
         require(destination.save(), "generic metadata save failed");
         if (destination.wav) require(rewrite_wav && rewrite_wav(context, dst) == 0, "WAV marker rewrite failed");

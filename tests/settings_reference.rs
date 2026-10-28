@@ -29,7 +29,11 @@ impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(
 #[test]
 fn defaults_config_paths_clamping_and_reset_are_explicit() {
     let f = Fixture::new();
+    #[cfg(target_os = "macos")]
     let default_directory = f.0.join("Library/Application Support/Platinum Engine");
+    #[cfg(target_os = "linux")]
+    let default_directory = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        .filter(|path| path.is_absolute()).unwrap_or_else(|| f.0.join(".config")).join("platinum-engine");
     assert_eq!(SettingsStore::in_home(f.0.clone(), 8).directory(), default_directory.as_path());
     let store = f.store(8);
     let mut loaded = store.load().unwrap();
@@ -184,6 +188,88 @@ fn stale_snapshots_and_external_corruption_never_overwrite() {
 }
 
 #[test]
+fn unsafe_settings_directories_files_and_replaced_snapshots_are_refused() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = Fixture::new();
+    let store = f.store(4);
+    let mut loaded = store.load().unwrap();
+    store.save(&mut loaded).unwrap();
+    let directory = store.directory().to_owned();
+    let state = store.settings_path();
+    let lock = directory.join("settings.lock");
+    let original = fs::read(&state).unwrap();
+
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(store.load().is_err());
+    assert!(store.save(&mut loaded).is_err());
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(store.load().is_err());
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o622)).unwrap();
+    assert!(store.load().is_err());
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+    fs::rename(&state, directory.join("saved")).unwrap();
+    fs::write(&state, &original).unwrap();
+    assert!(matches!(store.save(&mut loaded), Err(SettingsError::ConcurrentModification(_))));
+    fs::remove_file(&state).unwrap();
+    symlink(directory.join("saved"), &state).unwrap();
+    assert!(store.load().is_err());
+    assert_eq!(fs::read(directory.join("saved")).unwrap(), original);
+
+    let victim = f.0.join("victim");
+    fs::create_dir(&victim).unwrap();
+    let alias = f.0.join("alias");
+    symlink(&victim, &alias).unwrap();
+    for suffix in ["", "/", "/."] {
+        assert!(SettingsStore::new(PathBuf::from(format!("{}{suffix}", alias.display())), &f.0, 4).load().is_err());
+    }
+    assert!(!victim.join("settings.lock").exists());
+}
+
+#[test]
+fn settings_directory_replacement_between_load_and_save_is_refused() {
+    let f = Fixture::new();
+    let store = f.store(4);
+    let mut loaded = store.load().unwrap();
+    store.save(&mut loaded).unwrap();
+    let old = f.0.join("old-state");
+    fs::rename(store.directory(), &old).unwrap();
+    fs::create_dir(store.directory()).unwrap();
+    assert!(store.save(&mut loaded).is_err());
+    assert!(!store.settings_path().exists());
+    assert!(old.join("settings.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires synthetic directories and files owned by a different UID"]
+fn real_unowned_state_directory_and_file_are_refused() {
+    let directory = PathBuf::from(std::env::var_os("PN_UNOWNED_STATE_DIR").unwrap());
+    let file_dir = PathBuf::from(std::env::var_os("PN_UNOWNED_FILE_DIR").unwrap());
+    let directory_error = SettingsStore::new(&directory, &directory, 1).load().err().unwrap();
+    assert!(directory_error.to_string().contains("owned by the current user"), "{directory_error}");
+    assert!(!directory.join("settings.lock").exists());
+    let file_error = SettingsStore::new(&file_dir, &file_dir, 1).load().err().unwrap();
+    assert!(file_error.to_string().contains("owned by the current user"), "{file_error}");
+    assert_eq!(fs::read(file_dir.join("settings.json")).unwrap(), b"{}");
+}
+
+#[test]
+#[ignore = "stress a caller-selected filesystem for transient ownership and inode identity"]
+fn repeated_secure_settings_load_and_save() {
+    let iterations = std::env::var("PN_STATE_PIN_STRESS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1000);
+    for index in 0..iterations {
+        let f = Fixture::new();
+        let store = f.store(4);
+        let mut loaded = store.load().unwrap_or_else(|e| panic!("load {index}: {e}"));
+        store.save(&mut loaded).unwrap_or_else(|e| panic!("save {index}: {e}"));
+        assert!(store.load().is_ok(), "reload {index}");
+    }
+}
+
+#[test]
 fn real_simultaneous_cli_writers_have_one_winner() {
     let f = Fixture::new();
     let store = Arc::new(f.store(4));
@@ -192,9 +278,10 @@ fn real_simultaneous_cli_writers_have_one_winner() {
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         std::thread::spawn(move || {
-            let mut snapshot = store.load().unwrap();
-            snapshot.settings.processor_max = number;
+            let snapshot = store.load();
             barrier.wait();
+            let mut snapshot = snapshot?;
+            snapshot.settings.processor_max = number;
             store.save(&mut snapshot)
         })
     }).collect();

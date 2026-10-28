@@ -1,30 +1,46 @@
-//! Scoped ARM64 FPCR.FZ behavior used by the original HeartCore host callback.
+//! Scoped floating-point flush behavior used by synchronous DSP callbacks.
 //!
-//! Apply this to the complete synchronous process callback, including its event
-//! handling and balanced DSP chunks. Parameter/editor writes occur outside it.
+//! ARM64 uses FPCR.FZ as the original host does. x86_64 uses MXCSR FTZ and
+//! DAZ; ARM detects tininess before rounding, while x86 flushes after rounding,
+//! so boundary values are not claimed bit-identical across architectures.
+//! Apply the scope to the complete callback, including events and DSP chunks.
 
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+#[cfg(target_arch = "aarch64")]
 const FLUSH_TO_ZERO: u64 = 1 << 24;
+#[cfg(target_arch = "x86_64")]
+const FLUSH_TO_ZERO: u64 = (1 << 15) | (1 << 6); // MXCSR FTZ | DAZ
 
+#[cfg(target_arch = "aarch64")]
 #[inline]
-fn read_fpcr() -> u64 {
+fn read_control() -> u64 {
     let value: u64;
-    // The crate admits only the observed macOS arm64 reference target.
-    unsafe {
-        std::arch::asm!("mrs {value}, fpcr", value = out(reg) value, options(nostack, preserves_flags));
-    }
+    unsafe { std::arch::asm!("mrs {value}, fpcr", value = out(reg) value, options(nostack, preserves_flags)); }
     value
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline]
-fn write_fpcr(value: u64) {
-    // No nomem/readonly annotation: callers must not move memory-dependent
-    // processing across this floating-point environment transition.
-    unsafe {
-        std::arch::asm!("msr fpcr, {value}", value = in(reg) value, options(nostack, preserves_flags));
-    }
+fn write_control(value: u64) {
+    // No nomem/readonly annotation: DSP cannot cross this transition.
+    unsafe { std::arch::asm!("msr fpcr, {value}", value = in(reg) value, options(nostack, preserves_flags)); }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn read_control() -> u64 {
+    let mut value = 0u32;
+    unsafe { std::arch::asm!("stmxcsr [{address}]", address = in(reg) &mut value, options(nostack, preserves_flags)); }
+    u64::from(value)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn write_control(value: u64) {
+    let value = value as u32;
+    unsafe { std::arch::asm!("ldmxcsr [{address}]", address = in(reg) &value, options(nostack, preserves_flags)); }
 }
 
 struct FlushToZeroGuard {
@@ -34,9 +50,9 @@ struct FlushToZeroGuard {
 
 impl FlushToZeroGuard {
     fn enter() -> Self {
-        let previous = read_fpcr();
-        if previous & FLUSH_TO_ZERO == 0 {
-            write_fpcr(previous | FLUSH_TO_ZERO);
+        let previous = read_control();
+        if previous & FLUSH_TO_ZERO != FLUSH_TO_ZERO {
+            write_control(previous | FLUSH_TO_ZERO);
         }
         Self {
             previous_fz: previous & FLUSH_TO_ZERO,
@@ -47,20 +63,20 @@ impl FlushToZeroGuard {
 
 impl Drop for FlushToZeroGuard {
     fn drop(&mut self) {
-        let current = read_fpcr();
+        let current = read_control();
         let restored = (current & !FLUSH_TO_ZERO) | self.previous_fz;
         if restored != current {
-            write_fpcr(restored);
+            write_control(restored);
         }
     }
 }
 
-/// Run one synchronous native-equivalent HeartCore callback with FPCR.FZ set.
+/// Run one synchronous callback with the architecture's flush controls set.
 ///
-/// Nesting and panic unwinding restore the caller's prior FZ bit while retaining
-/// other current FPCR bits, matching the original host. Do not return a future
-/// expecting its later execution to inherit this scope, or migrate work to
-/// another thread. The guard itself is private and cannot cross threads.
+/// Nesting and panic unwinding restore the caller's prior flush bits while
+/// retaining other current control bits. Do not return a future expecting its
+/// later execution to inherit this scope, or migrate work to another thread.
+/// The guard itself is private and cannot cross threads.
 #[inline(never)]
 pub fn with_flush_to_zero<T>(body: impl FnOnce() -> T) -> T {
     let _guard = FlushToZeroGuard::enter();
@@ -72,52 +88,63 @@ mod tests {
     use super::*;
     use std::hint::black_box;
 
-    struct RestoreFpcr(u64);
-    impl Drop for RestoreFpcr {
+    struct RestoreControl(u64);
+    impl Drop for RestoreControl {
         fn drop(&mut self) {
-            write_fpcr(self.0);
+            write_control(self.0);
         }
     }
 
     #[test]
     fn subnormal_result_is_flushed_only_inside_scope() {
-        let _restore = RestoreFpcr(read_fpcr());
-        write_fpcr(read_fpcr() & !FLUSH_TO_ZERO);
+        let _restore = RestoreControl(read_control());
+        write_control(read_control() & !FLUSH_TO_ZERO);
         let normal = black_box(f32::MIN_POSITIVE);
         let half = black_box(0.5_f32);
         assert_eq!(black_box(normal * half).to_bits(), 0x0040_0000);
         let inside = with_flush_to_zero(|| black_box(normal) * black_box(half));
         assert_eq!(inside.to_bits(), 0);
         assert_eq!(black_box(normal * half).to_bits(), 0x0040_0000);
-        assert_eq!(read_fpcr() & FLUSH_TO_ZERO, 0);
+        assert_eq!(read_control() & FLUSH_TO_ZERO, 0);
     }
 
     #[test]
     fn nested_scopes_restore_the_outer_mode() {
-        let _restore = RestoreFpcr(read_fpcr());
-        write_fpcr(read_fpcr() & !FLUSH_TO_ZERO);
+        let _restore = RestoreControl(read_control());
+        write_control(read_control() & !FLUSH_TO_ZERO);
         with_flush_to_zero(|| {
-            assert_ne!(read_fpcr() & FLUSH_TO_ZERO, 0);
-            with_flush_to_zero(|| assert_ne!(read_fpcr() & FLUSH_TO_ZERO, 0));
-            assert_ne!(read_fpcr() & FLUSH_TO_ZERO, 0);
+            assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO);
+            with_flush_to_zero(|| assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO));
+            assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO);
         });
-        assert_eq!(read_fpcr() & FLUSH_TO_ZERO, 0);
+        assert_eq!(read_control() & FLUSH_TO_ZERO, 0);
     }
 
     #[test]
     fn unwind_restores_the_callers_fz_bit() {
-        let _restore = RestoreFpcr(read_fpcr());
-        write_fpcr(read_fpcr() & !FLUSH_TO_ZERO);
+        let _restore = RestoreControl(read_control());
+        write_control(read_control() & !FLUSH_TO_ZERO);
         let result = std::panic::catch_unwind(|| with_flush_to_zero(|| panic!("scope probe")));
         assert!(result.is_err());
-        assert_eq!(read_fpcr() & FLUSH_TO_ZERO, 0);
+        assert_eq!(read_control() & FLUSH_TO_ZERO, 0);
     }
 
     #[test]
     fn caller_enabled_fz_remains_enabled() {
-        let _restore = RestoreFpcr(read_fpcr());
-        write_fpcr(read_fpcr() | FLUSH_TO_ZERO);
-        with_flush_to_zero(|| assert_ne!(read_fpcr() & FLUSH_TO_ZERO, 0));
-        assert_ne!(read_fpcr() & FLUSH_TO_ZERO, 0);
+        let _restore = RestoreControl(read_control());
+        write_control(read_control() | FLUSH_TO_ZERO);
+        with_flush_to_zero(|| assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO));
+        assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_enables_and_restores_ftz_and_daz_independently() {
+        let _restore = RestoreControl(read_control());
+        for prior in [1 << 15, 1 << 6] {
+            write_control((read_control() & !FLUSH_TO_ZERO) | prior);
+            with_flush_to_zero(|| assert_eq!(read_control() & FLUSH_TO_ZERO, FLUSH_TO_ZERO));
+            assert_eq!(read_control() & FLUSH_TO_ZERO, prior);
+        }
     }
 }

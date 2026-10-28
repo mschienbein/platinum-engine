@@ -1,0 +1,189 @@
+--- a/src/libFLAC/include/private/lpc.h
++++ b/src/libFLAC/include/private/lpc.h
+@@ -72,6 +72,9 @@
+  *	OUT autoc[0,lag-1]
+  */
+ void FLAC__lpc_compute_autocorrelation(const FLAC__real data[], uint32_t data_len, uint32_t lag, double autoc[]);
++void FLAC__lpc_compute_autocorrelation_apple_lag_8(const FLAC__real data[], uint32_t data_len, uint32_t lag, double autoc[]);
++void FLAC__lpc_compute_autocorrelation_apple_lag_10(const FLAC__real data[], uint32_t data_len, uint32_t lag, double autoc[]);
++void FLAC__lpc_compute_autocorrelation_apple_lag_14(const FLAC__real data[], uint32_t data_len, uint32_t lag, double autoc[]);
+ #ifndef FLAC__NO_ASM
+ #  if (defined FLAC__CPU_IA32 || defined FLAC__CPU_X86_64) && FLAC__HAS_X86INTRIN
+ #    ifdef FLAC__SSE2_SUPPORTED
+--- a/src/libFLAC/lpc.c
++++ b/src/libFLAC/lpc.c
+@@ -171,6 +171,44 @@
+ 		#include "deduplication/lpc_compute_autocorrelation_intrin.c"
+ 	}
+ 
++}
++
++/* The macOS arm64 encoder dispatches to the NEON reverse-order kernel.
++ * Each lane is an independent binary64 fused accumulation; retaining the
++ * lane order matters even on machines with a different vector width. */
++static void apple_autocorrelation(const FLAC__real data[], uint32_t data_len,
++	uint32_t lag, double autoc[], uint32_t width)
++{
++	double history[14] = { 0.0 };
++	double sums[14] = { 0.0 };
++	uint32_t i, j;
++	(void)lag;
++	FLAC__ASSERT(lag <= width);
++	for(i = data_len; i != 0; ) {
++		const double sample = data[--i];
++		for(j = width - 1; j != 0; --j)
++			history[j] = history[j - 1];
++		history[0] = sample;
++		for(j = 0; j < width; ++j)
++			sums[j] = fma(sample, history[j], sums[j]);
++	}
++	for(j = 0; j < width; ++j)
++		autoc[j] = sums[j];
++}
++
++void FLAC__lpc_compute_autocorrelation_apple_lag_8(const FLAC__real data[], uint32_t len, uint32_t lag, double autoc[])
++{
++	apple_autocorrelation(data, len, lag, autoc, 8);
++}
++
++void FLAC__lpc_compute_autocorrelation_apple_lag_10(const FLAC__real data[], uint32_t len, uint32_t lag, double autoc[])
++{
++	apple_autocorrelation(data, len, lag, autoc, 10);
++}
++
++void FLAC__lpc_compute_autocorrelation_apple_lag_14(const FLAC__real data[], uint32_t len, uint32_t lag, double autoc[])
++{
++	apple_autocorrelation(data, len, lag, autoc, 14);
+ }
+ 
+ void FLAC__lpc_compute_lp_coefficients(const double autoc[], uint32_t *max_order, FLAC__real lp_coeff[][FLAC__MAX_LPC_ORDER], double error[])
+@@ -189,20 +227,20 @@
+ 		/* Sum up this iteration's reflection coefficient. */
+ 		r = -autoc[i+1];
+ 		for(j = 0; j < i; j++)
+-			r -= lpc[j] * autoc[i-j];
++			r = fma(-lpc[j], autoc[i-j], r);
+ 		r /= err;
+ 
+ 		/* Update LPC coefficients and total error. */
+ 		lpc[i]=r;
+ 		for(j = 0; j < (i>>1); j++) {
+ 			double tmp = lpc[j];
+-			lpc[j] += r * lpc[i-1-j];
+-			lpc[i-1-j] += r * tmp;
++			lpc[j] = fma(r, lpc[i-1-j], lpc[j]);
++			lpc[i-1-j] = fma(r, tmp, lpc[i-1-j]);
+ 		}
+ 		if(i & 1)
+-			lpc[j] += lpc[j] * r;
++			lpc[j] = fma(lpc[j], r, lpc[j]);
+ 
+-		err *= (1.0 - r * r);
++		err *= -fma(r, r, -1.0);
+ 
+ 		/* save this order */
+ 		for(j = 0; j <= i; j++)
+@@ -1576,19 +1614,18 @@
+ 
+ double FLAC__lpc_compute_expected_bits_per_residual_sample(double lpc_error, uint32_t total_samples)
+ {
+-	double error_scale;
+-
+ 	FLAC__ASSERT(total_samples > 0);
+-
+-	error_scale = 0.5 / (double)total_samples;
+-
+-	return FLAC__lpc_compute_expected_bits_per_residual_sample_with_error_scale(lpc_error, error_scale);
++	if(lpc_error > 0.0) {
++		double bps = log((lpc_error * 0.5) / (double)total_samples) * (0.5 / M_LN2);
++		return bps >= 0.0 ? bps : 0.0;
++	}
++	return lpc_error < 0.0 ? 1e32 : 0.0;
+ }
+ 
+ double FLAC__lpc_compute_expected_bits_per_residual_sample_with_error_scale(double lpc_error, double error_scale)
+ {
+ 	if(lpc_error > 0.0) {
+-		double bps = (double)0.5 * log(error_scale * lpc_error) / M_LN2;
++		double bps = log(error_scale * lpc_error) * (0.5 / M_LN2);
+ 		if(bps >= 0.0)
+ 			return bps;
+ 		else
+@@ -1610,13 +1647,20 @@
+ 	FLAC__ASSERT(max_order > 0);
+ 	FLAC__ASSERT(total_samples > 0);
+ 
+-	error_scale = 0.5 / (double)total_samples;
++	error_scale = 1.0 / (double)total_samples;
+ 
+ 	best_index = 0;
+ 	best_bits = (uint32_t)(-1);
+ 
+ 	for(indx = 0, order = 1; indx < max_order; indx++, order++) {
+-		bits = FLAC__lpc_compute_expected_bits_per_residual_sample_with_error_scale(lpc_error[indx], error_scale) * (double)(total_samples - order) + (double)(order * overhead_bits_per_order);
++		double estimate;
++		if(lpc_error[indx] > 0.0) {
++			double bps = log((lpc_error[indx] * 0.5) * error_scale) * (0.5 / M_LN2);
++			estimate = bps >= 0.0 ? bps : 0.0;
++		}
++		else
++			estimate = lpc_error[indx] < 0.0 ? 1e32 : 0.0;
++		bits = fma(estimate, (double)(total_samples - order), (double)(order * overhead_bits_per_order));
+ 		if(bits < best_bits) {
+ 			best_index = indx;
+ 			best_bits = bits;
+--- a/src/libFLAC/stream_encoder.c
++++ b/src/libFLAC/stream_encoder.c
+@@ -1045,6 +1045,13 @@
+ #  endif /* FLAC__CPU_... */
+ 	}
+ # endif /* !FLAC__NO_ASM */
++	/* Match the arm64 reference's NEON lag width on every Linux CPU. */
++	if(encoder->protected_->max_lpc_order < 8)
++		encoder->private_->local_lpc_compute_autocorrelation = FLAC__lpc_compute_autocorrelation_apple_lag_8;
++	else if(encoder->protected_->max_lpc_order < 10)
++		encoder->private_->local_lpc_compute_autocorrelation = FLAC__lpc_compute_autocorrelation_apple_lag_10;
++	else if(encoder->protected_->max_lpc_order < 14)
++		encoder->private_->local_lpc_compute_autocorrelation = FLAC__lpc_compute_autocorrelation_apple_lag_14;
+ 
+ #endif /* !FLAC__INTEGER_ONLY_LIBRARY */
+ #if !defined FLAC__NO_ASM && FLAC__HAS_X86INTRIN
+--- a/src/libFLAC/window.c
++++ b/src/libFLAC/window.c
+@@ -213,10 +213,22 @@
+ 		FLAC__window_rectangle(window, L);
+ 		/* ...replace ends with hann */
+ 		if (Np > 0) {
+-			for (n = 0; n <= Np; n++) {
+-				window[n] = (FLAC__real)(0.5f - 0.5f * cosf(M_PI * n / Np));
+-				window[L-Np-1+n] = (FLAC__real)(0.5f - 0.5f * cosf(M_PI * (n+Np) / Np));
++			const double inverse = 1.0 / (double)Np;
++			const FLAC__int32 paired = (Np + 1) & ~1;
++			/* Apple vectorizes pairs: multiply by reciprocal before pi.
++			 * Its scalar tail has a different association. */
++			for (n = 0; n < paired; n++) {
++				float left = (float)(((double)n * inverse) * M_PI);
++				float right = (float)(((double)(n + Np) * inverse) * M_PI);
++				window[n] = fmaf(-0.5f, cosf(left), 0.5f);
++				window[L-Np-1+n] = fmaf(-0.5f, cosf(right), 0.5f);
++			}
++			for (; n <= Np; n++) {
++				float left = (float)((double)n * (M_PI * inverse));
++				float right = (float)(((double)(n + Np) * M_PI) * inverse);
++				window[n] = fmaf(-0.5f, cosf(left), 0.5f);
++				window[L-Np-1+n] = fmaf(-0.5f, cosf(right), 0.5f);
+ 			}
+ 		}
+ 	}
+ }
+--- a/src/libFLAC/CMakeLists.txt
++++ b/src/libFLAC/CMakeLists.txt
+@@ -94,6 +94,8 @@
+     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+ target_link_libraries(FLAC PUBLIC $<$<BOOL:${HAVE_LROUND}>:m>)
++target_link_libraries(FLAC PRIVATE "${PN_CODEC_MATH_LIBRARY}" dl pthread m)
++target_link_options(FLAC PRIVATE "-Wl,--exclude-libs,ALL")
+ if(TARGET Ogg::ogg)
+     target_link_libraries(FLAC PUBLIC Ogg::ogg)
+ endif()

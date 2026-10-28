@@ -7,11 +7,11 @@
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +77,10 @@ pub enum CodecWarning {
 pub enum CodecError {
     InvalidInput(&'static str),
     Unsupported(&'static str),
+    /// The completed ALAC file did not decode to the submitted frame count.
+    AlacFrameMismatch { submitted: u64, decoded: u64 },
+    /// ALAC verification was cancelled before the private output was published.
+    Cancelled,
     Native { operation: &'static str, status: i32 },
     Io { operation: &'static str, path: PathBuf, source: io::Error },
     /// A primary failure was followed by a native or filesystem cleanup failure.
@@ -92,6 +96,8 @@ impl fmt::Display for CodecError {
         match self {
             Self::InvalidInput(message) => write!(f, "invalid audio codec input: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported audio codec input: {message}"),
+            Self::AlacFrameMismatch { submitted, decoded } => write!(f, "ALAC output decoded {decoded} frames, expected {submitted}; refusing publication"),
+            Self::Cancelled => f.write_str("ALAC postflight cancelled"),
             Self::Native { operation, status } => write!(f, "{operation} failed with OSStatus {status} ({:#010x})", *status as u32),
             Self::Io { operation, path, source } => write!(f, "{operation} {}: {source}", path.display()),
             Self::Cleanup { primary, source } => write!(f, "{primary}; additionally, cleanup failed: {source}"),
@@ -129,6 +135,13 @@ pub(crate) struct StereoBufferList {
     pub(crate) number_buffers: u32,
     pub(crate) buffers: [AudioBuffer; 2],
 }
+
+// On the tested macOS arm64 runtime, AudioToolbox AAC output depends on the
+// stack alignment at ExtAudioFileRead. Aligning the live list stabilizes that
+// call boundary without changing its ABI or the caller's sample buffers.
+// This is a bounded runtime observation, not a cross-version parity guarantee.
+#[repr(align(64))]
+struct AlignedStereoBufferList(StereoBufferList);
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
@@ -297,6 +310,9 @@ impl Reader {
         if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b"flac") {
             return Err(CodecError::Unsupported("the reference uses a separate FLAC decoder for paths ending in flac"));
         }
+        Self::open_audio_toolbox(path, sample_rate)
+    }
+    fn open_audio_toolbox(path: PathBuf, sample_rate: Option<f64>) -> Result<Self, CodecError> {
         let url = Url::new(&path)?;
         let mut raw = ptr::null_mut();
         let status = unsafe { ExtAudioFileOpenURL(url.as_ptr(), &mut raw) };
@@ -367,18 +383,18 @@ impl Reader {
         let (mut frames, bytes) = buffer_length(left.len(), 1, size_of::<f32>())?;
         if frames == 0 { return Ok(0); }
         let requested = frames;
-        let mut list = StereoBufferList {
+        let mut list = AlignedStereoBufferList(StereoBufferList {
             number_buffers: 2,
             buffers: [
                 AudioBuffer { number_channels: 1, data_byte_size: bytes, data: left.as_mut_ptr().cast() },
                 AudioBuffer { number_channels: 1, data_byte_size: bytes, data: right.as_mut_ptr().cast() },
             ],
-        };
+        });
         // AudioBufferList's variable-size ABI uses its count, not the C/Rust
         // declaration's trailing array length. Both entries are live here.
-        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, (&mut list as *mut StereoBufferList).cast()) };
+        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, (&mut list.0 as *mut StereoBufferList).cast()) };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileRead(planar stereo)", status }); }
-        if frames > requested || list.number_buffers != 2 || list.buffers.iter().any(|buffer| buffer.data_byte_size > bytes) {
+        if frames > requested || list.0.number_buffers != 2 || list.0.buffers.iter().any(|buffer| buffer.data_byte_size > bytes) {
             self.failed = true;
             return Err(CodecError::UnexpectedNativeResult("planar read exceeded supplied buffers"));
         }
@@ -407,6 +423,41 @@ impl Reader {
     pub fn close(mut self) -> Result<(), CodecError> { self.handle.close() }
 }
 
+fn verify_alac_frames(path: &Path, submitted: u64, cancelled: &mut impl FnMut() -> bool) -> Result<(), CodecError> {
+    if cancelled() { return Err(CodecError::Cancelled); }
+    let mut reader = Reader::open_audio_toolbox(absolute_path(path)?, None)?;
+    let decoded = (|| {
+        if submitted == 0 {
+            // ExtAudioFileRead returns -66567 for a valid zero-packet ALAC.
+            // With no writes submitted, validate its zero-frame container instead.
+            let frames = reader.file_length_frames()?;
+            if cancelled() { return Err(CodecError::Cancelled); }
+            return u64::try_from(frames).map_err(|_| CodecError::UnexpectedNativeResult("negative ALAC frame count"));
+        }
+        let channels = reader.client_format().channels_per_frame as usize;
+        let samples = channels.checked_mul(4096).filter(|&n| n != 0)
+            .ok_or(CodecError::InvalidInput("invalid ALAC channel count"))?;
+        let mut buffer = vec![0.0; samples];
+        let mut count = 0u64;
+        loop {
+            if cancelled() { return Err(CodecError::Cancelled); }
+            let frames = reader.read(&mut buffer)?;
+            if cancelled() { return Err(CodecError::Cancelled); }
+            if frames == 0 { break; }
+            count = count.checked_add(frames as u64).ok_or(CodecError::InvalidInput("decoded ALAC frame count overflows"))?;
+            if count > submitted { break; }
+        }
+        Ok::<_, CodecError>(count)
+    })();
+    let close = reader.close();
+    let decoded = match decoded {
+        Ok(decoded) => { close?; decoded }
+        Err(error) => return Err(with_native_cleanup(error, close)),
+    };
+    if decoded != submitted { return Err(CodecError::AlacFrameMismatch { submitted, decoded }); }
+    Ok(())
+}
+
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
 // The reference requests erase-existing (1); we deliberately pass zero so
@@ -415,7 +466,7 @@ static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 struct Workspace {
     directory: PathBuf,
     file: PathBuf,
-    identity: Option<(u64, u64)>,
+    identity: Option<File>,
 }
 impl Workspace {
     fn create(target: &Path) -> Result<Self, CodecError> {
@@ -434,16 +485,22 @@ impl Workspace {
         Err(CodecError::InvalidInput("could not allocate a unique codec workspace"))
     }
     fn remember_created_file(&mut self) -> Result<(), CodecError> {
-        let metadata = fs::symlink_metadata(&self.file).map_err(|e| io_error("inspect created codec file", &self.file, e))?;
-        if !metadata.file_type().is_file() {
-            return Err(CodecError::UnexpectedNativeResult("created codec output is not a regular file"));
+        let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&self.file).map_err(|e| io_error("pin created codec file", &self.file, e))?;
+        self.identity = Some(file);
+        let metadata = self.identity.as_ref().unwrap().metadata().map_err(|e| io_error("inspect created codec file", &self.file, e))?;
+        let named = fs::symlink_metadata(&self.file).map_err(|e| io_error("inspect named codec file", &self.file, e))?;
+        if !metadata.file_type().is_file() || !named.file_type().is_file()
+            || (metadata.dev(), metadata.ino()) != (named.dev(), named.ino())
+            || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(CodecError::UnexpectedNativeResult("created codec output identity or owner changed"));
         }
-        self.identity = Some((metadata.dev(), metadata.ino()));
         Ok(())
     }
     fn check_owned_file(&self) -> io::Result<()> {
         let metadata = fs::symlink_metadata(&self.file)?;
-        if metadata.file_type().is_file() && Some((metadata.dev(), metadata.ino())) == self.identity {
+        let held = self.identity.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "codec file is not pinned"))?.metadata()?;
+        if held.file_type().is_file() && metadata.file_type().is_file() && (metadata.dev(), metadata.ino()) == (held.dev(), held.ino()) {
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "codec workspace file was replaced; refusing to use or remove it"))
@@ -485,10 +542,15 @@ pub struct Writer {
     config: WriterConfig,
     warnings: Vec<CodecWarning>,
     failed: bool,
+    submitted_frames: u64,
 }
 
 impl Writer {
     pub fn create(path: impl AsRef<Path>, config: WriterConfig) -> Result<Self, CodecError> {
+        Self::create_impl(path, config, #[cfg(test)] false)
+    }
+    fn create_impl(path: impl AsRef<Path>, config: WriterConfig,
+        #[cfg(test)] fail_after_create: bool) -> Result<Self, CodecError> {
         let (file_type, file_format) = file_description(config)?;
         let client = float_format(config.sample_rate, config.channels)?;
         let target = absolute_path(path.as_ref())?;
@@ -502,16 +564,30 @@ impl Writer {
         let mut raw = ptr::null_mut();
         let status = unsafe { ExtAudioFileCreateWithURL(url.as_ptr(), file_type, &file_format, ptr::null(), FAIL_IF_EXISTS, &mut raw) };
         if status != 0 {
-            let primary = CodecError::Native { operation: "ExtAudioFileCreateWithURL", status };
+            let mut primary = CodecError::Native { operation: "ExtAudioFileCreateWithURL", status };
+            // The private directory was empty and inaccessible to other users.
+            // Native creation can leave a partial file even on failure.
+            if fs::symlink_metadata(&workspace.file).is_ok() {
+                if let Err(error) = workspace.remember_created_file() {
+                    primary = CodecError::Cleanup { primary: Box::new(primary), source: io::Error::other(error) };
+                }
+            }
             let close = match NonNull::new(raw) {
                 Some(p) => native_status("ExtAudioFileDispose", unsafe { ExtAudioFileDispose(p.as_ptr()) }),
                 None => Ok(()),
             };
             return Err(with_cleanup(with_native_cleanup(primary, close), &mut workspace));
         }
-        let mut handle = match ExtHandle::new(raw) { Ok(handle) => handle, Err(e) => return Err(with_cleanup(e, &mut workspace)) };
         if let Err(error) = workspace.remember_created_file() {
-            let primary = with_native_cleanup(error, handle.close());
+            let close = match NonNull::new(raw) {
+                Some(p) => native_status("ExtAudioFileDispose", unsafe { ExtAudioFileDispose(p.as_ptr()) }),
+                None => Ok(()),
+            };
+            return Err(with_cleanup(with_native_cleanup(error, close), &mut workspace));
+        }
+        let mut handle = match ExtHandle::new(raw) { Ok(handle) => handle, Err(e) => return Err(with_cleanup(e, &mut workspace)) };
+        #[cfg(test)] if fail_after_create {
+            let primary = with_native_cleanup(CodecError::InvalidInput("injected codec initialization failure"), handle.close());
             return Err(with_cleanup(primary, &mut workspace));
         }
         if let Err(e) = handle.set_client(&client) {
@@ -532,7 +608,7 @@ impl Writer {
             }
             // The reference does not set kExtAudioFileProperty_ConverterConfig.
         }
-        Ok(Self { handle, workspace, target, config, warnings, failed: false })
+        Ok(Self { handle, workspace, target, config, warnings, failed: false, submitted_frames: 0 })
     }
     pub fn config(&self) -> WriterConfig { self.config }
     pub fn warnings(&self) -> &[CodecWarning] { &self.warnings }
@@ -542,15 +618,27 @@ impl Writer {
         if self.failed { return Err(CodecError::Poisoned); }
         let (frames, bytes) = buffer_length(input.len(), self.config.channels, size_of::<f32>())?;
         if frames == 0 { return Ok(()); }
+        let submitted = self.submitted_frames.checked_add(u64::from(frames))
+            .ok_or(CodecError::InvalidInput("submitted frame count overflows"))?;
         let list = audio_buffer(self.config.channels, bytes, input.as_ptr().cast_mut().cast());
         let status = unsafe { ExtAudioFileWrite(self.handle.ptr(), frames, &list) };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileWrite", status }); }
+        self.submitted_frames = submitted;
         Ok(())
     }
     /// Dispose/flush the codec and publish without replacing any existing path.
     /// A hard-link failure (including an existing target) is returned as an
     /// error; filesystems that do not support hard links are not silently altered.
-    pub fn finish(mut self) -> Result<(), CodecError> {
+    pub fn finish(self) -> Result<(), CodecError> {
+        self.finish_cancellable(|| false)
+    }
+    /// Finish as above, checking cancellation around each ALAC postflight
+    /// read. A cancellation closes the decoder and removes the workspace.
+    pub fn finish_cancellable(self, cancelled: impl FnMut() -> bool) -> Result<(), CodecError> {
+        self.finish_cancellable_registered(cancelled, |_| Ok(()))
+    }
+    pub(crate) fn finish_cancellable_registered(mut self, mut cancelled: impl FnMut() -> bool,
+        register: impl FnOnce(&File) -> io::Result<()>) -> Result<(), CodecError> {
         let primary = match (self.failed, self.handle.close()) {
             (true, Err(close)) => Some(CodecError::Cleanup { primary: Box::new(CodecError::Poisoned), source: io::Error::other(close) }),
             (true, Ok(())) => Some(CodecError::Poisoned),
@@ -559,6 +647,20 @@ impl Writer {
         if let Some(error) = primary { return Err(with_cleanup(error, &mut self.workspace)); }
         if let Err(e) = self.workspace.check_owned_file() {
             let error = io_error("inspect codec output before publication", &self.workspace.file, e);
+            return Err(with_cleanup(error, &mut self.workspace));
+        }
+        if self.config.format == OutputFormat::Alac {
+            if let Err(error) = verify_alac_frames(&self.workspace.file, self.submitted_frames, &mut cancelled) {
+                return Err(with_cleanup(error, &mut self.workspace));
+            }
+            if let Err(error) = self.workspace.check_owned_file() {
+                let error = io_error("reinspect codec output after ALAC verification", &self.workspace.file, error);
+                return Err(with_cleanup(error, &mut self.workspace));
+            }
+            if cancelled() { return Err(with_cleanup(CodecError::Cancelled, &mut self.workspace)); }
+        }
+        if let Err(error) = register(self.workspace.identity.as_ref().expect("pinned codec output")) {
+            let error = io_error("register codec staging file", &self.target, error);
             return Err(with_cleanup(error, &mut self.workspace));
         }
         if let Err(e) = fs::hard_link(&self.workspace.file, &self.target) {
@@ -731,6 +833,127 @@ fn patch_moov_times(moov: &mut [u8], seconds: u32) -> io::Result<usize> {
         patch_full_box_times(&mut mdia[mdhd], seconds)?;
     }
     Ok(2 + tracks.len() * 4)
+}
+
+#[cfg(test)]
+mod writer_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn partial_initialization_and_registration_failures_cleanup_all_codecs() {
+        let dir = std::env::temp_dir().join(format!("pn-apple-ownership-{}-{}", std::process::id(), NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        for (format, name) in [(OutputFormat::Wav, "out.wav"), (OutputFormat::Aiff, "out.aiff"), (OutputFormat::Alac, "out.m4a")] {
+            let path = dir.join(name);
+            let config = WriterConfig { format, sample_rate: 48_000.0, channels: 2, bit_depth: 16 };
+            assert!(Writer::create_impl(&path, config, true).is_err());
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let mut writer = Writer::create(&path, config).unwrap();
+            writer.write(&vec![0.0; 8192]).unwrap();
+            assert!(writer.finish_cancellable_registered(|| false, |_| Err(io::Error::other("injected registration failure"))).is_err());
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        }
+        fs::remove_dir(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod planar_alignment_tests {
+    use super::{AlignedStereoBufferList, StereoBufferList};
+
+    #[test]
+    fn planar_list_alignment_preserves_native_buffer_list_layout() {
+        assert_eq!(std::mem::align_of::<AlignedStereoBufferList>(), 64);
+        assert_eq!(std::mem::offset_of!(StereoBufferList, buffers), 8);
+        assert_eq!(std::mem::size_of::<StereoBufferList>(), 40);
+    }
+}
+
+#[cfg(test)]
+mod alac_postflight_tests {
+    use super::*;
+    use crate::file_workflow::Cancellation;
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "pn-alac-postflight-test-{}-{}", std::process::id(), NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    fn writer(dir: &TestDir) -> Writer {
+        let mut writer = Writer::create(dir.0.join("output.m4a"), WriterConfig {
+            format: OutputFormat::Alac, sample_rate: 44_100.0, channels: 2, bit_depth: 16,
+        }).unwrap();
+        writer.write(&vec![0.25; 8192 * 2]).unwrap();
+        writer
+    }
+
+    #[test]
+    fn cancellation_during_postflight_cleans_workspace_without_publication() {
+        let dir = TestDir::new();
+        let writer = writer(&dir);
+        let cancel = Cancellation::new();
+        let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel(0);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(0);
+        let mut checks = 0;
+        let result = std::thread::scope(|scope| {
+            let token = &cancel;
+            scope.spawn(move || {
+                decoded_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                token.cancel();
+                cancelled_tx.send(()).unwrap();
+            });
+            writer.finish_cancellable(|| {
+                checks += 1;
+                // The third check is immediately after the first decoded block.
+                if checks == 3 {
+                    decoded_tx.send(()).unwrap();
+                    cancelled_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                }
+                cancel.is_cancelled()
+            })
+        });
+        assert!(matches!(result, Err(CodecError::Cancelled)));
+        assert_eq!(checks, 3);
+        assert!(!dir.0.join("output.m4a").exists());
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_preserves_workspace_cleanup_failure() {
+        let dir = TestDir::new();
+        let writer = writer(&dir);
+        let staged = writer.workspace.file.clone();
+        let retained = writer.workspace.directory.join("retained-original");
+        let mut checks = 0;
+        let result = writer.finish_cancellable(|| {
+            checks += 1;
+            if checks == 3 {
+                fs::rename(&staged, &retained).unwrap();
+                fs::write(&staged, b"replacement").unwrap();
+                true
+            } else { false }
+        });
+        match result {
+            Err(CodecError::Cleanup { primary, source }) => {
+                assert!(matches!(*primary, CodecError::Cancelled));
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected cancellation with cleanup failure, got {other:?}"),
+        }
+        assert!(!dir.0.join("output.m4a").exists());
+        assert_eq!(fs::read(&staged).unwrap(), b"replacement");
+        assert!(retained.exists());
+    }
 }
 
 #[cfg(test)]

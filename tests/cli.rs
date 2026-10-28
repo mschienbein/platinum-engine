@@ -236,6 +236,58 @@ fn non_unicode_input_is_a_truthful_machine_failure() {
     assert!(value["results"][0]["input"]["unix_bytes_hex"].as_str().unwrap().ends_with("ff2e776176"));
 }
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
+#[test]
+#[ignore = "requires PN_OGG_SNDFILE_CONVERT and PLATINUM_TEST_TAG_BRIDGE with source-container status support"]
+fn misnamed_generated_ogg_continues_without_source_tags() {
+    let sandbox = Sandbox::new();
+    let bridge = std::env::var("PLATINUM_TEST_TAG_BRIDGE").unwrap();
+    sandbox.ok(&["config", "set", "libraries.tag_bridge", &json!(bridge).to_string()]);
+    let pcm = sandbox.root.join("generated.wav");
+    let frames = 11_025u32;
+    let mut wave = Vec::new();
+    wave.extend_from_slice(b"RIFF"); wave.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+    wave.extend_from_slice(b"WAVEfmt "); wave.extend_from_slice(&16u32.to_le_bytes());
+    wave.extend_from_slice(&1u16.to_le_bytes()); wave.extend_from_slice(&1u16.to_le_bytes());
+    wave.extend_from_slice(&44_100u32.to_le_bytes()); wave.extend_from_slice(&88_200u32.to_le_bytes());
+    wave.extend_from_slice(&2u16.to_le_bytes()); wave.extend_from_slice(&16u16.to_le_bytes());
+    wave.extend_from_slice(b"data"); wave.extend_from_slice(&(frames * 2).to_le_bytes());
+    for frame in 0..frames {
+        let value = ((frame as f32 * std::f32::consts::TAU * 440.0 / 44_100.0).sin() * 10_000.0) as i16;
+        wave.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(&pcm, wave).unwrap();
+    let source = sandbox.root.join("generated.ogg");
+    drop(fs::OpenOptions::new().write(true).create_new(true).open(&source).unwrap());
+    let output = Command::new(std::env::var_os("PN_OGG_SNDFILE_CONVERT").unwrap())
+        .arg("-vorbis").arg(&pcm).arg(&source).output().unwrap();
+    assert!(output.status.success(), "sndfile-convert: {}", String::from_utf8_lossy(&output.stderr));
+    let bytes = fs::read(&source).unwrap();
+    assert!(bytes.starts_with(b"OggS"));
+    for extension in ["wav", "aif", "m4a"] {
+        let input = sandbox.root.join(format!("source.{extension}"));
+        let destination = sandbox.root.join(format!("output-{extension}"));
+        fs::write(&input, &bytes).unwrap(); fs::create_dir(&destination).unwrap();
+        let inspection = sandbox.ok(&["inspect", input.to_str().unwrap()]);
+        let inspected = &inspection["results"][0]["report"];
+        assert!(inspected["tags"].is_null() && inspected["tags_unavailable"].is_string());
+        assert_eq!(inspected["processed"], false);
+        assert_eq!(inspected["processing_state"], "unprocessed");
+        assert!(inspected["marker_json"].is_null());
+        let result = sandbox.ok(&["process", input.to_str().unwrap(), "--format", "wav",
+            "--output-dir", destination.to_str().unwrap(), "--jobs", "1"]);
+        let report = &result["results"][0]["report"];
+        assert!(report["source_tags_unavailable"].is_string());
+        assert_eq!(report["processing_marker_status"], "nil_payload_empty_wav_chunk");
+        let output = fs::read(report["output_path"].as_str().unwrap()).unwrap();
+        assert!(output.starts_with(b"RIFF") && output.windows(8).any(|window| window == b"PLTN\0\0\0\0"));
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+    }
+    let (output, result) = sandbox.run(&["process", source.to_str().unwrap(), "--format", "wav", "--same-folder"]);
+    assert!(!output.status.success());
+    assert_eq!(result["results"][0]["status"], "failed");
+}
+
 // The public tag bridge is a caller-supplied native dependency, not embedded in
 // the crate. This test runs explicitly with a bridge built from this repository.
 #[test]
@@ -247,7 +299,11 @@ fn synthetic_audio_analysis_processing_and_restore() {
     let bridge_json = json!(bridge).to_string();
     sandbox.ok(&["config", "set", "libraries.tag_bridge", &bridge_json]);
 
+    #[cfg(all(target_os = "macos", not(feature = "portable")))]
     const RATE: u32 = 48_000;
+    // Portable waveform extraction intentionally refuses unverified SRC.
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    const RATE: u32 = 44_100;
     const FRAMES: u32 = RATE * 3;
     let data_len = FRAMES * 4;
     let mut wav = Vec::with_capacity((44 + data_len) as usize);
@@ -280,6 +336,25 @@ fn synthetic_audio_analysis_processing_and_restore() {
     let replacement = replacement.to_str().unwrap();
     let outputs = outputs.to_str().unwrap();
     let backups = backups.to_str().unwrap();
+
+    // APFS canonical-equivalence policy is specific to the native macOS path;
+    // Linux deliberately relies on identity-checked publication for cases its
+    // UTF-8 casefold preflight cannot model.
+    #[cfg(target_os = "macos")]
+    {
+        let unicode_output = sandbox.root.join("unicode-output"); fs::create_dir(&unicode_output).unwrap();
+        let left_dir = sandbox.root.join("unicode-left"); fs::create_dir(&left_dir).unwrap();
+        let right_dir = sandbox.root.join("unicode-right"); fs::create_dir(&right_dir).unwrap();
+        let left = left_dir.join("café.wav"); let right = right_dir.join("cafe\u{301}.wav");
+        fs::write(&left, &wav).unwrap(); fs::write(&right, &wav).unwrap();
+        let (collision, outcome) = sandbox.run(&["process", left.to_str().unwrap(), right.to_str().unwrap(),
+            "--format", "wav", "--output-dir", unicode_output.to_str().unwrap(), "--jobs", "2"]);
+        assert_eq!(collision.status.code(), Some(1));
+        assert!(outcome["batch_error"].is_object());
+        assert!(outcome["results"].as_array().unwrap().iter().all(|result| result["status"] == "not_started"));
+        assert_eq!(fs::read_dir(&unicode_output).unwrap().count(), 0);
+        assert_eq!(fs::read(&left).unwrap(), wav); assert_eq!(fs::read(&right).unwrap(), wav);
+    }
 
     let analysis = sandbox.ok(&["analyze", source, "--jobs", "1"]);
     assert_eq!(analysis["results"][0]["report"]["frames"], FRAMES);
@@ -354,7 +429,6 @@ fn synthetic_audio_analysis_processing_and_restore() {
     assert_eq!(fs::read(backup).unwrap(), wav);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE pointing to the public tag bridge"]
 fn short_and_silent_wav_report_the_nil_marker_and_nonfinite_loudness() {
@@ -388,7 +462,6 @@ fn short_and_silent_wav_report_the_nil_marker_and_nonfinite_loudness() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB and PN_FLAC_SHA256"]
 fn restore_marked_flac_without_a_configured_decoder() {
@@ -399,11 +472,11 @@ fn restore_marked_flac_without_a_configured_decoder() {
     let sha256 = std::env::var("PN_FLAC_SHA256").expect("provide FLAC SHA-256 pin");
     sandbox.ok(&["config", "set", "libraries.tag_bridge", &json!(bridge).to_string()]);
     sandbox.ok(&["config", "set", "libraries.flac", &json!(&flac).to_string()]);
-    sandbox.ok(&["config", "set", "libraries.flac_sha256", &json!(sha256).to_string()]);
+    sandbox.ok(&["config", "set", "libraries.flac_sha256", &json!(&sha256).to_string()]);
     let source = sandbox.root.join("source.flac");
     let backups = sandbox.root.join("backups");
     fs::create_dir(&backups).unwrap();
-    let library = FlacLibrary::load(&flac).unwrap();
+    let library = FlacLibrary::load(&flac, &sha256).unwrap();
     let file = fs::OpenOptions::new().write(true).create_new(true).open(&source).unwrap();
     let mut encoder = FlacEncoder::new(&library, file, 48_000.0, 2, 16).unwrap();
     let samples: Vec<f32> = (0..96_000).flat_map(|frame| {
@@ -429,7 +502,6 @@ fn restore_marked_flac_without_a_configured_decoder() {
     assert!(!Path::new(backup).exists());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE pointing to the public tag bridge"]
 fn cli_reports_ambiguous_wav_override_and_keeps_strict_guards() {

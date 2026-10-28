@@ -9,13 +9,21 @@
 //! model-event application and processing run inside it, as in the reference.
 //! See `docs/VERIFICATION.md` for public verification scope and limits.
 
+#[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
     vabs_f32, vdup_n_f32, vdupq_laneq_f32, vdupq_n_f32, vfmaq_f32,
     vget_lane_f32, vgetq_lane_f32, vld1q_f32, vmaxnm_f32, vmaxq_f32,
     vminnm_f32, vsetq_lane_f32, vsubq_f32,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::portable::arm::{
+    vabs_f32, vdup_n_f32, vdupq_laneq_f32, vdupq_n_f32, vfmaq_f32_fz as vfmaq_f32,
+    vget_lane_f32, vgetq_lane_f32, vld1q_f32, vmaxnm_f32_fz as vmaxnm_f32,
+    vmaxq_f32_fz as vmaxq_f32, vsetq_lane_f32, vsubq_f32_fz as vsubq_f32,
+};
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
 /// Maximum native DSP call size. The host balances larger event segments into
 /// `ceil(frames / 64)` chunks before invoking this processor.
@@ -121,15 +129,15 @@ struct Domain {
 
 impl Domain {
     #[inline]
-    fn decode(self, normalized: f32) -> f32 {
+    fn decode(self, normalized: f32, fz: bool) -> f32 {
         let width = self.log_maximum - self.log_minimum;
-        let value = math::expf(normalized.mul_add(width, self.log_minimum)) - 0.0;
-        min_num(max_num(self.minimum, value), self.maximum)
+        let value = math::expf(normalized.arm_mul_add(width, self.log_minimum)) - 0.0;
+        min_num(max_num(self.minimum, value, fz), self.maximum, fz)
     }
 
     #[inline]
-    fn encode(self, value: f32) -> f32 {
-        let value = min_num(max_num(self.minimum, value), self.maximum);
+    fn encode(self, value: f32, fz: bool) -> f32 {
+        let value = min_num(max_num(self.minimum, value, fz), self.maximum, fz);
         let logarithm = math::logf(value + 0.0);
         (logarithm - self.log_minimum) / (self.log_maximum - self.log_minimum)
     }
@@ -185,13 +193,13 @@ impl LimiterModel {
     pub fn decode_editor_parameter(&self, index: u32, normalized: f32) -> Option<LimiterValue> {
         match index {
             0 => {
-                let value = normalized.mul_add(1.0, 0.5) as i32;
+                let value = normalized.arm_mul_add(1.0, 0.5) as i32;
                 Some(LimiterValue::Enabled(value.clamp(0, 1)))
             }
-            1 => Some(LimiterValue::InputGain(self.gain_domain().decode(normalized))),
-            2 => Some(LimiterValue::OutputGain(self.gain_domain().decode(normalized))),
-            3 => Some(LimiterValue::Ceiling(self.ceiling_domain().decode(normalized))),
-            4 => Some(LimiterValue::ReleaseSeconds(self.release_domain.decode(normalized))),
+            1 => Some(LimiterValue::InputGain(self.gain_domain().decode(normalized, false))),
+            2 => Some(LimiterValue::OutputGain(self.gain_domain().decode(normalized, false))),
+            3 => Some(LimiterValue::Ceiling(self.ceiling_domain().decode(normalized, false))),
+            4 => Some(LimiterValue::ReleaseSeconds(self.release_domain.decode(normalized, false))),
             _ => None,
         }
     }
@@ -247,23 +255,27 @@ impl LimiterModel {
 
 #[inline]
 fn model_round_trip(domain: Domain, value: f32, modulation: f32) -> f32 {
-    let normalized = domain.encode(value);
-    let modulated = min_num(max_num(normalized + modulation, 0.0), 1.0);
-    domain.decode(modulated)
+    let normalized = domain.encode(value, true);
+    let modulated = min_num(max_num(normalized + modulation, 0.0, true), 1.0, true);
+    domain.decode(modulated, true)
 }
 
 // The original uses FMAXNM/FMINNM for these operations, including their NaN,
 // signed-zero and current-FPCR behavior. The AArch64 target always has NEON.
 #[inline]
-fn max_num(a: f32, b: f32) -> f32 {
-    // SAFETY: this crate is restricted to macOS AArch64, where NEON is baseline.
-    unsafe { vget_lane_f32::<0>(vmaxnm_f32(vdup_n_f32(a), vdup_n_f32(b))) }
+fn max_num(a: f32, b: f32, fz: bool) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    { let _ = fz; unsafe { vget_lane_f32::<0>(vmaxnm_f32(vdup_n_f32(a), vdup_n_f32(b))) } }
+    #[cfg(target_arch = "x86_64")]
+    { if fz { crate::portable::arm::max_number_fz(a, b) } else { crate::portable::arm::max_number(a, b) } }
 }
 
 #[inline]
-fn min_num(a: f32, b: f32) -> f32 {
-    // SAFETY: this crate is restricted to macOS AArch64, where NEON is baseline.
-    unsafe { vget_lane_f32::<0>(vminnm_f32(vdup_n_f32(a), vdup_n_f32(b))) }
+fn min_num(a: f32, b: f32, fz: bool) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    { let _ = fz; unsafe { vget_lane_f32::<0>(vminnm_f32(vdup_n_f32(a), vdup_n_f32(b))) } }
+    #[cfg(target_arch = "x86_64")]
+    { if fz { crate::portable::arm::min_number_fz(a, b) } else { crate::portable::arm::min_number(a, b) } }
 }
 
 #[inline]
@@ -308,9 +320,9 @@ impl Ramp {
 
     #[inline]
     fn next(&mut self) -> f32 {
-        let phase = self.counter.mul_add(self.step, self.step);
+        let phase = self.counter.arm_mul_add(self.step, self.step);
         self.counter += 1.0;
-        phase.mul_add(self.target - self.start, self.start)
+        phase.arm_mul_add(self.target - self.start, self.start)
     }
 }
 
@@ -652,7 +664,7 @@ impl LimiterDsp {
 
             let measured = peak * parameters.ceiling;
             let coefficient = if !(self.detector >= measured) { self.detector_attack } else { self.detector_release };
-            self.detector = coefficient.mul_add(measured - self.detector, self.detector);
+            self.detector = coefficient.arm_mul_add(measured - self.detector, self.detector);
             let target = if self.detector > model.meters.held_peak {
                 self.hold = 0.0;
                 self.detector
@@ -663,7 +675,7 @@ impl LimiterDsp {
             };
             self.hold += reciprocal_rate;
             let coefficient = if !(self.held >= target) { self.held_attack } else { self.held_release };
-            self.held = coefficient.mul_add(target - self.held, self.held);
+            self.held = coefficient.arm_mul_add(target - self.held, self.held);
             model.meters.held_peak = self.held;
             model.notify_meter(1, 312);
             model.meters.detector = self.detector;
@@ -673,7 +685,7 @@ impl LimiterDsp {
             let (weighted, raw) = self.history_maxima(first);
             last_attenuation = 1.0 / (weighted + 1.0);
             let lower = if raw > weighted { weighted } else { raw };
-            self.peak_state = (lower - weighted).mul_add(decay, weighted);
+            self.peak_state = (lower - weighted).arm_mul_add(decay, weighted);
             *left = last_attenuation * (self.left_ring[first] * output_gain);
             *right = last_attenuation * (self.right_ring[first] * output_gain);
         }
@@ -700,7 +712,10 @@ impl LimiterDsp {
                 history = vsetq_lane_f32::<3>(self.peaks[(first + i + 3) & AUDIO_RING_MASK], history);
                 let weights = vld1q_f32(self.weights.as_ptr().add(i));
                 raw = vmaxq_f32(raw, history);
+                #[cfg(target_arch = "aarch64")]
                 let candidate = vfmaq_f32(base, vsubq_f32(history, base), weights);
+                #[cfg(target_arch = "x86_64")]
+                let candidate = vfmaq_f32(base, weights, vsubq_f32(history, base));
                 weighted = vmaxq_f32(weighted, candidate);
             }
             let w01 = vmaxq_f32(vdupq_laneq_f32::<0>(weighted), vdupq_laneq_f32::<1>(weighted));
@@ -717,7 +732,7 @@ impl LimiterDsp {
 
 #[inline]
 fn lookahead_window(sample_rate: f32) -> usize {
-    let n = sample_rate.mul_add(LOOKAHEAD_SECONDS, 0.5) as i32;
+    let n = sample_rate.arm_mul_add(LOOKAHEAD_SECONDS, 0.5) as i32;
     let n = n.clamp(1, AUDIO_RING_FRAMES as i32) as usize;
     n + (n.wrapping_neg() & 3)
 }

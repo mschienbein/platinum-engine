@@ -7,6 +7,7 @@
 //! The host still owns activation, hosted processing, and end-of-stream policy.
 
 use crate::math;
+use crate::portable::arm_scalar::ArmFloat;
 
 /// Number of frames retained between successive reverse windows.
 pub const OVERLAP: usize = 4_096;
@@ -19,10 +20,13 @@ const LOG_200: f64 = f64::from_bits(0x4015_317a_1b94_9c53);
 // 0x14a9c uses the literal one ULP below the usual rounded sqrt(2).
 const WRAPPER_SQRT_2: f64 = f64::from_bits(0x3ff6_a09e_667f_3bcc);
 
+#[cfg(all(target_os = "macos", not(feature = "portable")))]
 unsafe extern "C" {
     #[link_name = "exp"]
     fn system_exp(value: f64) -> f64;
 }
+#[cfg(any(target_os = "linux", feature = "portable"))]
+use crate::portable::math::exp as system_exp;
 
 #[derive(Clone, Copy, Default)]
 struct Allpass {
@@ -37,13 +41,14 @@ impl Allpass {
         let angle = (frequency * std::f64::consts::PI) / f64::from(sample_rate);
         let k = 1.0 / math::tan(angle);
         let k2 = k * k;
-        let denominator = k.mul_add(WRAPPER_SQRT_2, 1.0) + k2;
+        let denominator = k.arm_mul_add(WRAPPER_SQRT_2, 1.0) + k2;
         let scale = 1.0 / denominator;
-        let a2 = ((-k).mul_add(WRAPPER_SQRT_2, 1.0) + k2) * scale;
+        let a2 = ((-k).arm_mul_add(WRAPPER_SQRT_2, 1.0) + k2) * scale;
         let a1 = (1.0 - k2) * (scale + scale);
         Self { a1, a2 }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[inline]
     fn sample(self, x: f64, negative_a1: f64, negative_a2: f64,
               state0: &mut f64, state1: &mut f64) -> f64 {
@@ -73,6 +78,13 @@ impl Allpass {
             );
         }
         y
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn sample(self, x: f64, negative_a1: f64, negative_a2: f64,
+              state0: &mut f64, state1: &mut f64) -> f64 {
+        crate::portable::arm::phase_sample(self.a1, self.a2, x, negative_a1, negative_a2, state0, state1)
     }
 
     fn backwards(self, input: &[f32], output: &mut [f32]) {
