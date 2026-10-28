@@ -4,7 +4,7 @@ Status: the Rust CLI implements this command surface on macOS arm64. Two Platinu
 
 ## Product boundary
 
-The project targets the current application's audio and file-workflow capabilities in a headless engine, not a recreation of its windows. It does not claim complete feature parity. The original scratch-alignment-dependent pitch behavior, one uninitialized-byte-dependent MP3 header path, and an interleaved AAC diagnostic remain unresolved beyond the observed profiles. Ogg support is not established.
+The project targets the current application's audio and file-workflow capabilities in a headless engine, not a recreation of its windows. It does not claim complete feature parity. Pitch scratch alignment, a native-state-dependent MP3 header path, process-sensitive AAC decoding and MP4 timestamps remain bounded or unresolved. Static reference evidence excludes Ogg extensions from its normal input filter despite vendor advertising.
 
 Production processing uses Rust DSP, macOS AudioToolbox/Accelerate and explicitly configured public native libraries. It does not call the original application or its proprietary components; those are reference-only and optional. macOS arm64 is the current supported build/runtime scope, not a portability claim. The [build guide](../docs/BUILD.md) covers the bridge, optional codecs and isolated configuration.
 
@@ -20,6 +20,7 @@ Production processing uses Rust DSP, macOS AudioToolbox/Accelerate and explicitl
 | `inspect FILE...` | Format/rate/channels/bit depth, tags/artwork, processing marker, original/output/backup paths and status. |
 | `restore FILE...` | Restore original audio from its recorded backup using an explicit, verified source/destination pair; report partial failure instead of pretending success. |
 | `config show/get/set/reset` | Persistent non-account preferences, validation, and explicit effective values. |
+| `statistics show`, `statistics reset --confirm` | Engine-owned cumulative processed-song, repaired-peak and rounded-decibel gauges; explicit reset separate from preferences and vendor state. |
 | `help`, `version`, source/provenance information | Document supported operations and the reference compatibility target without impersonating the original vendor. |
 
 ## Command syntax
@@ -36,6 +37,7 @@ platinum process INPUT... [--jobs N] [--template-index N | --template-id ID]
     [--format wav|aiff|alac|flac|mp3|aac|match-input]
     [--output-dir DIR | --same-folder | --replace-originals --backup-dir DIR]
     [--mirror | --no-mirror] [--mp3-mode cbr320|vbr192]
+    [--overwrite] [--allow-ambiguous-marker]
 platinum analyze INPUT... [--jobs N] [--template-index N | --template-id ID]
 platinum inspect FILE... [--jobs N]
 platinum restore FILE... --backup ABSOLUTE_PATH [--backup ABSOLUTE_PATH ...]
@@ -49,6 +51,8 @@ platinum config show
 platinum config get FIELD
 platinum config set FIELD JSON_VALUE
 platinum config reset [FIELD]
+platinum statistics show
+platinum statistics reset --confirm
 ```
 
 Template manager indices are zero-based with built-ins first; IDs are exact,
@@ -71,15 +75,72 @@ requires **both** `--replace-originals` and an explicit existing `--backup-dir`
 on every invocation, even if replacement is persisted in the configuration.
 Replacement forces match-input; a conflicting explicit format is rejected.
 Each backup is copied and verified before publication and retained afterward.
-Other outputs never intentionally overwrite an existing destination. Batch
-destination and selected-source conflicts are checked before starting workers.
+Separate outputs refuse an existing destination by default. `--overwrite`
+explicitly permits atomic replacement of a regular, non-symlink output file;
+it is invocation-only and cannot be combined with `--replace-originals`. It
+never authorizes overwriting a selected input, a hard link to a selected input,
+a directory, a symlink, or another batch destination. Batch destination and
+selected-source conflicts are checked before starting workers, including
+case-equivalent names on case-insensitive volumes and selected files whose own
+preflight failed. Each destination's absent/present identity is captured at
+batch preflight and must still match at staging and commit. Existing outputs
+are atomically swapped with the completed stage, then the displaced entry is
+identity-, metadata-, and SHA-256-checked; an unexpected entry is swapped back
+instead of discarded. A rollback's displaced stage is checked against its
+pinned identity, metadata, and digest and retained even when unchanged, since a
+writer may still hold an open descriptor. Failed process results report its
+`error.recovery_path`; the retained file is never automatically deleted.
 Each worker uses the exact preflight plan and identity; a source changed after
 preflight is rejected rather than inspected and planned again.
-Restore pairs each file with the correspondingly ordered explicit `--backup`
-argument and verifies it against the marker read from that file. The source
-identity captured before marker inspection must still match under the restore
-reservation. Marker-only restore requires the tag bridge, not an audio decoder;
-the backup is not consumed, and supplied backup paths must be absolute.
+Process JSON includes `details.overwrite`,
+`details.effective_config.overwrite` and per-item
+`report.replaced_existing_output` (false for new output or source replacement).
+These checks detect ordinary concurrent writers; a same-user process that
+deliberately modifies the private workspace during a transaction can defeat
+them. On case-sensitive APFS, which is normalization-insensitive, canonically
+equivalent Unicode names are compared lexically, so such a batch can fail after
+an earlier job publishes;
+the no-replace or identity-checked publication still prevents clobbering.
+
+Before reading markers or publishing any file, restore snapshots every target
+and backup, freezes each backup's identity and SHA-256, and rejects the whole
+request if any target aliases any backup by path or inode. Restore then pairs
+each file with the correspondingly ordered explicit `--backup` argument and
+verifies it against the marker read from that file. The source identity captured
+before marker inspection must still match under the restore reservation.
+Marker-only restore requires the tag bridge, not an audio decoder; supplied
+backup paths must be absolute. After publication, the restored bytes
+and metadata are verified, the restored file receives `F_FULLFSYNC`, and its
+parent directory is synced before consuming the backup. Backup consumption
+honours the same path reservations as source-replacement jobs. The verified
+backup is exclusively moved into a private sibling quarantine, rechecked, then
+unlinked. Requests sharing a backup path or inode are restored as a group:
+every member must succeed before any authorized backup path is consumed; if
+any member fails or cannot be inspected, the backup is retained. The frozen
+backup is rechecked before every member and before consumption. Original
+processed inodes are retained until the group completes; if a frozen backup
+changes mid-group, published members are rolled back where safe, otherwise
+the recovery path and rollback failure are reported.
+
+If a sync, identity check, reservation, quarantine, or removal fails,
+restoration remains successful and the report contains `backup_removed: false`
+plus a structured `backup_removal_error` with `operation`, `path`, `message`,
+`retained_path`, and `unexpected_path`. `retained_path` is null if the verified
+backup's location is unknown; `unexpected_path` separately identifies an
+unverified entry retained after a race. On normal removal success
+`backup_removed` is true and `backup_removal_error` is null; a quarantine
+directory cleanup warning can accompany `backup_removed: true`.
+`details.backup_policy` is `remove_after_verified_restore`.
+
+`--allow-ambiguous-marker` is a process-only, nonpersistent override for one
+WAV `PLTN` whose payload is empty or whose canonical Base64 decodes to an
+incomplete JSON object. It can reprocess an already-processed file with a
+damaged or empty marker; the default remains refusal. The report names each
+applied override. Valid processed markers, `_PN` suffixes, duplicate `PLTN`
+chunks and suspicious trailing marker bytes remain refused. An ambiguous
+override also refuses any bytes beyond the declared RIFF. Analysis, inspection
+and restore keep their strict marker rules. This is an explicit user-selected
+safety policy, not default admission parity with the original.
 
 For a first run, use a disposable copy of an input and an existing separate
 output directory. After following the build guide, set `INPUT` and `OUTPUT_DIR`
@@ -110,10 +171,11 @@ restore using the corresponding **absolute** backup path:
   --backup "$BACKUP_PATH"
 ```
 
-Restore replaces the processed file with a verified copy of the backup and
-retains the backup. A separate-output file or a nil marker without a recorded
-backup cannot authorize this restore; keep the independent copy and reported
-backup for recovery instead.
+Restore replaces the processed file with a verified copy of the backup and,
+after verifying the published copy, consumes that backup. Check `backup_removed`
+and `backup_removal_error` in the per-file report. A separate-output file or a
+nil marker without a recorded backup cannot authorize restore; keep the
+independent copy and reported backup for recovery instead.
 
 JSON processing reports expose `processing_marker_status`. `present` means the
 stored marker was decoded and checked against the actual processing result.
@@ -137,6 +199,38 @@ command path is represented as an object containing display text and exact
 `unix_bytes_hex`. Exit status is 0 for success, 1 for failure or partial
 failure, 2 for command/usage errors, and 130 for cancellation. The status of
 each file remains visible when outcomes are mixed.
+
+## Cumulative gauges
+
+Successful CLI processing records one song, its repaired-peak count, and its
+binary32 absolute input/output-volume difference rounded to the nearest integer
+with ties away from zero. The counters use native signed-64 wrapping additions.
+The instruction-derived nontrapping conversion maps NaN to zero and positive
+overflow to `i64::MAX`; those edge cases are not observed GUI parity claims.
+The original's status-4 error path can increment despite failed publication;
+the Engine instead counts only returned successful processing reports.
+
+`statistics.json` and `statistics.lock` live in the Engine state directory,
+separate from `settings.json` and all Platinum Notes preferences. An absent file
+starts a new baseline; no historical or vendor totals are imported. The first
+recorded time is the recording host's Unix-millisecond clock, not necessarily
+the first audio-processing time. Explicit reset clears gauges and that date;
+configuration reset and audio restore do not change the gauges.
+
+Cooperating processes serialize read/modify/write and reset under the permanent
+lock. First publication is no-replace; existing-state updates use identity checks
+and atomic rename. Malformed state is preserved and reported, not reset silently.
+Cancellation prevents a reset if it wins the shared publication boundary.
+After audio is published, accounting is attempted immediately; a cancelled wait
+on a contended statistics lock reports that the audio exists but was not counted.
+Cleanup failures remain failures rather than clean cancellations.
+
+Audio and statistics are separate commits, not crash-atomic exactly-once
+accounting. An accounting error never removes or relabels successful audio.
+The per-file result retains its report and a separate statistics outcome; a
+post-rename sync error reports published-but-durability-uncertain and must not
+be blindly retried.
+
 
 ## Processing controls
 
@@ -240,9 +334,32 @@ establish encoded-file parity.
 The CLI accepts `wav`, `aiff`, `alac`, `flac`, `mp3`, `aac`, and
 `match-input` output selections. AAC and ALAC use an M4A container. Input
 discovery recognizes WAV, AIFF/AIF, MP3, M4A and FLAC; protected M4P/WL.MP3
-and unverified Ogg sources are rejected. Actual decoding and encoding still
-depend on the source and the host codecs, and these options do not establish
-byte parity. The interleaved AAC diagnostic remains unresolved.
+and `.ogg` sources are rejected. The reference's recovered normal extension
+filter excludes `.ogg` and `.oga`; its lower-level decoder can open generated
+Ogg fixtures, which does not establish GUI admission. Actual decoding and
+encoding depend on the source and host codecs, and these options do not
+establish byte parity.
+
+`analyze` obtains waveform data in a separate read pass requesting 44.1 kHz
+interleaved float32. Each nonempty read of at most 512 frames produces one
+pair of sequential float32 mean-absolute amplitudes, using the last two
+channels or duplicating mono. A short read remains its own bin; it is not
+zero-padded. JSON reports both the requested rate and the decoder's actual
+rate, frame positions and actual bin lengths. The original FLAC rate setter
+is a no-op, so FLAC waveform data retains its source rate. Analysis of FLAC
+with more than two channels currently fails closed: the native interleaved
+path can leave part of the returned buffer uninitialized, and deterministic
+waveform values for that suffix have not been established. No analysis
+report is returned for that unsupported path.
+
+For a processed file, the primary waveform describes that file. An original
+waveform is available only when a readable backup is explicitly identified
+by its processing marker; otherwise its unavailability is reported. Native
+component captures verify the reducer for three input sequences, not every
+decoder, resampler, file or GUI cache behavior.
+A separate four-case generated PCM16 WAV comparison at 44.1/48 kHz (mono/stereo)
+matched every native decoder float byte and read boundary; the release CLI's
+resulting bins also match.
 
 MP3 output exposes `cbr320` and `vbr192`. The implementation derives bit depth,
 sample-rate adaptation and channel handling from the source and selected

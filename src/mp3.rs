@@ -28,7 +28,6 @@ pub enum Mp3Error {
     InvalidConfiguration(&'static str),
     InvalidBuffer(&'static str),
     Lame { operation: &'static str, code: i32 },
-    NativeStateRequired,
     StreamFailed,
     TagRewriteFailed,
 }
@@ -42,7 +41,6 @@ impl fmt::Display for Mp3Error {
             Self::UnsupportedVersion(v) => write!(f, "LAME 3.100 required; library reports {v:?}"),
             Self::InvalidConfiguration(s) | Self::InvalidBuffer(s) => f.write_str(s),
             Self::Lame { operation, code } => write!(f, "LAME {operation} failed ({code})"),
-            Self::NativeStateRequired => write!(f, "native header update reads a caller stack byte before initializing it as a result; its actual value is required for this source"),
             Self::StreamFailed => write!(f, "MP3 stream was invalidated by an earlier error"),
             Self::TagRewriteFailed => write!(f, "LAME tag rewrite did not write its reported frame"),
         }
@@ -234,7 +232,10 @@ pub struct Mp3Config {
     pub source: SourceHeader,
     /// Oracle/debug context only; never surface as a normal CLI setting.
     /// The original updater reads this byte before initializing it in some
-    /// branches. If unavailable, finish fails rather than guessing.
+    /// branches. `None` applies the nonzero branch: static analysis shows the
+    /// reused caller slot holds the limiter AudioUnit handle, whose byte 3 is
+    /// 0x80..0xff on the in-process AudioToolbox creation path, and that
+    /// branch matches the retained native exports.
     #[doc(hidden)]
     pub native_update_result_byte_3: Option<u8>,
 }
@@ -584,28 +585,33 @@ fn inspect_mp3_reader<R: Read + Seek>(reader: &mut R) -> Result<Mp3Header, Mp3Er
     Ok(result)
 }
 
-fn update_source_header(file: &mut File, source: &Mp3Header, scratch_byte: Option<u8>) -> Result<bool, Mp3Error> {
-    let mut window = read_scan(file)?;
-    let Some(loc) = locate_header(&window.data) else { return Ok(false); };
-    let data = &mut window.data;
+fn prepare_source_header_update(
+    data: &mut [u8],
+    loc: LocatedHeader,
+    source: &Mp3Header,
+    scratch_byte: Option<u8>,
+) -> Result<usize, Mp3Error> {
     let first_mode = (loc.word >> 6) & 3;
     let tag = loc.xing + 120;
     let recognized = recognized_lame(data, tag);
+    let forced_tag = recognized && source.lame_identifier.is_some();
     let mut end = loc.frame + 4;
     data[loc.xing..loc.xing + 4].copy_from_slice(if source.xing { b"Xing" } else { b"Info" });
-
-    let has_tag = if recognized && source.lame_identifier.is_some() {
-        true
-    } else {
-        if recognized {
-            let available = loc.frame_size.saturating_sub(tag - loc.frame).min(36);
-            if available != 0 {
-                data[tag..tag + available].fill(0);
-                end = end.max(tag + available);
-            }
+    if recognized && source.lame_identifier.is_none() {
+        let available = loc.frame_size.saturating_sub(tag - loc.frame).min(36);
+        if available != 0 {
+            data[tag..tag + available].fill(0);
+            end = end.max(tag + available);
         }
-        scratch_byte.ok_or(Mp3Error::NativeStateRequired)? != 0
-    };
+    }
+    let mode = if source.stereo_mode_change {
+        if first_mode == loc.second_mode { loc.second_mode ^ 1 } else { first_mode }
+    } else { loc.second_mode };
+    let new_word = (loc.word & !(3 << 6)) | (mode << 6);
+    data[loc.frame..loc.frame + 4].copy_from_slice(&new_word.to_be_bytes());
+    // The native updater reads result byte 3 uninitialized on this path; an
+    // unspecified caller byte selects the statically established nonzero branch.
+    let has_tag = forced_tag || scratch_byte.map_or(true, |byte| byte != 0);
     if has_tag {
         if let Some(id) = source.lame_identifier {
             if id[0] != 0 {
@@ -615,13 +621,7 @@ fn update_source_header(file: &mut File, source: &Mp3Header, scratch_byte: Optio
                 end = end.max(tag + 9);
             }
         }
-    }
-    let mode = if source.stereo_mode_change {
-        if first_mode == loc.second_mode { loc.second_mode ^ 1 } else { first_mode }
-    } else { loc.second_mode };
-    let new_word = (loc.word & !(3 << 6)) | (mode << 6);
-    data[loc.frame..loc.frame + 4].copy_from_slice(&new_word.to_be_bytes());
-    if has_tag {
+        // The header word above is also part of the CRC computed below.
         let old = (u32::from(data[tag + 21]) << 16) | (u32::from(data[tag + 22]) << 8) | u32::from(data[tag + 23]);
         let delay = source.encoder_delay.min(4095);
         let packed = (delay << 12) | (old & 4095);
@@ -633,9 +633,153 @@ fn update_source_header(file: &mut File, source: &Mp3Header, scratch_byte: Optio
         data[tag + 34..tag + 36].copy_from_slice(&written_crc.to_be_bytes());
         end = end.max(tag + 36);
     }
+    Ok(end)
+}
+
+fn update_source_header<R: Read + Write + Seek>(file: &mut R, source: &Mp3Header, scratch_byte: Option<u8>) -> Result<bool, Mp3Error> {
+    let mut window = read_scan(file)?;
+    let Some(loc) = locate_header(&window.data) else { return Ok(false); };
+    let end = prepare_source_header_update(&mut window.data, loc, source, scratch_byte)?;
     if end > loc.frame {
         file.seek(SeekFrom::Start(window.base + loc.frame as u64))?;
-        file.write_all(&data[loc.frame..end])?;
+        file.write_all(&window.data[loc.frame..end])?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod source_update_tests {
+    use super::*;
+
+    fn source_without_lame(xing: bool) -> Mp3Header {
+        Mp3Header {
+            valid_layer3: true,
+            xing,
+            info: !xing,
+            encoder_delay: 576,
+            start_skip_samples: 1105,
+            stereo_mode_change: true,
+            stereo_mode: 1,
+            ..Mp3Header::default()
+        }
+    }
+
+    // The short MPEG-1 frame ends before the fixed-offset LAME fields, which
+    // are therefore in the second frame. The native erase then clears zero
+    // bytes. These synthetic files contain no audio from an application.
+    fn output_fixture(short: bool, id3: bool, xing: bool, recognized: bool) -> Vec<u8> {
+        let prefix = if id3 { 15 } else { 0 };
+        let size = if short { 104 } else { 417 };
+        let word = if short { 0xfffb_1000u32 } else { 0xfffb_9000u32 };
+        let mut bytes = vec![0; prefix + size * 4];
+        if id3 { bytes[..15].copy_from_slice(b"ID3\x04\x00\x00\x00\x00\x00\x05abcde"); }
+        for frame in 0..4 {
+            let mode = u32::from(frame != 0);
+            let pos = prefix + frame * size;
+            bytes[pos..pos + 4].copy_from_slice(&(word | mode << 6).to_be_bytes());
+        }
+        let marker = prefix + 36;
+        bytes[marker..marker + 4].copy_from_slice(if xing { b"Xing" } else { b"Info" });
+        let tag = marker + 120;
+        if recognized { bytes[tag..tag + 9].copy_from_slice(b"LAME3.100"); }
+        let packed = (576u32 << 12) | 1000;
+        bytes[tag + 21] = (packed >> 16) as u8;
+        bytes[tag + 22] = (packed >> 8) as u8;
+        bytes[tag + 23] = packed as u8;
+        let crc = u16::from(crc16(&bytes[prefix..tag + 34]) == 0);
+        bytes[tag + 34..tag + 36].copy_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
+    fn updated(input: &[u8], source: &Mp3Header, scratch: Option<u8>) -> Result<Vec<u8>, Mp3Error> {
+        let mut file = io::Cursor::new(input.to_vec());
+        update_source_header(&mut file, source, scratch)?;
+        Ok(file.into_inner())
+    }
+
+    #[test]
+    fn unknown_scratch_accepts_identical_complete_file_effects() {
+        for id3 in [false, true] {
+            for xing in [false, true] {
+                for recognized in [false, true] {
+                    let input = output_fixture(true, id3, xing, recognized);
+                    let source = source_without_lame(xing);
+                    let zero = updated(&input, &source, Some(0)).unwrap();
+                    // The pinned native updater left these same fixtures
+                    // byte-identical for both controlled scratch branches.
+                    assert_eq!(zero, input);
+                    for byte in [1, 2, 128, 255] {
+                        assert_eq!(updated(&input, &source, Some(byte)).unwrap(), zero);
+                    }
+                    assert_eq!(updated(&input, &source, None).unwrap(), zero);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_scratch_uses_the_nonzero_branch_when_effects_differ() {
+        let source = source_without_lame(true);
+        let mut bad_crc = output_fixture(true, false, true, true);
+        bad_crc[36 + 120 + 35] ^= 1;
+        let erased_tag = output_fixture(false, false, true, true);
+        let changed_marker = output_fixture(true, false, false, true);
+        for input in [&bad_crc, &erased_tag, &changed_marker] {
+            let zero = updated(input, &source, Some(0)).unwrap();
+            let one = updated(input, &source, Some(1)).unwrap();
+            assert_ne!(zero, one);
+            assert_eq!(updated(input, &source, None).unwrap(), one);
+        }
+    }
+
+    #[test]
+    fn recognized_source_and_output_force_the_tag_branch() {
+        let mut source = source_without_lame(true);
+        source.lame_identifier = Some(*b"LAME3.100");
+        source.correct_crc = true;
+        let input = output_fixture(false, true, true, true);
+        let zero = updated(&input, &source, Some(0)).unwrap();
+        assert_eq!(updated(&input, &source, Some(255)).unwrap(), zero);
+        assert_eq!(updated(&input, &source, None).unwrap(), zero);
+
+        let unrecognized = output_fixture(false, false, true, false);
+        assert_ne!(updated(&unrecognized, &source, Some(0)).unwrap(),
+            updated(&unrecognized, &source, Some(1)).unwrap());
+        assert_eq!(updated(&unrecognized, &source, None).unwrap(),
+            updated(&unrecognized, &source, Some(1)).unwrap());
+    }
+
+    #[test]
+    fn output_without_xing_or_info_needs_no_scratch_state() {
+        let source = source_without_lame(true);
+        for id3 in [false, true] {
+            let mut input = output_fixture(true, id3, true, true);
+            let marker = if id3 { 51 } else { 36 };
+            input[marker..marker + 4].copy_from_slice(b"NONE");
+            let mut file = io::Cursor::new(input.clone());
+            assert!(!update_source_header(&mut file, &source, None).unwrap());
+            assert_eq!(file.into_inner(), input);
+        }
+    }
+
+    #[test]
+    fn unknown_scratch_nonzero_branch_extends_a_short_file() {
+        let mut input = vec![0u8; 163];
+        for (frame, pos) in [0usize, 26, 52].into_iter().enumerate() {
+            let word = 0xfff3_1000u32 | (u32::from(frame != 0) << 6);
+            input[pos..pos + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        input[21..25].copy_from_slice(b"Xing");
+        input[162] = 0x24; // 576 << 12; the remaining delay/padding bytes are EOF zeros.
+        let window = read_scan(&mut io::Cursor::new(&input)).unwrap();
+        if crc16(&window.data[..175]) == 0 { input[120] ^= 1; }
+        let source = source_without_lame(true);
+        let zero = updated(&input, &source, Some(0)).unwrap();
+        let one = updated(&input, &source, Some(1)).unwrap();
+        assert_eq!(zero.len(), 163);
+        assert_eq!(one.len(), 177);
+        assert_eq!(&one[..zero.len()], zero.as_slice());
+        assert!(one[zero.len()..].iter().all(|&byte| byte == 0));
+        assert_eq!(updated(&input, &source, None).unwrap(), one);
+    }
 }

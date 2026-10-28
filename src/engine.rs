@@ -1,6 +1,6 @@
 //! Streaming Platinum Notes controller integration. The implementations behind
 //! these calls are native reconstructions, not the proprietary application.
-//! Complete encoded-file identity is a separate, not-yet-established gate.
+//! Complete encoded-file identity is established only for a pinned reference case.
 
 use crate::apple_codec::{
     self, AudioBuffer, AudioBufferList, StereoBufferList, StreamDescription,
@@ -15,7 +15,7 @@ use crate::file_workflow::{self, AudioFormat, Cancellation, DiscoveredFile, File
 use crate::fp_mode::with_flush_to_zero;
 use crate::limiter::{LimiterContext, LimiterDsp, LimiterModel, LimiterValue};
 use crate::loudness::{GainAnalyzer, LoudnessMeter};
-use crate::metadata::{Marker, ProcessingMarker};
+use crate::metadata::{self, Marker, ProcessingMarker};
 use crate::multipass::{CrossoverFrequencyScale, ParameterWrite, ShippedPreset};
 use crate::multipass_graph::{GraphContext, MultipassGraph};
 use crate::phase::PhaseCorrection;
@@ -38,29 +38,30 @@ const VERSION: &str = "10.5.0.1256";
 
 /// An error is never a successful or partially successful processing report.
 /// `partial_publication` means the destination was published before an error;
-/// `retained_backup` identifies a backup that must not be discarded.
+/// `retained_backup` and `recovery_path` identify files that must not be discarded.
 #[derive(Debug, Serialize)]
 pub struct EngineError {
     pub stage: &'static str,
     pub message: String,
     pub cancelled: bool,
     pub retained_backup: Option<PathBuf>,
+    pub recovery_path: Option<PathBuf>,
     pub partial_publication: bool,
 }
 impl EngineError {
     fn new(stage: &'static str, error: impl fmt::Display) -> Self {
-        Self { stage, message: error.to_string(), cancelled: false, retained_backup: None, partial_publication: false }
+        Self { stage, message: error.to_string(), cancelled: false, retained_backup: None, recovery_path: None, partial_publication: false }
     }
     fn cancelled(stage: &'static str) -> Self {
-        Self { stage, message: "processing cancelled".into(), cancelled: true, retained_backup: None, partial_publication: false }
+        Self { stage, message: "processing cancelled".into(), cancelled: true, retained_backup: None, recovery_path: None, partial_publication: false }
     }
     fn workflow(stage: &'static str, error: WorkflowError) -> Self {
-        let (backup, published) = match &error {
-            WorkflowError::Transaction { backup, published, .. } => (backup.clone(), *published),
-            _ => (None, false),
+        let (backup, recovery, published) = match &error {
+            WorkflowError::Transaction { backup, recovery, published, .. } => (backup.clone(), recovery.clone(), *published),
+            _ => (None, None, false),
         };
         let cancelled = error.is_cancelled();
-        Self { stage, message: error.to_string(), cancelled, retained_backup: backup, partial_publication: published }
+        Self { stage, message: error.to_string(), cancelled, retained_backup: backup, recovery_path: recovery, partial_publication: published }
     }
 }
 impl fmt::Display for EngineError {
@@ -84,6 +85,8 @@ pub struct ProcessReport {
     pub processing_sample_rate: f64,
     pub output_path: PathBuf,
     pub backup_path: Option<PathBuf>,
+    /// Whether a distinct pre-existing output was atomically replaced.
+    pub replaced_existing_output: bool,
     pub input_format: String,
     pub output_format: String,
     pub sample_rate: f64,
@@ -110,6 +113,11 @@ pub struct ProcessReport {
     pub applied_stages: Vec<String>,
     /// `present`, `nil_payload_absent`, or `nil_payload_empty_wav_chunk`.
     pub processing_marker_status: &'static str,
+    /// An explicitly authorized ambiguous input marker, if one was used.
+    pub input_marker_override: Option<&'static str>,
+    /// Diagnostic only: the supplied second (since 1904) written to every MP4
+    /// creation/modification header field instead of the AudioToolbox clock.
+    pub controlled_mp4_time_1904: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,10 +150,12 @@ pub struct ReportedDynamics {
     pub compression_applied: bool,
 }
 
-/// Per-second extrema of decoded graph-output samples, excluding padded EOF frames.
+/// Per-read channel mean-absolute amplitudes used by the native waveform view.
+/// Apple inputs request 44.1 kHz; the native FLAC route retains its source rate.
 #[derive(Debug, Serialize)]
 pub struct Waveform {
     pub path: PathBuf,
+    pub requested_sample_rate: f64,
     pub sample_rate: f64,
     pub channels: u32,
     pub layout: &'static str,
@@ -156,9 +166,10 @@ pub struct Waveform {
 pub struct WaveformBin {
     pub start_frame: u64,
     pub frames: u32,
-    pub minimum: Option<f32>,
-    pub maximum: Option<f32>,
-    pub non_finite_samples: u64,
+    #[serde(serialize_with = "float_json")]
+    pub left_mean_absolute: f32,
+    #[serde(serialize_with = "float_json")]
+    pub right_mean_absolute: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +243,71 @@ fn read_marker(bridge: &TagBridge, path: &Path, format: tags::Format) -> Result<
         .map(|payload| Marker::from_encoded_bytes(&payload).map_err(|e| EngineError::new("decode marker", e))).transpose()
 }
 
+enum InspectedMarker {
+    Known(Option<Marker>),
+    AuthorizedAmbiguous(&'static str),
+}
+
+fn read_process_marker(bridge: &TagBridge, path: &Path, format: tags::Format, allow: bool) -> Result<InspectedMarker, EngineError> {
+    let payload = bridge.read_processing_marker(path, format).map_err(|e| EngineError::new("read marker", e))?;
+    let layout = if format == tags::Format::Wav {
+        let mut input = fs::File::open(path).map_err(|e| EngineError::new("read marker", e))?;
+        Some(metadata::wav_marker_layout(&mut input).map_err(|e| EngineError::new("read marker", e))?)
+    } else {
+        None
+    };
+    admit_process_marker(payload.as_deref(), format, allow, layout)
+}
+
+fn admit_process_marker(
+    payload: Option<&[u8]>, format: tags::Format, allow: bool, layout: Option<metadata::WavMarkerLayout>,
+) -> Result<InspectedMarker, EngineError> {
+    if format == tags::Format::Wav {
+        let layout = layout.ok_or_else(|| EngineError::new("read marker", "missing WAV marker layout"))?;
+        if layout.marker_count > 1 {
+            return Err(EngineError::new("decode marker", "multiple WAV PLTN chunks are refused for processing; a processed marker may be hidden"));
+        }
+        if layout.trailing_marker_risk {
+            return Err(EngineError::new("decode marker", "possible PLTN byte sequence or partial identifier overlapping or after the declared RIFF end; processing refused"));
+        }
+        if (layout.marker_count == 0) != payload.is_none() {
+            return Err(EngineError::new("read marker", "WAV marker layout changed during inspection"));
+        }
+    }
+    let marker = decode_process_marker(payload, format, allow)?;
+    if matches!(&marker, InspectedMarker::AuthorizedAmbiguous(_)) {
+        let layout = layout.ok_or_else(|| EngineError::new("read marker", "missing WAV marker layout"))?;
+        if layout.marker_count != 1 {
+            return Err(EngineError::new("decode marker", "ambiguous-marker override requires exactly one WAV PLTN chunk"));
+        }
+        if layout.trailing_bytes {
+            return Err(EngineError::new("decode marker", "ambiguous-marker override refuses bytes after the declared RIFF end"));
+        }
+    }
+    Ok(marker)
+}
+
+fn decode_process_marker(payload: Option<&[u8]>, format: tags::Format, allow: bool) -> Result<InspectedMarker, EngineError> {
+    let Some(payload) = payload else { return Ok(InspectedMarker::Known(None)); };
+    let parsed = if format == tags::Format::Wav {
+        metadata::marker_for_wav_processing(payload)
+    } else {
+        Marker::from_encoded_bytes(payload).map_err(|error| (error, None))
+    };
+    match parsed {
+        Ok(marker) => Ok(InspectedMarker::Known(Some(marker))),
+        Err((error, ambiguous)) => {
+            match ambiguous {
+                Some(kind) if allow => Ok(InspectedMarker::AuthorizedAmbiguous(kind)),
+                Some(kind) => Err(EngineError::new("decode marker", format!(
+                    "{error}; ambiguous WAV marker ({kind}) requires --allow-ambiguous-marker for processing, subject to other safeguards; this may reprocess an already processed file"
+                ))),
+                None => Err(EngineError::new("decode marker", error)),
+            }
+        }
+    }
+}
+
 /// Read only the marker and retain the identity captured before the read.
 /// Restore does not need an audio decoder or a full metadata inspection.
 pub fn read_restore_marker(path: &Path, settings: &Settings) -> Result<(FileIdentity, Option<Marker>), EngineError> {
@@ -255,20 +331,32 @@ fn marker_json(marker: Option<&Marker>) -> Result<Option<serde_json::Value>, Eng
     Ok(Some(serde_json::from_slice(&bytes).map_err(|e| EngineError::new("serialize marker", e))?))
 }
 
-/// Inspect using the actual decoder, container tag reader and decoded marker.
-/// Absence and a malformed present marker are distinct outcomes.
-pub fn inspect_file(path: &Path, settings: &Settings) -> Result<InspectionReport, EngineError> {
+enum InspectionOutcome {
+    Known(InspectionReport),
+    AuthorizedAmbiguous { kind: &'static str, source_codec: SourceCodec, input_format: String },
+}
+
+// `process_override` is None for strict inspection and Some for process
+// preflight. An authorized ambiguity never becomes a public inspection report.
+fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: Option<bool>) -> Result<InspectionOutcome, EngineError> {
     require_reportable_path(path, "inspect input")?;
     let identity = file_workflow::FileIdentity::capture(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
     let family = source_tag_format(path)?;
     let bridge = bridge(settings)?;
     let tag_inspection = bridge.inspect(path, family).map_err(|e| EngineError::new("inspect tags", e))?;
-    let marker = read_marker(&bridge, path, family)?;
-    let state = file_workflow::processed_state(path, marker.as_ref()).map_err(|e| EngineError::workflow("inspect marker", e))?;
+    let marker = match process_override {
+        Some(allow) => read_process_marker(&bridge, path, family, allow)?,
+        None => InspectedMarker::Known(read_marker(&bridge, path, family)?),
+    };
+    let state = match &marker {
+        InspectedMarker::Known(marker) => Some(file_workflow::processed_state(path, marker.as_ref()).map_err(|e| EngineError::workflow("inspect marker", e))?),
+        InspectedMarker::AuthorizedAmbiguous(_) => None,
+    };
     let (processing_state, backup_path) = match &state {
-        ProcessingState::Unprocessed => ("unprocessed", None),
-        ProcessingState::Suffixed => ("suffixed", None),
-        ProcessingState::Marked { backup } => ("marked", backup.clone()),
+        Some(ProcessingState::Unprocessed) => (Some("unprocessed"), None),
+        Some(ProcessingState::Suffixed) => (Some("suffixed"), None),
+        Some(ProcessingState::Marked { backup }) => (Some("marked"), backup.clone()),
+        None => (None, None),
     };
     let (backup_exists, backup_error) = match &backup_path {
         None => (None, None),
@@ -286,11 +374,30 @@ pub fn inspect_file(path: &Path, settings: &Settings) -> Result<InspectionReport
     let (bitrate, bitrate_error) = match reader.bitrate() { Ok(b) => (Some(b), None), Err(e) => (None, Some(e.to_string())) };
     reader.close().map_err(|e| EngineError::new("close input", e))?;
     identity.verify(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let marker_json = marker_json(marker.as_ref())?;
-    Ok(InspectionReport { path: path.to_owned(), input_format: format_label(path, codec), sample_rate: source.sample_rate,
-        channels: source.channels_per_frame, bit_depth: source.bits_per_channel, frames: frames as u64,
-        bitrate, bitrate_error, processed: state != ProcessingState::Unprocessed, processing_state,
-        backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, marker, source_codec: codec })
+    let input_format = format_label(path, codec);
+    match marker {
+        InspectedMarker::Known(marker) => {
+            let marker_json = marker_json(marker.as_ref())?;
+            let state = state.expect("known marker has a processing state");
+            Ok(InspectionOutcome::Known(InspectionReport { path: path.to_owned(), input_format, sample_rate: source.sample_rate,
+                channels: source.channels_per_frame, bit_depth: source.bits_per_channel, frames: frames as u64,
+                bitrate, bitrate_error, processed: state != ProcessingState::Unprocessed,
+                processing_state: processing_state.expect("known marker has a processing state"),
+                backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, marker, source_codec: codec }))
+        }
+        InspectedMarker::AuthorizedAmbiguous(kind) => Ok(InspectionOutcome::AuthorizedAmbiguous {
+            kind, source_codec: codec, input_format,
+        }),
+    }
+}
+
+/// Inspect using the actual decoder, container tag reader and decoded marker.
+/// Absence and a malformed present marker are distinct outcomes.
+pub fn inspect_file(path: &Path, settings: &Settings) -> Result<InspectionReport, EngineError> {
+    match inspect_file_with_policy(path, settings, None)? {
+        InspectionOutcome::Known(report) => Ok(report),
+        InspectionOutcome::AuthorizedAmbiguous { .. } => Err(EngineError::new("inspect marker", "ambiguous marker cannot be inspected")),
+    }
 }
 
 /// A plan and the source identity and codec on which it was based.
@@ -301,23 +408,49 @@ pub struct PreparedProcess {
     identity: FileIdentity,
     source_codec: SourceCodec,
     input_format: String,
+    input_marker_override: Option<&'static str>,
+    controlled_mp4_time_1904: Option<u32>,
 }
 impl PreparedProcess {
     pub fn output_plan(&self) -> &OutputPlan { &self.plan }
+    pub fn input_marker_override(&self) -> Option<&'static str> { self.input_marker_override }
+    /// Authorize overwrite using a shared guard for the complete selected batch.
+    pub fn enable_overwrite(&mut self, guard: std::sync::Arc<file_workflow::OverwriteGuard>) -> Result<(), EngineError> {
+        self.plan.enable_overwrite(guard).map_err(|e| EngineError::workflow("plan overwrite", e))
+    }
+    /// Diagnostic clock control: AAC/ALAC outputs store `seconds_since_1904`
+    /// in all MP4 header time fields. Other formats are unaffected.
+    #[doc(hidden)]
+    pub fn with_controlled_mp4_time(mut self, seconds_since_1904: u32) -> Self {
+        self.controlled_mp4_time_1904 = Some(seconds_since_1904);
+        self
+    }
 }
 
 /// Inspect and plan a source for later batch validation and processing.
-pub fn prepare_file(input: &DiscoveredFile, settings: &Settings) -> Result<PreparedProcess, EngineError> {
+/// An explicit override accepts an ambiguous WAV marker and may reprocess a
+/// previously processed file; valid processed markers are still refused.
+pub fn prepare_file(input: &DiscoveredFile, settings: &Settings, allow_ambiguous_marker: bool) -> Result<PreparedProcess, EngineError> {
     let identity = FileIdentity::capture(&input.path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let inspection = inspect_file(&input.path, settings)?;
+    let inspection = inspect_file_with_policy(&input.path, settings, Some(allow_ambiguous_marker))?;
     identity.verify(&input.path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let plan = OutputPlan::new(input, inspection.source_codec, &settings.output, inspection.marker.as_ref())
-        .map_err(|e| EngineError::workflow("plan output", e))?;
+    let (plan, source_codec, input_format, input_marker_override) = match inspection {
+        InspectionOutcome::Known(inspection) => {
+            let plan = OutputPlan::new(input, inspection.source_codec, &settings.output, inspection.marker.as_ref())
+                .map_err(|e| EngineError::workflow("plan output", e))?;
+            (plan, inspection.source_codec, inspection.input_format, None)
+        }
+        InspectionOutcome::AuthorizedAmbiguous { kind, source_codec, input_format } => {
+            let plan = OutputPlan::for_authorized_ambiguous_marker(input, source_codec, &settings.output)
+                .map_err(|e| EngineError::workflow("plan output", e))?;
+            (plan, source_codec, input_format, Some(kind))
+        }
+    };
     identity.verify(&input.path).map_err(|e| EngineError::workflow("plan source identity", e))?;
     require_reportable_path(plan.source(), "plan output")?;
     require_reportable_path(plan.destination(), "plan output")?;
     if let Some(path) = plan.backup_directory() { require_reportable_path(path, "plan backup")?; }
-    Ok(PreparedProcess { plan, identity, source_codec: inspection.source_codec, input_format: inspection.input_format })
+    Ok(PreparedProcess { plan, identity, source_codec, input_format, input_marker_override, controlled_mp4_time_1904: None })
 }
 
 struct Measured {
@@ -333,44 +466,68 @@ struct WaveformBuilder {
     path: PathBuf,
     rate: f64,
     channels: usize,
-    layout: &'static str,
-    frames_per_bin: u32,
     total: u64,
-    count: u32,
-    min: Option<f32>,
-    max: Option<f32>,
-    non_finite: u64,
     bins: Vec<WaveformBin>,
 }
 impl WaveformBuilder {
     fn new(path: &Path, rate: f64, channels: usize) -> Self {
-        Self { path: path.to_owned(), rate, channels, layout: "interleaved_graph_output", frames_per_bin: (rate as u32).max(1),
-            total: 0, count: 0, min: None, max: None, non_finite: 0, bins: Vec::new() }
+        Self { path: path.to_owned(), rate, channels, total: 0, bins: Vec::new() }
     }
-    fn feed(&mut self, samples: &[f32]) {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), EngineError> {
+        let frames = samples.len() / self.channels;
+        if frames == 0 { return Ok(()); }
+        if self.bins.len() == self.bins.capacity() {
+            self.bins.try_reserve(1).map_err(|error| EngineError::new("allocate waveform", error))?;
+        }
+        let left_channel = self.channels.saturating_sub(2);
+        let right_channel = self.channels - 1;
+        let mut left = 0.0_f32;
+        let mut right = 0.0_f32;
         for frame in samples.chunks_exact(self.channels) {
-            for &sample in frame {
-                if sample.is_finite() {
-                    self.min = Some(self.min.map_or(sample, |v| v.min(sample)));
-                    self.max = Some(self.max.map_or(sample, |v| v.max(sample)));
-                } else { self.non_finite += 1; }
-            }
-            self.count += 1;
-            self.total += 1;
-            if self.count == self.frames_per_bin { self.flush(); }
+            left += frame[left_channel].abs();
+            right += frame[right_channel].abs();
+        }
+        self.bins.push(WaveformBin {
+            start_frame: self.total, frames: frames as u32,
+            left_mean_absolute: left / frames as f32,
+            right_mean_absolute: right / frames as f32,
+        });
+        self.total += frames as u64;
+        Ok(())
+    }
+    fn finish(self) -> Waveform {
+        Waveform {
+            path: self.path, requested_sample_rate: 44_100.0, sample_rate: self.rate,
+            channels: self.channels as u32, layout: "per_read_last_two_channels_mean_absolute",
+            frames: self.total, bins: self.bins,
         }
     }
-    fn flush(&mut self) {
-        if self.count == 0 { return; }
-        self.bins.push(WaveformBin { start_frame: self.total - u64::from(self.count), frames: self.count,
-            minimum: self.min.take(), maximum: self.max.take(), non_finite_samples: self.non_finite });
-        self.count = 0;
-        self.non_finite = 0;
+}
+fn analyze_waveform(path: &Path, settings: &Settings, cancel: &Cancellation) -> Result<Waveform, EngineError> {
+    check_cancel(cancel, "waveform")?;
+    let mut reader = AudioReader::open(path, Some(44_100.0), &input_libraries(settings))
+        .map_err(|error| EngineError::new("open waveform input", error))?;
+    let source = reader.source_format();
+    let client = reader.client_format();
+    let channels = client.channels_per_frame as usize;
+    if channels == 0 {
+        return Err(EngineError::new("waveform", "decoder has no channels"));
     }
-    fn finish(mut self) -> Waveform {
-        self.flush();
-        Waveform { path: self.path, sample_rate: self.rate, channels: self.channels as u32, layout: self.layout, frames: self.total, bins: self.bins }
+    if source_codec(path, source) == SourceCodec::Flac && channels > 2 {
+        return Err(EngineError::new("waveform", "native multichannel FLAC waveform reads an unwritten buffer suffix; no deterministic sample values are established"));
     }
+    let mut waveform = WaveformBuilder::new(path, client.sample_rate, channels);
+    let mut samples = vec![0.0; BLOCK.checked_mul(channels)
+        .ok_or_else(|| EngineError::new("waveform", "channel count overflows"))?];
+    loop {
+        check_cancel(cancel, "waveform")?;
+        let read = reader.read(&mut samples).map_err(|error| EngineError::new("read waveform input", error))?;
+        if read == 0 { break; }
+        waveform.feed(&samples[..read * channels])?;
+    }
+    reader.close().map_err(|error| EngineError::new("close waveform input", error))?;
+    check_cancel(cancel, "waveform")?;
+    Ok(waveform.finish())
 }
 fn check_cancel(cancel: &Cancellation, stage: &'static str) -> Result<(), EngineError> {
     if cancel.is_cancelled() { Err(EngineError::cancelled(stage)) } else { Ok(()) }
@@ -394,12 +551,10 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     let mut left = [0.0f32; BLOCK];
     let mut right = [0.0f32; BLOCK];
     let mut converter = ChannelConverter::new(rate, channels)?;
-    let mut waveform = capture_waveform.then(|| WaveformBuilder::new(path, rate, channels));
     loop {
         left.fill(0.0); right.fill(0.0);
         let read = reader.read_stereo_planar(&mut left, &mut right).map_err(|e| EngineError::new("read analysis input", e))?;
         converter.convert(&left, &right, &mut samples)?;
-        if let Some(waveform) = &mut waveform { waveform.feed(&samples[..read * channels]); }
         let source_read = accounting.source_read(BLOCK as u32, read as u32).map_err(|e| EngineError::new("analysis accounting", format!("{e:?}")))?;
         meter.process_interleaved(&samples).map_err(|e| EngineError::new("analysis meter", e))?;
         detector.process_interleaved(&samples).map_err(|e| EngineError::new("analysis pitch detector", e))?;
@@ -411,7 +566,7 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     check_cancel(cancel, "analysis")?;
     Ok(Measured { values: AnalysisValues::from_measurements(meter.integrated_loudness(), detector.tuning_hz()),
         frames: accounting.actual_input_frames, processing_rate: rate, source, codec,
-        waveform: waveform.map(WaveformBuilder::finish) })
+        waveform: if capture_waveform { Some(analyze_waveform(path, settings, cancel)?) } else { None } })
 }
 
 pub fn analyze_file(path: &Path, settings: &Settings, cancel: &Cancellation) -> Result<AnalysisReport, EngineError> {
@@ -447,11 +602,8 @@ fn analyze_file_with(
         ProcessingState::Suffixed => (None, Some("suffix-only processed state does not identify an original".to_owned())),
         ProcessingState::Unprocessed => (None, None),
     };
-    let mut unavailable = if marked.is_some() { vec!["new clip and dynamics measurements require the healing pass".to_owned()] }
+    let unavailable = if marked.is_some() { vec!["new clip and dynamics measurements require the healing pass".to_owned()] }
         else { vec!["clip-repair count and dynamics adjustments require the healing pass".to_owned()] };
-    if measured.codec == SourceCodec::Flac && measured.source.channels_per_frame > 2 {
-        unavailable.push("native FLAC planar reader supplies at most the first two source channels; graph waveform reflects its channel conversion".to_owned());
-    }
     identity.verify(path).map_err(|e| EngineError::workflow("analyze source identity", e))?;
     Ok(AnalysisReport { path: path.to_owned(), input_format: inspection.input_format, sample_rate: measured.processing_rate,
         channels: measured.source.channels_per_frame, frames: measured.frames as u64, volume: measured.values.input_level_db,
@@ -1080,8 +1232,9 @@ fn abort_with(mut error: EngineError, staged: file_workflow::StagedOutput) -> En
         Err(cleanup) => {
             error.cancelled = false;
             error.message.push_str(&format!("; abort failed: {cleanup}"));
-            if let WorkflowError::Transaction { backup: b, published, .. } = &cleanup {
+            if let WorkflowError::Transaction { backup: b, recovery, published, .. } = &cleanup {
                 error.retained_backup = b.clone().or(backup);
+                error.recovery_path = recovery.clone().or(error.recovery_path);
                 error.partial_publication |= *published;
             } else { error.retained_backup = backup; }
         }
@@ -1107,6 +1260,10 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         if let Err(e) = require_reportable_path(path, "backup") { return Err(abort_with(e, staged)); }
     }
     let temp = match TempCaf::new() { Ok(t) => t, Err(e) => return Err(abort_with(e, staged)) };
+    let controlled_mp4_time = match plan.format() {
+        AudioFormat::Aac | AudioFormat::Alac => prepared.controlled_mp4_time_1904,
+        _ => None,
+    };
     let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str), EngineError> {
         let measured = analyze(input, settings, cancel, false)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after analysis", e))?;
@@ -1121,6 +1278,10 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
             else { crate::mp3::SourceHeader::Other(header) };
         let final_result = final_pass(&temp, staged.staging_path(), &measured, &healed, template, plan.format(), source_header, settings, &libraries, cancel)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after encoding", e))?;
+        if let Some(seconds) = controlled_mp4_time {
+            apple_codec::set_mp4_header_times(staged.staging_path(), seconds)
+                .map_err(|e| EngineError::new("set controlled MP4 time", e))?;
+        }
         check_cancel(cancel, "copy tags")?;
         let output_pitch = if plan_healing.pitch.is_some() { 440.0 } else { measured.values.input_tuning_hz };
         let backup = staged.backup_path().and_then(Path::to_str);
@@ -1180,14 +1341,15 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
     let mut stages = healed.stages;
     stages.push("limiter".to_owned());
     Ok(ProcessReport { input_path: input.to_owned(), output_path: publication.destination, backup_path: publication.backup,
-        input_format: prepared.input_format.clone(), output_format: encoded.format,
+        replaced_existing_output: publication.replaced_existing_output, input_format: prepared.input_format.clone(), output_format: encoded.format,
         input_sample_rate: measured.source.sample_rate, processing_sample_rate: measured.processing_rate, sample_rate: encoded.stream.sample_rate,
         channels: measured.source.channels_per_frame, output_channels: encoded.stream.channels_per_frame,
         output_bit_depth: encoded.stream.bits_per_channel, encoded_length_frames: encoded.frames,
         input_frames: measured.frames as u64, healed_frames: healed.frames,
         output_frames: output.frames, input_volume: measured.values.input_level_db, healed_volume: healed.analyzer.integrated_loudness() as f32,
         output_volume: output.output_volume, input_pitch_hz: measured.values.input_tuning_hz, output_pitch_hz: output_pitch,
-        tempo_factor: healed.tempo_factor, clip_count: healed.clip_count, applied_stages: stages, processing_marker_status: marker_status })
+        tempo_factor: healed.tempo_factor, clip_count: healed.clip_count, applied_stages: stages, processing_marker_status: marker_status,
+        input_marker_override: prepared.input_marker_override, controlled_mp4_time_1904: controlled_mp4_time })
 }
 
 #[cfg(test)]
@@ -1196,20 +1358,213 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     #[test]
-    fn waveform_bins_exclude_padding_and_preserve_nonfinite_counts() {
-        let mut waveform = WaveformBuilder::new(Path::new("fixture.wav"), 2.0, 2);
-        waveform.feed(&[-1.0, 0.5, 0.25, f32::NAN, 0.1, f32::INFINITY]);
+    fn marker_report_retains_exact_decoded_pitch_number() {
+        let encoded = metadata::encode_marker_base64(br#"{"inputPitch":437.76852416992188}"#).unwrap();
+        let marker = Marker::from_encoded_bytes(&encoded).unwrap();
+        assert_eq!(marker.input_pitch.to_bits(), 0x407b_5c4b_e000_0000);
+        let report = marker_json(Some(&marker)).unwrap().unwrap();
+        assert_eq!(report["inputPitch"].as_f64().unwrap().to_bits(), 0x407b_5c4b_e000_0000);
+    }
+
+    #[test]
+    fn ambiguous_marker_override_is_explicit_and_wav_only() {
+        let incomplete = metadata::encode_marker_base64(br#"{"isProcessed":"#).unwrap();
+        let processed = metadata::encode_marker_base64(br#"{"isProcessed":true}"#).unwrap();
+        for (payload, kind) in [(b"".as_slice(), "empty_wav_pltn"), (incomplete.as_slice(), "incomplete_json")] {
+            let error = decode_process_marker(Some(payload), tags::Format::Wav, false).err().unwrap();
+            assert!(error.message.contains("--allow-ambiguous-marker"));
+            assert!(error.message.contains("may reprocess"));
+            assert!(matches!(decode_process_marker(Some(payload), tags::Format::Wav, true),
+                Ok(InspectedMarker::AuthorizedAmbiguous(actual)) if actual == kind));
+            for format in [tags::Format::Mp3, tags::Format::Mp4, tags::Format::Aiff, tags::Format::Flac] {
+                assert!(decode_process_marker(Some(payload), format, true).is_err());
+            }
+        }
+        assert!(matches!(decode_process_marker(Some(&processed), tags::Format::Wav, true),
+            Ok(InspectedMarker::Known(Some(marker))) if marker.is_processed));
+        assert!(matches!(decode_process_marker(None, tags::Format::Wav, true), Ok(InspectedMarker::Known(None))));
+        assert!(decode_process_marker(Some(b"!!!!"), tags::Format::Wav, true).is_err());
+        let malformed = metadata::encode_marker_base64(br#"{"isProcessed":truX}"#).unwrap();
+        assert!(decode_process_marker(Some(&malformed), tags::Format::Wav, true).is_err());
+        let invalid_field = metadata::encode_marker_base64(br#"{"isProcessed":true,"targetVolume":[]}"#).unwrap();
+        assert!(decode_process_marker(Some(&invalid_field), tags::Format::Wav, true).is_err());
+    }
+
+    #[test]
+    fn wav_processing_refuses_duplicate_markers_and_ambiguous_trailing_bytes() {
+        fn wave(payloads: &[&[u8]]) -> Vec<u8> {
+            let mut bytes = b"RIFF\0\0\0\0WAVE".to_vec();
+            for &payload in payloads { bytes.extend(metadata::wav_pltn_chunk(Some(payload)).unwrap()); }
+            let length = (bytes.len() - 8) as u32;
+            bytes[4..8].copy_from_slice(&length.to_le_bytes());
+            bytes
+        }
+        fn layout(bytes: Vec<u8>) -> metadata::WavMarkerLayout {
+            metadata::wav_marker_layout(&mut std::io::Cursor::new(bytes)).unwrap()
+        }
+        let processed = metadata::encode_marker_base64(br#"{"isProcessed":true}"#).unwrap();
+        let unprocessed = metadata::encode_marker_base64(br#"{"isProcessed":false}"#).unwrap();
+        let duplicate = layout(wave(&[&processed, &unprocessed]));
+        for allow in [false, true] {
+            let error = admit_process_marker(Some(&unprocessed), tags::Format::Wav, allow, Some(duplicate)).err().unwrap();
+            assert!(error.message.contains("multiple WAV PLTN"));
+        }
+        let mut trailing = wave(&[b""]);
+        trailing.extend(metadata::wav_pltn_chunk(Some(&processed)).unwrap());
+        let trailing_layout = layout(trailing);
+        let error = admit_process_marker(Some(b""), tags::Format::Wav, true, Some(trailing_layout)).err().unwrap();
+        assert_eq!(error.stage, "decode marker");
+
+        let mut absent_trailer = wave(&[]);
+        absent_trailer.extend(metadata::wav_pltn_chunk(Some(&processed)).unwrap());
+        let absent_trailer = layout(absent_trailer);
+        let mut unprocessed_trailer = wave(&[&unprocessed]);
+        unprocessed_trailer.extend(metadata::wav_pltn_chunk(Some(&processed)).unwrap());
+        let unprocessed_trailer = layout(unprocessed_trailer);
+        let mut benign_absent = wave(&[]);
+        benign_absent.extend_from_slice(b"helloP");
+        let benign_absent = layout(benign_absent);
+        let mut benign_unprocessed = wave(&[&unprocessed]);
+        benign_unprocessed.extend_from_slice(b"helloP");
+        let benign_unprocessed = layout(benign_unprocessed);
+        let mut benign_ambiguous = wave(&[b""]);
+        benign_ambiguous.extend_from_slice(b"helloP");
+        let benign_ambiguous = layout(benign_ambiguous);
+        let mut split_buffer = wave(&[]);
+        split_buffer.extend(std::iter::repeat_n(b'x', 8188));
+        split_buffer.extend_from_slice(b"PLTN");
+        let split_buffer = layout(split_buffer);
+        for allow in [false, true] {
+            for (payload, source_layout) in [
+                (None, absent_trailer),
+                (Some(unprocessed.as_slice()), unprocessed_trailer),
+                (None, split_buffer),
+            ] {
+                let error = admit_process_marker(payload, tags::Format::Wav, allow, Some(source_layout)).err().unwrap();
+                assert_eq!(error.stage, "decode marker");
+            }
+            assert!(matches!(admit_process_marker(None, tags::Format::Wav, allow, Some(benign_absent)),
+                Ok(InspectedMarker::Known(None))));
+            assert!(matches!(admit_process_marker(Some(&unprocessed), tags::Format::Wav, allow, Some(benign_unprocessed)),
+                Ok(InspectedMarker::Known(Some(marker))) if !marker.is_processed));
+        }
+        let error = admit_process_marker(Some(b""), tags::Format::Wav, true, Some(benign_ambiguous)).err().unwrap();
+        assert_eq!(error.stage, "decode marker");
+
+        let fixture = TempCaf::new().unwrap();
+        let source = fixture.directory.join("single-processed.wav");
+        fs::write(&source, wave(&[&processed])).unwrap();
+        let selected = file_workflow::discover_inputs(&[source.clone()]).unwrap().remove(0);
+        let settings = file_workflow::OutputSettings { mode: file_workflow::OutputMode::SameFolder, format: AudioFormat::Wav };
+
+        for allow in [false, true] {
+            assert!(matches!(admit_process_marker(None, tags::Format::Wav, allow, Some(layout(wave(&[])))),
+                Ok(InspectedMarker::Known(None))));
+            assert!(matches!(admit_process_marker(Some(&unprocessed), tags::Format::Wav, allow,
+                Some(layout(wave(&[&unprocessed])))), Ok(InspectedMarker::Known(Some(marker))) if !marker.is_processed));
+            let marker = match admit_process_marker(Some(&processed), tags::Format::Wav, allow,
+                Some(layout(wave(&[&processed])))).unwrap_or_else(|error| panic!("{error}")) {
+                InspectedMarker::Known(Some(marker)) => marker,
+                _ => panic!("valid processed marker was not preserved"),
+            };
+            assert!(marker.is_processed);
+            assert!(matches!(OutputPlan::new(&selected, SourceCodec::Lpcm, &settings, Some(&marker)),
+                Err(WorkflowError::AlreadyProcessed { .. })));
+        }
+        fs::remove_file(source).unwrap();
+        fixture.cleanup().unwrap();
+    }
+
+    #[test]
+    fn waveform_preserves_read_boundaries_and_channel_mean_absolute_values() {
+        let mut waveform = WaveformBuilder::new(Path::new("fixture.wav"), 44_100.0, 2);
+        let mut samples = [0.0_f32; 1024];
+        samples[0] = -1.0;
+        samples[2] = 0.5;
+        samples[1] = -0.25;
+        samples[3] = 1.0;
+        waveform.feed(&samples).unwrap();
+        waveform.feed(&[0.25, -0.75]).unwrap();
+        waveform.feed(&[]).unwrap();
         let result = waveform.finish();
-        assert_eq!(result.frames, 3);
+        assert_eq!(result.frames, 513);
         assert_eq!(result.bins.len(), 2);
-        assert_eq!(result.bins[0].start_frame, 0);
-        assert_eq!(result.bins[0].frames, 2);
-        assert_eq!(result.bins[0].minimum, Some(-1.0));
-        assert_eq!(result.bins[0].maximum, Some(0.5));
-        assert_eq!(result.bins[0].non_finite_samples, 1);
-        assert_eq!(result.bins[1].start_frame, 2);
+        assert_eq!(result.bins[0].frames, 512);
+        assert_eq!(result.bins[0].left_mean_absolute.to_bits(), 0x3b40_0000);
+        assert_eq!(result.bins[0].right_mean_absolute.to_bits(), 0x3b20_0000);
+        assert_eq!(result.bins[1].start_frame, 512);
         assert_eq!(result.bins[1].frames, 1);
-        assert_eq!(result.bins[1].non_finite_samples, 1);
+        assert_eq!(result.bins[1].left_mean_absolute.to_bits(), 0x3e80_0000);
+        assert_eq!(result.bins[1].right_mean_absolute.to_bits(), 0x3f40_0000);
+    }
+
+    #[test]
+    fn waveform_duplicates_mono_and_selects_last_two_multichannel_values() {
+        let mut mono = WaveformBuilder::new(Path::new("mono.wav"), 44_100.0, 1);
+        mono.feed(&[-0.25, 0.75]).unwrap();
+        let mono = mono.finish();
+        assert_eq!(mono.bins[0].left_mean_absolute.to_bits(), 0x3f00_0000);
+        assert_eq!(mono.bins[0].right_mean_absolute.to_bits(), 0x3f00_0000);
+        let mut surround = WaveformBuilder::new(Path::new("multi.wav"), 44_100.0, 3);
+        surround.feed(&[1.0, -0.25, 0.5, 1.0, 0.5, -0.375]).unwrap();
+        let surround = surround.finish();
+        assert_eq!(surround.bins[0].left_mean_absolute.to_bits(), 0x3ec0_0000);
+        assert_eq!(surround.bins[0].right_mean_absolute.to_bits(), 0x3ee0_0000);
+    }
+
+    #[test]
+    fn waveform_does_not_hide_nonfinite_channel_values() {
+        let mut waveform = WaveformBuilder::new(Path::new("nonfinite.wav"), 44_100.0, 2);
+        waveform.feed(&[f32::NAN, f32::NEG_INFINITY]).unwrap();
+        let result = serde_json::to_value(waveform.finish()).unwrap();
+        assert_eq!(result["bins"][0]["left_mean_absolute"], "NaN");
+        assert_eq!(result["bins"][0]["right_mean_absolute"], "Infinity");
+    }
+
+    #[test]
+    #[ignore = "requires separately captured MIKWaveformAnalyzer JSONL in PN_WAVEFORM_NATIVE_DIR"]
+    fn waveform_reducer_matches_native_component_words() {
+        let root = PathBuf::from(std::env::var_os("PN_WAVEFORM_NATIVE_DIR").expect("native waveform capture directory"));
+        for name in ["stereo-512-plus-1", "mono", "three-channel"] {
+            let text = fs::read_to_string(root.join(format!("{name}.stdout"))).unwrap();
+            let records: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let identity = records.iter().find(|record| record["record"] == "identity").unwrap();
+            assert_eq!(identity["universal_sha256"], "67eafcae58496a56c026804e675a2e234aa91a06502319dde8f8a568f9a34a23");
+            assert_eq!(identity["signature_check_status"], 0);
+            let first = records.iter().find(|record| record["record"] == "input").unwrap();
+            let channels = first["channels"].as_u64().unwrap() as usize;
+            let word = |value: &serde_json::Value| {
+                u32::from_str_radix(value.as_str().unwrap().strip_prefix("0x").unwrap(), 16).unwrap()
+            };
+            let mut waveform = WaveformBuilder::new(Path::new(name), 44_100.0, channels);
+            let mut calls = 0;
+            for record in &records {
+                if record["record"] == "input" {
+                    assert_eq!(record["channels"].as_u64().unwrap() as usize, channels);
+                    let samples: Vec<f32> = record["sample_words"].as_array().unwrap()
+                        .iter().map(|value| f32::from_bits(word(value))).collect();
+                    assert_eq!(samples.len(), record["frames"].as_u64().unwrap() as usize * channels);
+                    waveform.feed(&samples).unwrap();
+                    calls += 1;
+                } else if record["record"] == "analyze" {
+                    assert_eq!(record["status"], 0);
+                } else if record["record"] == "finish" {
+                    assert_eq!(record["status"], 1);
+                }
+            }
+            let native = records.iter().find(|record| record["record"] == "spectrum").unwrap();
+            let result = waveform.finish();
+            assert_eq!(result.bins.len(), calls);
+            assert_eq!(result.bins.len(), native["count"].as_u64().unwrap() as usize);
+            for (field, left) in [("left_words", true), ("right_words", false)] {
+                let expected = native[field].as_array().unwrap();
+                assert_eq!(expected.len(), result.bins.len());
+                for (index, (bin, expected)) in result.bins.iter().zip(expected).enumerate() {
+                    let actual = if left { bin.left_mean_absolute } else { bin.right_mean_absolute };
+                    assert_eq!(actual.to_bits(), word(expected), "{name} {field} bucket {index}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1248,6 +1603,15 @@ mod tests {
         assert!(!error.cancelled);
         assert_eq!(error.retained_backup.as_ref(), Some(&backup));
         assert!(error.message.contains("cleanup"));
+
+        let recovery = PathBuf::from("/fixture/retained-stage.wav");
+        let failure = WorkflowError::Transaction {
+            cause: Box::new(WorkflowError::DestinationChanged("/fixture/output.wav".into())),
+            backup: None, recovery: Some(recovery.clone()), rollback: None, cleanup: Vec::new(), published: false,
+        };
+        let error = EngineError::workflow("publish output", failure);
+        assert_eq!(error.recovery_path.as_ref(), Some(&recovery));
+        assert!(!error.partial_publication);
     }
 
     #[test]

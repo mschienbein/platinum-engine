@@ -310,6 +310,37 @@ mod oracle {
             }
         }
     }
+    #[test]
+    #[ignore = "requires an explicitly pinned LAME 3.100"]
+    fn unknown_source_update_byte_selects_the_nonzero_branch() {
+        let candidate = LameLibrary::load(required("PN_MP3_LAME_PATH"), &required("PN_MP3_LAME_SHA256")).unwrap();
+        let dir = probe_dir();
+        let samples: Vec<i16> = (0..8192).map(|i| ((i * 37 % 2003) as i32 - 1001) as i16).collect();
+        let encode = |path: &Path, source, byte| {
+            let config = Mp3Config { sample_rate: 44_100, channels: 2, mode: Mp3Mode::Cbr320,
+                source, native_update_result_byte_3: byte };
+            let mut encoder = Mp3Encoder::create_new(&candidate, path, config).unwrap();
+            encoder.write_converted_stereo(&mut samples.clone()).unwrap();
+            let report = encoder.finish().unwrap();
+            assert!(report.source_header_patch_applied);
+            fs::read(path).unwrap()
+        };
+
+        for xing in [false, true] {
+            let mut source_bytes = header_fixture(false, false);
+            if !xing { source_bytes[36..40].copy_from_slice(b"Info"); }
+            let header = inspect_mp3_header_bytes(&source_bytes).unwrap();
+            assert!(header.lame_identifier.is_none());
+            for other in [false, true] {
+                let source = || if other { SourceHeader::Other(header.clone()) } else { SourceHeader::Mp3(header.clone()) };
+                let zero = encode(&dir.join(format!("zero-{xing}-{other}.mp3")), source(), Some(0));
+                let nonzero = encode(&dir.join(format!("nonzero-{xing}-{other}.mp3")), source(), Some(1));
+                let unknown = encode(&dir.join(format!("unknown-{xing}-{other}.mp3")), source(), None);
+                assert_ne!(zero, nonzero);
+                assert_eq!(unknown, nonzero);
+            }
+        }
+    }
     /// In addition to the three LAME variables above, requires
     /// PN_MP3_REFERENCE_MIKAUDIO_PATH pointing to the pinned framework binary.
     /// It calls the reference only in this opt-in test, after recorder finish.
@@ -413,6 +444,203 @@ mod oracle {
         assert_ne!(fs::read(&native_paths[0]).unwrap(), fs::read(&native_paths[1]).unwrap(),
             "the two controlled native stack states did not change bytes; inspect the outputs");
     }
+    /// The short first frame makes the fixed-offset LAME area lie in frame 2.
+    /// In the convergent cases both native scratch branches leave the entire
+    /// file unchanged, despite taking different write lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "requires the pinned native MIKAudio comparison oracle"]
+    fn scratch_branch_complete_file_diagnostics() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        fn short_output(id3: bool, xing: bool, recognized: bool) -> Vec<u8> {
+            let prefix = if id3 { 15 } else { 0 };
+            let mut bytes = vec![0u8; prefix + 104 * 4];
+            if id3 { bytes[..15].copy_from_slice(b"ID3\x04\x00\x00\x00\x00\x00\x05abcde"); }
+            for frame in 0..4 {
+                let word = 0xfffb_1000u32 | (u32::from(frame != 0) << 6);
+                let pos = prefix + frame * 104;
+                bytes[pos..pos + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            let marker = prefix + 36;
+            bytes[marker..marker + 4].copy_from_slice(if xing { b"Xing" } else { b"Info" });
+            let tag = marker + 120;
+            if recognized { bytes[tag..tag + 9].copy_from_slice(b"LAME3.100"); }
+            let packed = (576u32 << 12) | 1000;
+            bytes[tag + 21] = (packed >> 16) as u8;
+            bytes[tag + 22] = (packed >> 8) as u8;
+            bytes[tag + 23] = packed as u8;
+            let crc = u16::from(crc16(&bytes[prefix..tag + 34]) == 0);
+            bytes[tag + 34..tag + 36].copy_from_slice(&crc.to_be_bytes());
+            bytes
+        }
+
+        let audio_path = PathBuf::from(required("PN_MP3_REFERENCE_MIKAUDIO_PATH"));
+        let sha = file_sha256(&audio_path).unwrap();
+        assert!(sha == "f793e89ef220486f6aea96b33654145fed4ce232f2a69edf2f5b54e5f40c2a24" ||
+            sha == "05b607da99a54400095075f8384982b4b56e03c6d0ecb1f8e42851e629adffa5");
+        let audio = unsafe { Library::new(&audio_path).unwrap() };
+        let update: unsafe extern "C" fn() = unsafe { sym(&audio, b"MIKLameInfoHeaderUpdate\0") };
+        let dir = probe_dir();
+        let run = |label: &str, input: &[u8], source: &Mp3Header| -> Vec<Vec<u8>> {
+            [0u8, 1, 2, 128, 255].into_iter().map(|scratch| {
+                let output = dir.join(format!("{label}-{scratch}.mp3"));
+                let mut file = OpenOptions::new().write(true).create_new(true).open(&output).unwrap();
+                std::io::Write::write_all(&mut file, input).unwrap();
+                drop(file);
+                let path = CString::new(output.as_os_str().as_bytes()).unwrap();
+                // SAFETY: the updater is digest-pinned, result storage is
+                // initialized, and the generated file is exclusively ours.
+                unsafe { call_native_update(update, &path, source, scratch); }
+                println!("{label} scratch={scratch} length={} sha256={}",
+                    fs::metadata(&output).unwrap().len(), file_sha256(&output).unwrap());
+                fs::read(output).unwrap()
+            }).collect()
+        };
+        for id3 in [false, true] {
+            for xing in [false, true] {
+                let mut source_file = header_fixture(false, false);
+                if !xing { source_file[36..40].copy_from_slice(b"Info"); }
+                let source = inspect_mp3_header_bytes(&source_file).unwrap();
+                for recognized in [false, true] {
+                    let input = short_output(id3, xing, recognized);
+                    let results = run(&format!("equal-{id3}-{xing}-{recognized}"), &input, &source);
+                    for output in &results { assert_eq!(output, &input); }
+                }
+            }
+        }
+
+        let source = inspect_mp3_header_bytes(&header_fixture(false, false)).unwrap();
+        let clean = short_output(false, true, true);
+        let mut bad_crc = clean.clone();
+        bad_crc[36 + 120 + 35] ^= 1;
+        let results = run("different-crc", &bad_crc, &source);
+        assert_eq!(results[0], bad_crc);
+        for output in &results[1..] { assert_eq!(output, &clean); }
+
+        let other_marker = short_output(false, false, true);
+        let results = run("different-marker", &other_marker, &source);
+        assert_eq!(results[0], other_marker);
+        for output in &results[1..] {
+            assert_eq!(&output[36..40], b"Xing");
+            assert_ne!(output, &results[0]);
+        }
+
+        let recognized_source = inspect_mp3_header_bytes(&header_fixture(true, false)).unwrap();
+        let recognized_output = short_output(false, true, true);
+        let results = run("forced-tag", &recognized_output, &recognized_source);
+        for output in &results[1..] { assert_eq!(output, &results[0]); }
+        let unrecognized_output = short_output(false, true, false);
+        let results = run("missing-output-tag", &unrecognized_output, &recognized_source);
+        assert_eq!(results[0], unrecognized_output);
+        for output in &results[1..] {
+            assert_eq!(&output[156..165], b"LAME3.100");
+            assert_ne!(output, &results[0]);
+        }
+
+        let mut no_marker = short_output(false, true, true);
+        no_marker[36..40].copy_from_slice(b"NONE");
+        for output in run("no-xing", &no_marker, &source) { assert_eq!(output, no_marker); }
+
+        // MPEG-2/8 kbps frames are 26 bytes here. The nonzero branch writes
+        // through 177 while the original file ends at 163; all appended
+        // bytes are zero but the files are nevertheless different.
+        let mut truncated = vec![0u8; 163];
+        for (frame, pos) in [0usize, 26, 52].into_iter().enumerate() {
+            let word = 0xfff3_1000u32 | (u32::from(frame != 0) << 6);
+            truncated[pos..pos + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        truncated[21..25].copy_from_slice(b"Xing");
+        truncated[162] = 0x24;
+        let mut crc_input = truncated.clone();
+        crc_input.resize(175, 0);
+        if crc16(&crc_input) == 0 { truncated[120] ^= 1; }
+        let results = run("extension", &truncated, &source);
+        assert_eq!(results[0], truncated);
+        for output in &results[1..] {
+            assert_eq!(output.len(), 177);
+            assert_eq!(&output[..truncated.len()], truncated.as_slice());
+            assert!(output[truncated.len()..].iter().all(|&byte| byte == 0));
+        }
+    }
+    /// Diagnostic only: seed an artificial pre-update recorder header from
+    /// another generated output, then test the two native updater paths and
+    /// the candidate's actual tag-transfer/marker writer. The seeded header
+    /// is not a captured recorder state and cannot identify the GUI's byte.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "requires pinned generated Xing case, native MIKAudio and trusted TagLib bridge"]
+    fn generated_xing_post_tag_controlled_diagnostic() {
+        use platinum_engine::metadata::Marker;
+        use platinum_engine::mp3::inspect_mp3_header;
+        use platinum_engine::tags::{Format, OutputChoice, TagBridge};
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        fn id3_end(data: &[u8]) -> usize {
+            if !data.starts_with(b"ID3") { return 0; }
+            assert!(data.len() >= 10 && data[6..10].iter().all(|byte| byte & 0x80 == 0));
+            10 + data[6..10].iter().fold(0usize, |size, byte| (size << 7) | usize::from(*byte))
+        }
+        let source_path = PathBuf::from(required("PN_MP3_CASE_SOURCE"));
+        let reference_path = PathBuf::from(required("PN_MP3_CASE_ORIGINAL"));
+        let tag_seed_path = PathBuf::from(required("PN_MP3_CASE_TAG_SEED"));
+        let native_path = PathBuf::from(required("PN_MP3_REFERENCE_MIKAUDIO_PATH"));
+        assert_eq!(file_sha256(&source_path).unwrap(), "ceb61a55c296eebec677d11d82baf0dd539cd13c290321c6cf0874e70dfe3ebe");
+        assert_eq!(file_sha256(&reference_path).unwrap(), "12b12b9ddff607fc9f82e38a25dd212518a6cbd462dc6aa3f44f79c7cf16971d");
+        assert_eq!(file_sha256(&tag_seed_path).unwrap(), "e66cd0765dc097296456efb7f3de93d631f8b5ca6346f5748c704778795c7039");
+        let audio_sha = file_sha256(&native_path).unwrap();
+        assert!(audio_sha == "f793e89ef220486f6aea96b33654145fed4ce232f2a69edf2f5b54e5f40c2a24" ||
+            audio_sha == "05b607da99a54400095075f8384982b4b56e03c6d0ecb1f8e42851e629adffa5");
+        let source = inspect_mp3_header(&source_path).unwrap();
+        assert!(source.info && source.lame_identifier.is_none());
+        let original = fs::read(&reference_path).unwrap();
+        let tag_seed = fs::read(&tag_seed_path).unwrap();
+        let original_start = id3_end(&original);
+        let seed_start = id3_end(&tag_seed);
+        assert!(original.len() > original_start + 192 && tag_seed.len() > seed_start + 192);
+        assert_eq!(&original[original_start + 36..original_start + 40], b"Info");
+        assert!(matches!(&tag_seed[seed_start + 156..seed_start + 160], b"LAME" | b"Lavf" | b"Lavc"));
+        let mut artificial_recorder = original[original_start..].to_vec();
+        artificial_recorder[156..192].copy_from_slice(&tag_seed[seed_start + 156..seed_start + 192]);
+        let audio = unsafe { Library::new(&native_path).unwrap() };
+        let update: unsafe extern "C" fn() = unsafe { sym(&audio, b"MIKLameInfoHeaderUpdate\0") };
+        let bridge_path = PathBuf::from(required("PN_MP3_CASE_TAG_BRIDGE"));
+        assert_eq!(file_sha256(&bridge_path).unwrap(), "ab36bcd51a901ccb5d95e73b960596033c0387ec450215d66bf7bc8d18fc57aa");
+        let bridge = unsafe { TagBridge::load(&bridge_path).unwrap() };
+        let marker = Marker::from_encoded_bytes(&bridge.read_processing_marker(&reference_path, Format::Mp3).unwrap().unwrap()).unwrap();
+        let dir = probe_dir();
+        let raw_path = dir.join("artificial-pre-update.mp3");
+        let mut raw_file = OpenOptions::new().write(true).create_new(true).open(&raw_path).unwrap();
+        raw_file.write_all(&artificial_recorder).unwrap();
+        drop(raw_file);
+        println!("diagnostic directory={} seed={} artificial_recorder_sha256={}", dir.display(), tag_seed_path.display(), file_sha256(&raw_path).unwrap());
+        for scratch in [0u8, 1] {
+            let path = dir.join(format!("xing-post-tag-scratch-{scratch}.mp3"));
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+            file.write_all(&artificial_recorder).unwrap();
+            drop(file);
+            let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            unsafe { call_native_update(update, &c_path, &source, scratch); }
+            let pretag_sha = file_sha256(&path).unwrap();
+            let pretag_path = dir.join(format!("xing-pre-tag-scratch-{scratch}.mp3"));
+            let mut pretag_file = OpenOptions::new().write(true).create_new(true).open(&pretag_path).unwrap();
+            pretag_file.write_all(&fs::read(&path).unwrap()).unwrap();
+            drop(pretag_file);
+            let transfer = bridge.transfer(&source_path, &path, Format::Mp3, Format::Mp3, OutputChoice::Explicit, &marker).unwrap();
+            assert!(transfer.is_success(), "{transfer:?}");
+            let produced = fs::read(&path).unwrap();
+            let first = produced.iter().zip(&original).position(|(a, b)| a != b)
+                .or_else(|| (produced.len() != original.len()).then_some(produced.len().min(original.len())));
+            println!("scratch={scratch} pretag_sha={pretag_sha} posttag_sha={} bytes={} first_difference={first:?}", file_sha256(&path).unwrap(), produced.len());
+            assert_eq!(first, if scratch == 0 { Some(original_start + 177) } else { None });
+        }
+        assert_eq!(file_sha256(&source_path).unwrap(), "ceb61a55c296eebec677d11d82baf0dd539cd13c290321c6cf0874e70dfe3ebe");
+        assert_eq!(file_sha256(&reference_path).unwrap(), "12b12b9ddff607fc9f82e38a25dd212518a6cbd462dc6aa3f44f79c7cf16971d");
+    }
+
     /// Independently compare our source inspection with MIKAudio's returned
     /// 40-byte record on synthetic Xing/Info, ID3 and LAME-presence cases.
     #[test]

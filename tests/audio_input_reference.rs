@@ -25,6 +25,7 @@ mod oracle {
     use std::fs::{self, File, OpenOptions};
     use std::io::Write;
     use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +37,7 @@ mod oracle {
             let root = std::env::current_dir().unwrap().join("local-artifacts/flac-implementation");
             for _ in 0..128 {
                 let path = root.join(format!("input-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-                match fs::create_dir(&path) {
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
                     Ok(()) => return Self(path),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(e) => panic!("create generated-fixture directory: {e}"),
@@ -46,7 +47,15 @@ mod oracle {
         }
         fn path(&self, name: &str) -> PathBuf { self.0.join(name) }
     }
-    impl Drop for TestDir { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("retained failed reference fixtures at {}", self.0.display());
+            } else {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
 
     #[link(name = "System")]
     unsafe extern "C" {
@@ -128,6 +137,42 @@ mod oracle {
         serde_json::from_str(stdout.lines().last().expect("missing oracle JSON")).expect("invalid oracle JSON")
     }
     fn as_bytes(samples: &[f32]) -> Vec<u8> { samples.iter().flat_map(|sample| sample.to_ne_bytes()).collect() }
+
+    // Encoders are operator-selected and run only in our private fixture dir.
+    // Compare the same generated Ogg bytes; serial numbers need not reproduce.
+    fn encode_ogg_fixture(ffmpeg: &Path, sndfile: &Path, wav: &Path, ogg: &Path, codec: &str, signature: &[u8]) -> Vec<u8> {
+        let result = if codec == "vorbis" {
+            // The installed FFmpeg Vorbis encoder accepts stereo only. Reserve
+            // our own destination before using libsndfile for mono and stereo.
+            drop(OpenOptions::new().write(true).create_new(true).open(ogg).unwrap());
+            Command::new(sndfile).arg("-vorbis").arg(wav).arg(ogg)
+                .output().expect("run the operator-selected sndfile-convert")
+        } else {
+            Command::new(ffmpeg)
+                .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-n", "-i"])
+                .arg(wav)
+                .args(["-map", "0:a:0", "-map_metadata", "-1", "-c:a", codec, "-f", "ogg"])
+                .arg(ogg).output().expect("run the operator-selected FFmpeg")
+        };
+        assert!(result.status.success(), "{codec} fixture generation failed: {}",
+            String::from_utf8_lossy(&result.stderr));
+        let bytes = fs::read(ogg).unwrap();
+        assert!(bytes.len() >= 27 && &bytes[..4] == b"OggS", "{codec}: not an Ogg page");
+        assert_eq!(bytes[4], 0, "{codec}: unsupported Ogg bitstream version");
+        assert_eq!(bytes[5] & 3, 2, "{codec}: first page must be BOS, not a continuation");
+        let segments = bytes[26] as usize;
+        assert!(segments > 0 && bytes.len() >= 27 + segments, "{codec}: missing segment table");
+        assert!(bytes[27] as usize >= signature.len(), "{codec}: short identification packet");
+        let body = 27 + segments;
+        assert!(bytes.len() >= body + signature.len(), "{codec}: truncated identification packet");
+        assert_eq!(&bytes[body..body + signature.len()], signature, "{codec}: wrong Ogg codec");
+        bytes
+    }
+
+    fn copy_generated_fixture(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path).unwrap();
+        file.write_all(bytes).unwrap();
+    }
 
     #[test]
     #[ignore = "requires PN_FLAC_LIBRARY, PN_FLAC_LIBRARY_SHA256, PN_FLAC_INPUT_ORACLE and PN_MIKAUDIO_REFERENCE"]
@@ -354,6 +399,119 @@ mod oracle {
                 assert_eq!(actual, expected, "Apple fixture {case}, block {block}; first differing byte {:?}",
                     actual.iter().zip(&expected).position(|(a,b)| a != b));
                 reader.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PN_OGG_FFMPEG, PN_OGG_SNDFILE_CONVERT, PN_FLAC_INPUT_ORACLE and PN_MIKAUDIO_REFERENCE"]
+    fn generated_ogg_codecs_probe_mikaudio_dispatch_and_decode() {
+        use platinum_engine::apple_codec::CodecError;
+        use platinum_engine::mp3::file_sha256;
+
+        let ffmpeg = env_path("PN_OGG_FFMPEG");
+        let sndfile = env_path("PN_OGG_SNDFILE_CONVERT");
+        let oracle = env_path("PN_FLAC_INPUT_ORACLE");
+        let image = env_path("PN_MIKAUDIO_REFERENCE");
+        println!("ogg probe: ffmpeg_sha256={} sndfile_convert_sha256={}", file_sha256(&ffmpeg).unwrap(), file_sha256(&sndfile).unwrap());
+        let dir = TestDir::new();
+        let codecs: [(&str, &str, &[u8]); 3] = [
+            ("vorbis", "vorbis", b"\x01vorbis"),
+            ("opus", "libopus", b"OpusHead"),
+            ("flac", "flac", b"\x7fFLAC"),
+        ];
+        let variants = ["ogg", "OGG", "oga", "wav"];
+        let reads = [(257usize, false, None), (4096, false, Some(32_000u32)),
+            (257, true, None), (4096, true, Some(32_000u32))];
+        for (label, encoder, signature) in codecs {
+            for channels in [1u16, 2] {
+                let wav = dir.path(&format!("pcm-{label}-{channels}.wav"));
+                write_pcm16_wav(&wav, 48_000, channels, 8193);
+                let encoded = dir.path(&format!("encoded-{label}-{channels}.ogg"));
+                let contents = encode_ogg_fixture(&ffmpeg, &sndfile, &wav, &encoded, encoder, signature);
+                let source_hash = file_sha256(&encoded).unwrap();
+                for (variant, extension) in variants.into_iter().enumerate() {
+                    // .oga and .wav exercise the component independently of
+                    // PNFile admission; .wav is only a renamed Ogg container.
+                    let source = dir.path(&format!("input-{label}-{channels}-{variant}.{extension}"));
+                    copy_generated_fixture(&source, &contents);
+                    assert_eq!(file_sha256(&source).unwrap(), source_hash);
+                    for (block, planar, rate) in reads {
+                        let raw = dir.path(&format!("original-{label}-{channels}-{variant}-{extension}-{block}-{planar}.f32"));
+                        println!("ogg start codec={label} channels={channels} suffix={extension} block={block} planar={planar} rate={rate:?} input_sha256={source_hash}");
+                        let original = run_original(&oracle, &image, &source, &raw, block, rate, planar);
+                        let open_status = original["open_status"].as_i64().expect("original open status");
+                        println!("ogg reference={original}");
+                        let result = AudioReader::open(&source, rate.map(f64::from), &InputLibraries::default());
+                        let mut reader = match (open_status, result) {
+                            (0, Ok(reader)) => reader,
+                            (0, Err(error)) => panic!("original opened but candidate failed: {error}"),
+                            (1, Err(AudioInputError::Apple(CodecError::Native { operation, status }))) => {
+                                // MIKExtAudioFileOpen collapses both Apple open
+                                // and ffmt failures to 1; do not compare that
+                                // wrapper status to an Apple OSStatus.
+                                assert!(matches!(operation, "ExtAudioFileOpenURL" | "ExtAudioFileGetProperty(file format)"),
+                                    "candidate failed after the original open boundary: {operation} ({status})");
+                                println!("ogg candidate_open_failure operation={operation} osstatus={status}");
+                                assert!(!raw.exists());
+                                assert_eq!(file_sha256(&source).unwrap(), source_hash);
+                                continue;
+                            }
+                            (status, Err(error)) => panic!("original open status {status}, candidate failed differently: {error}"),
+                            (status, Ok(_)) => panic!("original open status {status}, candidate unexpectedly opened"),
+                        };
+                        assert!(matches!(&reader, AudioReader::Apple(_)), ".ogg/oga/wav must use the Apple path");
+                        let src = reader.source_format();
+                        assert_eq!(src.sample_rate, original["source_rate"].as_f64().unwrap());
+                        for (actual, name) in [(src.format_id, "format_id"), (src.format_flags, "format_flags"),
+                            (src.bytes_per_packet, "bytes_per_packet"), (src.frames_per_packet, "frames_per_packet"),
+                            (src.bytes_per_frame, "bytes_per_frame"), (src.channels_per_frame, "channels"),
+                            (src.bits_per_channel, "bits"), (src.reserved, "reserved")] {
+                            assert_eq!(u64::from(actual), original[name].as_u64().unwrap(), "{label}.{extension}: {name}");
+                        }
+                        assert_eq!(src.channels_per_frame, u32::from(channels));
+                        assert_eq!(reader.file_length_frames().unwrap(), original["source_frames"].as_i64().unwrap());
+                        let mut samples = Vec::new();
+                        let mut total = 0usize;
+                        if planar {
+                            reader.set_stereo_planar(rate.map_or(src.sample_rate, f64::from)).unwrap();
+                            let mut left = vec![13.0f32; block];
+                            let mut right = vec![-17.0f32; block];
+                            loop {
+                                left.fill(13.0);
+                                right.fill(-17.0);
+                                let got = reader.read_stereo_planar(&mut left, &mut right).unwrap();
+                                if original["tail_preserved"].as_bool().unwrap() {
+                                    assert!(left[got..].iter().all(|&v| v == 13.0));
+                                    assert!(right[got..].iter().all(|&v| v == -17.0));
+                                }
+                                if got == 0 { break; }
+                                samples.extend_from_slice(&left[..got]);
+                                samples.extend_from_slice(&right[..got]);
+                                total += got;
+                                assert!(total <= 1_000_000, "generated fixture did not reach EOF");
+                            }
+                        } else {
+                            let mut buffer = vec![0.0f32; block * channels as usize];
+                            loop {
+                                buffer.fill(0.0);
+                                let got = reader.read(&mut buffer).unwrap();
+                                if got == 0 { break; }
+                                samples.extend_from_slice(&buffer[..got * channels as usize]);
+                                total += got;
+                                assert!(total <= 1_000_000, "generated fixture did not reach EOF");
+                            }
+                        }
+                        assert_eq!(total as u64, original["read_frames"].as_u64().unwrap());
+                        let actual = as_bytes(&samples);
+                        let expected = fs::read(&raw).unwrap();
+                        assert_eq!(actual, expected, "{label}.{extension}, block {block}, planar {planar}, rate {rate:?}; first differing byte {:?}",
+                            actual.iter().zip(&expected).position(|(a,b)| a != b));
+                        println!("ogg decoded_pcm_sha256={} matched_frames={total}", file_sha256(&raw).unwrap());
+                        reader.close().unwrap();
+                        assert_eq!(file_sha256(&source).unwrap(), source_hash, "source changed during comparison");
+                    }
+                }
             }
         }
     }

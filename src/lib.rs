@@ -24,6 +24,7 @@ pub mod phase;
 pub mod pitch;
 pub mod pitch_detect;
 pub mod settings;
+pub mod statistics;
 pub mod tags;
 pub mod templates;
 pub mod transient;

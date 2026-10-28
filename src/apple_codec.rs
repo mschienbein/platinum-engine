@@ -630,3 +630,153 @@ impl Pcm16StereoConverter {
     }
 }
 impl Drop for Pcm16StereoConverter { fn drop(&mut self) { let _ = self.dispose(); } }
+
+/// Diagnostic clock control for AudioToolbox MP4 output. The recorder stores
+/// its wall-clock close second (since 1904) in the creation and modification
+/// fields of `mvhd` and of every track's `tkhd` and `mdhd`. Replacing them with
+/// a supplied second makes a candidate comparable to a native export whose
+/// recorded value is known. Returns the number of patched fields.
+pub fn set_mp4_header_times(path: &Path, seconds_since_1904: u32) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const MAX_MOOV: u64 = 64 * 1024 * 1024;
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let length = file.metadata()?.len();
+    let mut offset = 0u64;
+    let (start, size) = loop {
+        if length.saturating_sub(offset) < 8 { return Err(invalid_mp4("moov box not found")); }
+        let mut header = [0u8; 16];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut header[..8])?;
+        let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().expect("four bytes")) {
+            0 => (length - offset, 8),
+            1 => { file.read_exact(&mut header[8..])?; (u64::from_be_bytes(header[8..].try_into().expect("eight bytes")), 16) }
+            n => (u64::from(n), 8),
+        };
+        if size < header_len || size > length - offset { return Err(invalid_mp4("invalid top-level box size")); }
+        if &header[4..8] == b"moov" { break (offset + header_len, size - header_len); }
+        offset += size;
+    };
+    if size > MAX_MOOV { return Err(invalid_mp4("moov box exceeds the supported size")); }
+    let mut moov = vec![0u8; size as usize];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut moov)?;
+    let patched = patch_moov_times(&mut moov, seconds_since_1904)?;
+    file.seek(SeekFrom::Start(start))?;
+    file.write_all(&moov)?;
+    file.sync_all()?;
+    Ok(patched)
+}
+
+fn invalid_mp4(message: &'static str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
+
+fn mp4_children(data: &[u8]) -> io::Result<Vec<([u8; 4], std::ops::Range<usize>)>> {
+    let mut children = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let rest = &data[offset..];
+        if rest.len() < 8 { return Err(invalid_mp4("truncated child box header")); }
+        let kind: [u8; 4] = rest[4..8].try_into().expect("four bytes");
+        let (size, header_len) = match u32::from_be_bytes(rest[..4].try_into().expect("four bytes")) {
+            0 => (rest.len(), 8),
+            1 => {
+                if rest.len() < 16 { return Err(invalid_mp4("truncated large box header")); }
+                let size = u64::from_be_bytes(rest[8..16].try_into().expect("eight bytes"));
+                (usize::try_from(size).map_err(|_| invalid_mp4("child box is too large"))?, 16)
+            }
+            n => (n as usize, 8),
+        };
+        if size < header_len || size > rest.len() { return Err(invalid_mp4("invalid child box size")); }
+        children.push((kind, offset + header_len..offset + size));
+        offset += size;
+    }
+    Ok(children)
+}
+
+fn only_child(data: &[u8], kind: &[u8; 4]) -> io::Result<std::ops::Range<usize>> {
+    let mut found = mp4_children(data)?.into_iter().filter(|(k, _)| k == kind).map(|(_, r)| r);
+    match (found.next(), found.next()) {
+        (Some(range), None) => Ok(range),
+        (None, _) => Err(invalid_mp4("required MP4 header box is missing")),
+        (Some(_), Some(_)) => Err(invalid_mp4("MP4 header box is duplicated")),
+    }
+}
+
+fn patch_full_box_times(payload: &mut [u8], seconds: u32) -> io::Result<()> {
+    match payload.first() {
+        Some(0) if payload.len() >= 12 => {
+            payload[4..8].copy_from_slice(&seconds.to_be_bytes());
+            payload[8..12].copy_from_slice(&seconds.to_be_bytes());
+        }
+        Some(1) if payload.len() >= 20 => {
+            payload[4..12].copy_from_slice(&u64::from(seconds).to_be_bytes());
+            payload[12..20].copy_from_slice(&u64::from(seconds).to_be_bytes());
+        }
+        _ => return Err(invalid_mp4("unsupported or truncated MP4 time header")),
+    }
+    Ok(())
+}
+
+fn patch_moov_times(moov: &mut [u8], seconds: u32) -> io::Result<usize> {
+    let mvhd = only_child(moov, b"mvhd")?;
+    patch_full_box_times(&mut moov[mvhd], seconds)?;
+    let tracks: Vec<_> = mp4_children(moov)?.into_iter().filter(|(k, _)| k == b"trak").map(|(_, r)| r).collect();
+    if tracks.is_empty() { return Err(invalid_mp4("MP4 has no track")); }
+    for trak in &tracks {
+        let trak = &mut moov[trak.clone()];
+        let tkhd = only_child(trak, b"tkhd")?;
+        patch_full_box_times(&mut trak[tkhd], seconds)?;
+        let mdia = only_child(trak, b"mdia")?;
+        let mdia = &mut trak[mdia];
+        let mdhd = only_child(mdia, b"mdhd")?;
+        patch_full_box_times(&mut mdia[mdhd], seconds)?;
+    }
+    Ok(2 + tracks.len() * 4)
+}
+
+#[cfg(test)]
+mod mp4_time_tests {
+    use super::*;
+
+    fn full_box(kind: &[u8; 4], version: u8, body: usize) -> Vec<u8> {
+        let mut b = ((8 + 4 + body) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(&[version, 0, 0, 0]);
+        b.extend((0..body).map(|i| 0xa0 ^ i as u8));
+        b
+    }
+    fn container(kind: &[u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = children.concat();
+        let mut b = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend(body);
+        b
+    }
+
+    #[test]
+    fn patches_exactly_the_six_time_fields_of_versions_0_and_1() {
+        let moov = container(b"moov", &[full_box(b"mvhd", 0, 96),
+            container(b"trak", &[full_box(b"tkhd", 1, 92), container(b"mdia", &[full_box(b"mdhd", 0, 20), full_box(b"hdlr", 0, 25)])])]);
+        let mut moov_body = moov[8..].to_vec();
+        let before = moov_body.clone();
+        assert_eq!(patch_moov_times(&mut moov_body, 0xE706_F05D).unwrap(), 6);
+        let changed: Vec<usize> = (0..before.len()).filter(|&i| before[i] != moov_body[i]).collect();
+        // Offsets in the moov body: mvhd v0 creation at 12; trak at 108, tkhd v1
+        // creation at 108+8+12; mdia after the 104-byte tkhd, mdhd v0 creation +20.
+        let mvhd = 12;
+        let tkhd = 108 + 8 + 12;
+        let mdhd = tkhd + 92 + 8 + 12;
+        assert_eq!(&moov_body[mvhd..mvhd + 8], &[0xE7, 0x06, 0xF0, 0x5D, 0xE7, 0x06, 0xF0, 0x5D]);
+        assert_eq!(&moov_body[tkhd..tkhd + 16], &[0, 0, 0, 0, 0xE7, 0x06, 0xF0, 0x5D, 0, 0, 0, 0, 0xE7, 0x06, 0xF0, 0x5D]);
+        assert_eq!(&moov_body[mdhd..mdhd + 8], &[0xE7, 0x06, 0xF0, 0x5D, 0xE7, 0x06, 0xF0, 0x5D]);
+        assert!(changed.iter().all(|&i| (mvhd..mvhd + 8).contains(&i) || (tkhd..tkhd + 16).contains(&i) || (mdhd..mdhd + 8).contains(&i)));
+    }
+
+    #[test]
+    fn rejects_missing_or_duplicated_time_headers() {
+        let missing = container(b"moov", &[full_box(b"mvhd", 0, 96), container(b"trak", &[full_box(b"tkhd", 0, 80)])]);
+        let duplicated = container(b"moov", &[full_box(b"mvhd", 0, 96), full_box(b"mvhd", 0, 96)]);
+        for moov in [missing, duplicated] {
+            assert_eq!(patch_moov_times(&mut moov[8..].to_vec(), 1).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+}

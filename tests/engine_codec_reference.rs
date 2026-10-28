@@ -45,7 +45,7 @@ impl Fixture {
         let mut template = s.template(TemplateRef::Index(0)).unwrap();
         template.clip.enabled = false; template.pitch.enabled = false; template.exciter_option = -1;
         template.expansion.enabled = false; template.compression.enabled = false;
-        let prepared = prepare_file(&item, s).unwrap();
+        let prepared = prepare_file(&item, s, false).unwrap();
         let result = process_file(&prepared, &template, s, &Cancellation::new()).unwrap();
         assert_eq!(result.output_format, expected); assert!(result.output_frames > 0);
         assert_eq!(result.processing_marker_status, "present");
@@ -59,7 +59,7 @@ impl Fixture {
         bytes[44..].fill(0);
         fs::write(&self.input, &bytes).unwrap();
         let item = file_workflow::discover_inputs(&[self.input.clone()]).unwrap().remove(0);
-        let prepared = prepare_file(&item, settings).unwrap();
+        let prepared = prepare_file(&item, settings, false).unwrap();
         let template = settings.template(TemplateRef::Index(0)).unwrap();
         let report = process_file(&prepared, &template, settings, &Cancellation::new()).unwrap();
         assert_eq!(report.processing_marker_status, "nil_payload_absent");

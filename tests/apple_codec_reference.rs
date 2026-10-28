@@ -237,3 +237,240 @@ fn pinned_codec_reference_full_file_comparison() {
         }
     }
 }
+
+// Unlike the separate-process oracle above, this diagnostic alternates the
+// production reader and a direct system reader in one process, using the same
+// output allocation. It intentionally retains exact mismatches as failures.
+mod aac_context {
+    use super::*;
+    use std::ffi::c_void;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::ptr;
+
+    #[repr(C)]
+    struct Buffer { channels: u32, bytes: u32, data: *mut c_void }
+    #[repr(C)]
+    struct BufferList { count: u32, buffers: [Buffer; 1] }
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    unsafe extern "C" {
+        #[link_name = "ExtAudioFileOpenURL"]
+        fn open_url(url: *const c_void, output: *mut *mut c_void) -> i32;
+        #[link_name = "ExtAudioFileGetProperty"]
+        fn get_property(file: *mut c_void, property: u32, size: *mut u32, output: *mut c_void) -> i32;
+        #[link_name = "ExtAudioFileSetProperty"]
+        fn set_property(file: *mut c_void, property: u32, size: u32, data: *const c_void) -> i32;
+        #[link_name = "ExtAudioFileRead"]
+        fn read_frames(file: *mut c_void, frames: *mut u32, list: *mut BufferList) -> i32;
+        #[link_name = "ExtAudioFileDispose"]
+        fn dispose(file: *mut c_void) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        #[link_name = "CFURLCreateFromFileSystemRepresentation"]
+        fn create_url(allocator: *const c_void, bytes: *const u8, length: isize, directory: u8) -> *const c_void;
+        #[link_name = "CFRelease"]
+        fn release(object: *const c_void);
+    }
+
+    const fn fourcc(bytes: [u8; 4]) -> u32 { u32::from_be_bytes(bytes) }
+    fn status(operation: &str, result: i32) { assert_eq!(result, 0, "{operation}: OSStatus {result}"); }
+
+    #[cfg(target_arch = "aarch64")]
+    fn current_fpcr() -> u64 {
+        let value: u64;
+        unsafe { std::arch::asm!("mrs {value}, fpcr", value = out(reg) value, options(nostack, preserves_flags)); }
+        value
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fn current_fpcr() -> u64 { 0 }
+
+    struct Direct {
+        file: *mut c_void,
+        source: StreamDescription,
+        client: StreamDescription,
+    }
+    impl Direct {
+        fn open(path: &Path) -> Self {
+            let path_bytes = path.as_os_str().as_bytes();
+            let url = unsafe {
+                create_url(ptr::null(), path_bytes.as_ptr(), path_bytes.len().try_into().unwrap(), 0)
+            };
+            assert!(!url.is_null());
+            let mut file = ptr::null_mut();
+            let result = unsafe { open_url(url, &mut file) };
+            unsafe { release(url) };
+            if result != 0 {
+                if !file.is_null() { unsafe { dispose(file) }; }
+                status("direct open", result);
+            }
+            assert!(!file.is_null());
+            let mut direct = Self { file, source: StreamDescription::default(), client: StreamDescription::default() };
+            let mut size = std::mem::size_of::<StreamDescription>() as u32;
+            status("direct source format", unsafe {
+                get_property(direct.file, fourcc(*b"ffmt"), &mut size, (&mut direct.source as *mut StreamDescription).cast())
+            });
+            assert_eq!(size as usize, std::mem::size_of::<StreamDescription>());
+            let source = direct.source;
+            let bytes = source.channels_per_frame.checked_mul(4).unwrap();
+            direct.client = StreamDescription {
+                sample_rate: source.sample_rate, format_id: fourcc(*b"lpcm"), format_flags: 9,
+                bytes_per_packet: bytes, frames_per_packet: 1, bytes_per_frame: bytes,
+                channels_per_frame: source.channels_per_frame, bits_per_channel: 32, reserved: 0,
+            };
+            status("direct client format", unsafe {
+                set_property(direct.file, fourcc(*b"cfmt"), std::mem::size_of::<StreamDescription>() as u32,
+                    (&direct.client as *const StreamDescription).cast())
+            });
+            direct
+        }
+        fn length(&self) -> i64 {
+            let mut length = 0i64;
+            let mut size = std::mem::size_of::<i64>() as u32;
+            status("direct length", unsafe {
+                get_property(self.file, fourcc(*b"#frm"), &mut size, (&mut length as *mut i64).cast())
+            });
+            assert_eq!(size as usize, std::mem::size_of::<i64>());
+            length
+        }
+        fn read(&mut self, block: &mut [f32]) -> (usize, Option<u32>) {
+            let channels = self.client.channels_per_frame as usize;
+            assert_eq!(block.len() % channels, 0);
+            let mut frames: u32 = (block.len() / channels).try_into().unwrap();
+            let capacity: u32 = (block.len() * std::mem::size_of::<f32>()).try_into().unwrap();
+            let data = block.as_mut_ptr().cast();
+            let mut list = BufferList { count: 1, buffers: [Buffer { channels: channels as u32, bytes: capacity, data }] };
+            status("direct read", unsafe { read_frames(self.file, &mut frames, &mut list) });
+            assert!(frames as usize <= block.len() / channels && list.count == 1);
+            assert!(list.buffers[0].bytes <= capacity && list.buffers[0].data == data);
+            (frames as usize, Some(list.buffers[0].bytes))
+        }
+        fn close(&mut self) {
+            let file = std::mem::replace(&mut self.file, ptr::null_mut());
+            if !file.is_null() { status("direct dispose", unsafe { dispose(file) }); }
+        }
+    }
+    impl Drop for Direct {
+        fn drop(&mut self) { if !self.file.is_null() { unsafe { dispose(self.file) }; } }
+    }
+
+    enum Input { Rust(Reader), Native(Direct) }
+    impl Input {
+        fn open(arm: char, path: &Path) -> Self {
+            match arm {
+                'R' => Self::Rust(Reader::open(path, None).unwrap()),
+                'N' => Self::Native(Direct::open(path)),
+                _ => unreachable!(),
+            }
+        }
+        fn formats(&self) -> (StreamDescription, StreamDescription) {
+            match self {
+                Self::Rust(r) => (r.source_format(), r.client_format()),
+                Self::Native(r) => (r.source, r.client),
+            }
+        }
+        fn length(&self) -> i64 {
+            match self {
+                Self::Rust(r) => r.file_length_frames().unwrap(),
+                Self::Native(r) => r.length(),
+            }
+        }
+        fn read(&mut self, block: &mut [f32]) -> (usize, Option<u32>) {
+            match self {
+                Self::Rust(r) => (r.read(block).unwrap(), None),
+                Self::Native(r) => r.read(block),
+            }
+        }
+        fn close(self) {
+            match self {
+                Self::Rust(r) => r.close().unwrap(),
+                Self::Native(mut r) => r.close(),
+            }
+        }
+    }
+    struct Capture {
+        arm: char, source: StreamDescription, client: StreamDescription, length: i64,
+        open_fpcr: (u64, u64), reads: Vec<(usize, Option<u32>, u64, u64)>, samples: Vec<f32>,
+    }
+    fn capture(arm: char, path: &Path, block: &mut [f32]) -> Capture {
+        let before = current_fpcr();
+        let mut input = Input::open(arm, path);
+        let after = current_fpcr();
+        let (source, client) = input.formats();
+        assert_eq!(source.format_id, fourcc(*b"aac "), "fixture must be generated mono AAC");
+        assert_eq!(source.channels_per_frame, 1, "fixture must be generated mono AAC");
+        let length = input.length();
+        let capacity: usize = length.try_into().expect("negative or oversized file frame count");
+        let mut samples = Vec::with_capacity(capacity);
+        let mut reads = Vec::new();
+        loop {
+            block.fill(0.0);
+            let before = current_fpcr();
+            let (frames, bytes) = input.read(block);
+            let after = current_fpcr();
+            reads.push((frames, bytes, before, after));
+            if frames == 0 { break; }
+            samples.extend_from_slice(&block[..frames]);
+        }
+        input.close();
+        Capture { arm, source, client, length, open_fpcr: (before, after), reads, samples }
+    }
+
+    #[test]
+    #[ignore = "diagnostic requiring PN_AAC_DIAG_SOURCE; retains any exact mismatches"]
+    fn aac_interleaved_same_process_rust_and_native_contexts() {
+        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("local-artifacts/apple-codecs")).unwrap();
+        let path = fs::canonicalize(std::env::var_os("PN_AAC_DIAG_SOURCE").expect("set PN_AAC_DIAG_SOURCE")).unwrap();
+        assert!(path.starts_with(&root) && path.is_file(), "fixture must be generated under local-artifacts/apple-codecs");
+        let sequence = std::env::var("PN_AAC_DIAG_SEQUENCE").unwrap_or_else(|_| "RRNNNRRN".to_owned());
+        assert!(!sequence.is_empty() && sequence.len() <= 32 && sequence.contains('R') && sequence.contains('N')
+            && sequence.bytes().all(|b| b == b'R' || b == b'N'), "sequence must contain both R and N, maximum 32");
+        let frames: usize = std::env::var("PN_AAC_DIAG_BLOCK").unwrap_or_else(|_| "512".to_owned()).parse().unwrap();
+        assert!((1..=65_535).contains(&frames));
+        let output = std::env::var_os("PN_AAC_DIAG_OUTPUT").map(|value| {
+            let path = PathBuf::from(value);
+            let path = if path.is_absolute() { path } else { std::env::current_dir().unwrap().join(path) };
+            assert_eq!(fs::canonicalize(path.parent().unwrap()).unwrap(), root, "output must be a new child of the fixture root");
+            fs::DirBuilder::new().mode(0o700).create(&path).expect("create exclusive output directory");
+            path
+        });
+        assert_eq!(std::mem::size_of::<StreamDescription>(), 40);
+        assert_eq!(std::mem::size_of::<Buffer>(), 16);
+        assert_eq!(std::mem::offset_of!(Buffer, data), 8);
+        assert_eq!(std::mem::offset_of!(BufferList, buffers), 8);
+        assert_eq!(std::mem::size_of::<BufferList>(), 24);
+        println!("fixture_sha256={} sequence={sequence} block_frames={frames}",
+            platinum_engine::mp3::file_sha256(&path).unwrap());
+        let mut block = vec![0.0f32; frames];
+        println!("shared_output_mod64={}", block.as_ptr() as usize % 64);
+        let mut captures = Vec::new();
+        for (index, arm) in sequence.chars().enumerate() {
+            let result = capture(arm, &path, &mut block);
+            let hash = output.as_ref().map(|dir| {
+                let target = dir.join(format!("{index}-{arm}.f32"));
+                let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&target).unwrap();
+                file.write_all(&as_bytes_f32(&result.samples)).unwrap();
+                drop(file);
+                platinum_engine::mp3::file_sha256(target).unwrap()
+            });
+            println!("trial={index} arm={arm} sha256={hash:?} frames={} source={:?} client={:?} source_length={} open_fpcr={:?} reads={:?}",
+                result.samples.len(), result.source, result.client, result.length, result.open_fpcr, result.reads);
+            captures.push(result);
+        }
+        let baseline = &captures[0];
+        let mut all_equal = true;
+        for (index, result) in captures.iter().enumerate().skip(1) {
+            let first = baseline.samples.iter().zip(&result.samples).position(|(a, b)| a.to_bits() != b.to_bits());
+            let differing_words = baseline.samples.iter().zip(&result.samples).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let same_schedule = baseline.reads.iter().map(|read| read.0).eq(result.reads.iter().map(|read| read.0));
+            let equal = baseline.source == result.source && baseline.client == result.client && baseline.length == result.length
+                && same_schedule && baseline.samples.len() == result.samples.len() && differing_words == 0;
+            println!("comparison=0/{index} arms={}/{} equal={equal} same_schedule={same_schedule} first_word={first:?} differing_overlap_words={differing_words}",
+                baseline.arm, result.arm);
+            all_equal &= equal;
+        }
+        assert!(all_equal, "same-process AAC captures differ; retain exact raw outputs and inspect the trial log");
+    }
+}

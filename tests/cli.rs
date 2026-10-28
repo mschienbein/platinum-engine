@@ -42,19 +42,71 @@ impl Sandbox {
 impl Drop for Sandbox { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); } }
 
 #[test]
-fn help_version_and_machine_usage_error() {
-    let help = Command::new(env!("CARGO_BIN_EXE_platinum")).arg("--help").output().unwrap();
-    assert!(help.status.success());
-    let text = String::from_utf8(help.stdout).unwrap();
-    for command in ["process", "analyze", "inspect", "restore", "templates", "config", "provenance"] {
-        assert!(text.contains(command), "help missing {command}");
-    }
+fn version_and_machine_usage_error() {
     let sandbox = Sandbox::new();
     let version = sandbox.ok(&["version"]);
     assert_eq!(version["data"]["version"], env!("CARGO_PKG_VERSION"));
     let (output, error) = sandbox.run(&["not-a-command"]);
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(error["error"]["kind"], "usage");
+}
+
+#[test]
+fn ambiguous_marker_override_is_rejected_outside_process() {
+    let sandbox = Sandbox::new();
+    let input = "input.wav";
+    for args in [
+        vec!["inspect", input, "--allow-ambiguous-marker"],
+        vec!["analyze", input, "--allow-ambiguous-marker"],
+        vec!["restore", input, "--backup", "/synthetic/backup.wav", "--allow-ambiguous-marker"],
+    ] {
+        let (output, error) = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(error["error"]["kind"], "usage");
+    }
+}
+
+#[test]
+fn overwrite_is_explicit_ephemeral_and_conflicts_with_source_replacement() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.root.join("missing.wav");
+    let backup = sandbox.root.join("backups");
+    fs::create_dir(&backup).unwrap();
+    let source = source.to_str().unwrap(); let backup = backup.to_str().unwrap();
+    let (output, normal) = sandbox.run(&["process", source, "--format", "wav"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(normal["details"]["overwrite"], false);
+    assert_eq!(normal["details"]["effective_config"]["overwrite"], false);
+    let (output, opted_in) = sandbox.run(&["process", source, "--format", "wav", "--overwrite"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(opted_in["details"]["overwrite"], true);
+    assert_eq!(opted_in["details"]["effective_config"]["overwrite"], true);
+    assert!(sandbox.ok(&["config", "show"])["data"].get("overwrite").is_none());
+    let (output, error) = sandbox.run(&["process", source, "--overwrite", "--replace-originals", "--backup-dir", backup]);
+    assert_eq!(output.status.code(), Some(2)); assert_eq!(error["error"]["kind"], "usage");
+    let help = Command::new(env!("CARGO_BIN_EXE_platinum")).args(["process", "--help"]).output().unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--overwrite"));
+}
+
+#[test]
+fn restore_rejects_cross_pair_target_backup_alias_before_any_write() {
+    for hardlink_alias in [false, true] {
+        let sandbox = Sandbox::new();
+        let first = sandbox.root.join("first.wav"); fs::write(&first, b"first").unwrap();
+        let second = sandbox.root.join("second.wav"); fs::write(&second, b"second").unwrap();
+        let backup = sandbox.root.join("backup.wav"); fs::write(&backup, b"backup").unwrap();
+        let alias = if hardlink_alias {
+            let alias = sandbox.root.join("second-alias.wav"); fs::hard_link(&second, &alias).unwrap(); alias
+        } else { second.clone() };
+        let (output, result) = sandbox.run(&["restore", first.to_str().unwrap(), second.to_str().unwrap(),
+            "--backup", alias.to_str().unwrap(), "--backup", backup.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(result["error"]["kind"], "usage");
+        assert_eq!(fs::read(first).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"second");
+        assert_eq!(fs::read(backup).unwrap(), b"backup");
+    }
 }
 
 #[test]
@@ -189,6 +241,7 @@ fn non_unicode_input_is_a_truthful_machine_failure() {
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE pointing to the public tag bridge"]
 fn synthetic_audio_analysis_processing_and_restore() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let sandbox = Sandbox::new();
     let bridge = std::env::var("PLATINUM_TEST_TAG_BRIDGE").expect("provide public tag bridge path");
     let bridge_json = json!(bridge).to_string();
@@ -230,29 +283,73 @@ fn synthetic_audio_analysis_processing_and_restore() {
 
     let analysis = sandbox.ok(&["analyze", source, "--jobs", "1"]);
     assert_eq!(analysis["results"][0]["report"]["frames"], FRAMES);
-    assert_eq!(analysis["results"][0]["report"]["waveform"]["frames"], FRAMES);
-    assert!(!analysis["results"][0]["report"]["waveform"]["bins"].as_array().unwrap().is_empty());
+    let waveform = &analysis["results"][0]["report"]["waveform"];
+    assert_eq!(waveform["sample_rate"], 44_100.0);
+    assert_eq!(waveform["requested_sample_rate"], 44_100.0);
+    assert_eq!(waveform["frames"], 132_300);
+    let bins = waveform["bins"].as_array().unwrap();
+    assert_eq!(bins[0]["frames"], 512);
+    assert_eq!(bins.last().unwrap()["frames"], 204);
+    assert_eq!(bins.iter().map(|bin| bin["frames"].as_u64().unwrap()).sum::<u64>(), 132_300);
     assert!(analysis["results"][0]["report"]["clip_count"].is_null());
     let processed = sandbox.ok(&["process", source, "--format", "wav", "--output-dir", outputs, "--jobs", "1"]);
+    assert_eq!(processed["details"]["overwrite"], false);
+    assert_eq!(processed["results"][0]["report"]["replaced_existing_output"], false);
     let output_path = processed["results"][0]["report"]["output_path"].as_str().unwrap();
     let output_bytes = fs::read(output_path).unwrap();
-    assert!(!output_bytes.is_empty());
+    let old_inode = fs::metadata(output_path).unwrap().ino();
     let inspection = sandbox.ok(&["inspect", output_path]);
     assert_eq!(inspection["results"][0]["report"]["processed"], true);
-    assert!(inspection["results"][0]["report"]["tags"].is_object());
+    assert_eq!(inspection["results"][0]["report"]["input_format"], "wav/pcm");
+    assert_eq!(inspection["results"][0]["report"]["frames"], FRAMES);
     let (collision, outcome) = sandbox.run(&["process", source, "--format", "wav", "--output-dir", outputs, "--jobs", "1"]);
     assert_eq!(collision.status.code(), Some(1));
     assert_eq!(outcome["results"][0]["status"], "failed");
     assert_eq!(fs::read(output_path).unwrap(), output_bytes);
+
+    let overwritten = sandbox.ok(&["process", source, "--format", "wav", "--output-dir", outputs, "--jobs", "1", "--overwrite"]);
+    assert_eq!(overwritten["details"]["overwrite"], true);
+    assert_eq!(overwritten["details"]["effective_config"]["overwrite"], true);
+    assert_eq!(overwritten["results"][0]["report"]["replaced_existing_output"], true);
+    assert_ne!(fs::metadata(output_path).unwrap().ino(), old_inode);
+    assert_eq!(fs::read(source).unwrap(), wav);
+    let new_output = fs::read(output_path).unwrap();
+    let (collision, outcome) = sandbox.run(&["process", source, output_path, "--format", "wav", "--output-dir", outputs, "--overwrite"]);
+    assert_eq!(collision.status.code(), Some(1));
+    assert!(outcome["batch_error"].is_object());
+    assert_eq!(fs::read(output_path).unwrap(), new_output);
+    assert_eq!(fs::read(source).unwrap(), wav);
 
     let replaced = sandbox.ok(&["process", replacement, "--replace-originals", "--backup-dir", backups, "--jobs", "1"]);
     let backup = replaced["results"][0]["report"]["backup_path"].as_str().unwrap();
     assert_eq!(fs::read(backup).unwrap(), wav);
     let comparison = sandbox.ok(&["analyze", replacement, "--jobs", "1"]);
     assert_eq!(comparison["results"][0]["report"]["processed"], true);
-    assert_eq!(comparison["results"][0]["report"]["original_waveform"]["frames"], FRAMES);
-    let restored = sandbox.ok(&["restore", replacement, "--backup", backup]);
+    assert_eq!(comparison["results"][0]["report"]["original_waveform"]["frames"], 132_300);
+    assert_eq!(comparison["results"][0]["report"]["original_waveform"]["sample_rate"], 44_100.0);
+    let copy = sandbox.root.join("shared-copy.wav");
+    fs::copy(replacement, &copy).unwrap();
+    let restored = sandbox.ok(&["restore", replacement, copy.to_str().unwrap(), "--backup", backup, "--backup", backup]);
     assert_eq!(restored["results"][0]["status"], "ok");
+    assert_eq!(restored["results"][0]["report"]["backup_removed"], true);
+    assert!(restored["results"][0]["report"]["backup_removal_error"].is_null());
+    assert_eq!(restored["results"][1]["status"], "ok");
+    assert_eq!(restored["results"][1]["report"]["backup_removed"], true);
+    assert_eq!(fs::read(&copy).unwrap(), wav);
+    assert_eq!(restored["details"]["backup_policy"], "remove_after_verified_restore");
+    assert_eq!(fs::read(replacement).unwrap(), wav);
+    assert!(!Path::new(backup).exists());
+
+    let replaced = sandbox.ok(&["process", replacement, "--replace-originals", "--backup-dir", backups, "--jobs", "1"]);
+    let backup = replaced["results"][0]["report"]["backup_path"].as_str().unwrap();
+    fs::set_permissions(backups, fs::Permissions::from_mode(0o500)).unwrap();
+    let (output, restored) = sandbox.run(&["restore", replacement, "--backup", backup]);
+    fs::set_permissions(backups, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(output.status.success(), "{restored}");
+    assert_eq!(restored["results"][0]["status"], "ok");
+    assert_eq!(restored["results"][0]["report"]["backup_removed"], false);
+    assert!(restored["results"][0]["report"]["backup_removal_error"]["operation"].is_string());
+    assert_eq!(restored["results"][0]["report"]["backup_removal_error"]["path"], backup);
     assert_eq!(fs::read(replacement).unwrap(), wav);
     assert_eq!(fs::read(backup).unwrap(), wav);
 }
@@ -327,6 +424,129 @@ fn restore_marked_flac_without_a_configured_decoder() {
     assert_eq!(inspection.status.code(), Some(1), "full inspection must still require the decoder");
     let restored = sandbox.ok(&["restore", source.to_str().unwrap(), "--backup", backup]);
     assert_eq!(restored["results"][0]["status"], "ok");
+    assert_eq!(restored["results"][0]["report"]["backup_removed"], true);
     assert_eq!(fs::read(&source).unwrap(), original);
-    assert_eq!(fs::read(backup).unwrap(), original);
+    assert!(!Path::new(backup).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE pointing to the public tag bridge"]
+fn cli_reports_ambiguous_wav_override_and_keeps_strict_guards() {
+    use platinum_engine::metadata::{encode_marker_base64, wav_pltn_chunk};
+
+    let sandbox = Sandbox::new();
+    let bridge = std::env::var("PLATINUM_TEST_TAG_BRIDGE").expect("provide public tag bridge path");
+    sandbox.ok(&["config", "set", "libraries.tag_bridge", &json!(bridge).to_string()]);
+    let output = sandbox.root.join("override-output"); fs::create_dir(&output).unwrap();
+    let output = output.to_str().unwrap();
+    let frames = 48_513u32;
+    let data_len = frames * 4;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF"); wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt "); wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&48_000u32.to_le_bytes()); wav.extend_from_slice(&192_000u32.to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes()); wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data"); wav.extend_from_slice(&data_len.to_le_bytes());
+    for frame in 0..frames {
+        let sample = ((frame as f64 * std::f64::consts::TAU * 437.0 / 48_000.0).sin() * 16_000.0) as i16;
+        wav.extend_from_slice(&sample.to_le_bytes()); wav.extend_from_slice(&(sample / 2).to_le_bytes());
+    }
+    let incomplete = encode_marker_base64(br#"{"isProcessed":"#).unwrap();
+    for (name, payload, kind) in [
+        ("empty.wav", b"".as_slice(), "empty_wav_pltn"),
+        ("incomplete.wav", incomplete.as_slice(), "incomplete_json"),
+    ] {
+        let path = sandbox.root.join(name);
+        let mut bytes = wav.clone();
+        bytes.extend_from_slice(&wav_pltn_chunk(Some(payload)).unwrap());
+        let length = u32::try_from(bytes.len() - 8).unwrap();
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let input = path.to_str().unwrap();
+        let (denied, value) = sandbox.run(&["process", input, "--format", "wav", "--output-dir", output, "--jobs", "1"]);
+        assert_eq!(denied.status.code(), Some(1));
+        assert!(value["results"][0]["error"]["message"].as_str().unwrap().contains("--allow-ambiguous-marker"));
+        let strict_backup = sandbox.root.join("strict-backup.wav");
+        fs::write(&strict_backup, b"unrelated").unwrap();
+        for args in [vec!["inspect", input], vec!["restore", input, "--backup", strict_backup.to_str().unwrap()]] {
+            let (strict, value) = sandbox.run(&args);
+            assert_eq!(strict.status.code(), Some(1));
+            assert_eq!(value["results"][0]["error"]["stage"], "decode marker");
+        }
+        let args = ["process", input, "--format", "wav", "--output-dir", output, "--jobs", "1", "--allow-ambiguous-marker"];
+        let result = sandbox.ok(&args);
+        assert_eq!(result["details"]["input_marker_overrides"][0]["kind"], kind);
+        assert_eq!(result["results"][0]["report"]["input_marker_override"], kind);
+        let produced_path = result["results"][0]["report"]["output_path"].as_str().unwrap();
+        let produced = fs::read(produced_path).unwrap();
+        let (collision, result) = sandbox.run(&args);
+        assert_eq!(collision.status.code(), Some(1));
+        assert_eq!(result["details"]["input_marker_overrides"][0]["kind"], kind);
+        assert_eq!(fs::read(produced_path).unwrap(), produced);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    let path = sandbox.root.join("marked.wav");
+    let mut bytes = wav.clone();
+    let marker = encode_marker_base64(br#"{"isProcessed":true}"#).unwrap();
+    bytes.extend_from_slice(&wav_pltn_chunk(Some(&marker)).unwrap());
+    let length = u32::try_from(bytes.len() - 8).unwrap();
+    bytes[4..8].copy_from_slice(&length.to_le_bytes()); fs::write(&path, &bytes).unwrap();
+    let (denied, result) = sandbox.run(&["process", path.to_str().unwrap(), "--format", "wav", "--output-dir", output, "--allow-ambiguous-marker"]);
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(result["results"][0]["error"]["message"].as_str().unwrap().contains("already processed"));
+    assert_eq!(result["details"]["input_marker_overrides"], json!([]));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+
+    let duplicate = sandbox.root.join("duplicate.wav");
+    let unprocessed = encode_marker_base64(br#"{"isProcessed":false}"#).unwrap();
+    let mut bytes = wav.clone();
+    bytes.extend_from_slice(&wav_pltn_chunk(Some(&marker)).unwrap());
+    bytes.extend_from_slice(&wav_pltn_chunk(Some(&unprocessed)).unwrap());
+    let length = u32::try_from(bytes.len() - 8).unwrap();
+    bytes[4..8].copy_from_slice(&length.to_le_bytes()); fs::write(&duplicate, &bytes).unwrap();
+    for allow in [false, true] {
+        let mut args = vec!["process", duplicate.to_str().unwrap(), "--format", "wav", "--output-dir", output];
+        if allow { args.push("--allow-ambiguous-marker"); }
+        let (denied, result) = sandbox.run(&args);
+        assert_eq!(denied.status.code(), Some(1));
+        assert!(result["results"][0]["error"]["message"].as_str().unwrap().contains("multiple WAV PLTN"));
+    }
+    assert_eq!(fs::read(duplicate).unwrap(), bytes);
+
+    for (name, present) in [("absent-trailer.wav", false), ("unprocessed-trailer.wav", true)] {
+        let source = sandbox.root.join(name);
+        let mut bytes = wav.clone();
+        if present {
+            bytes.extend_from_slice(&wav_pltn_chunk(Some(&unprocessed)).unwrap());
+            let length = u32::try_from(bytes.len() - 8).unwrap();
+            bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        }
+        bytes.extend_from_slice(&wav_pltn_chunk(Some(&marker)).unwrap());
+        fs::write(&source, &bytes).unwrap();
+        for allow in [false, true] {
+            let mut args = vec!["process", source.to_str().unwrap(), "--format", "wav", "--output-dir", output];
+            if allow { args.push("--allow-ambiguous-marker"); }
+            let (denied, result) = sandbox.run(&args);
+            assert_eq!(denied.status.code(), Some(1));
+            assert_eq!(result["results"][0]["error"]["stage"], "decode marker");
+            assert_eq!(result["results"][0]["error"]["partial_publication"], false);
+        }
+        assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+
+    let trailing = sandbox.root.join("trailing.wav");
+    let mut bytes = wav;
+    bytes.extend_from_slice(&wav_pltn_chunk(Some(b"")).unwrap());
+    let length = u32::try_from(bytes.len() - 8).unwrap();
+    bytes[4..8].copy_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&wav_pltn_chunk(Some(&marker)).unwrap());
+    fs::write(&trailing, &bytes).unwrap();
+    let (denied, result) = sandbox.run(&["process", trailing.to_str().unwrap(), "--format", "wav", "--output-dir", output, "--allow-ambiguous-marker"]);
+    assert_eq!(denied.status.code(), Some(1));
+    assert_eq!(result["results"][0]["error"]["stage"], "decode marker");
+    assert_eq!(result["results"][0]["error"]["partial_publication"], false);
+    assert_eq!(fs::read(trailing).unwrap(), bytes);
 }

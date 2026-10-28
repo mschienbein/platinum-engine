@@ -232,6 +232,130 @@ fn decode_marker_base64(payload: &[u8]) -> Vec<u8> {
     decoded
 }
 
+/// Decode once and retain an ambiguity classification only for parser errors.
+pub(crate) fn marker_for_wav_processing(payload: &[u8]) -> Result<Marker, (MarkerError, Option<&'static str>)> {
+    let decoded = decode_marker_base64(payload);
+    marker_from_json(&decoded).map_err(|error| {
+        let ambiguous = if matches!(&error, MarkerError::InvalidMarker(_)) {
+            ambiguous_wav_marker(payload, &decoded)
+        } else {
+            None
+        };
+        (error, ambiguous)
+    })
+}
+
+// Classify only WAV marker payloads eligible for the explicit processing
+// override. This does not establish whether the source was processed.
+fn ambiguous_wav_marker(payload: &[u8], decoded: &[u8]) -> Option<&'static str> {
+    if payload.is_empty() { return Some("empty_wav_pltn"); }
+    if !valid_marker_base64(payload) { return None; }
+    let first = decoded.iter().copied().find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+    if first != Some(b'{') { return None; }
+    if json_is_incomplete(decoded) { Some("incomplete_json") } else { None }
+}
+
+// An EOF error alone is insufficient: a short \u escape can already contain a
+// non-hex digit, and an unterminated string can contain invalid UTF-8.
+fn json_is_incomplete(decoded: &[u8]) -> bool {
+    let Some((in_string, hex_remaining)) = json_string_tail(decoded) else { return false };
+    if let Err(error) = std::str::from_utf8(decoded) {
+        if error.error_len().is_some() || !in_string { return false; }
+    }
+    let error = match serde_json::from_slice::<serde_json::Value>(decoded) {
+        Err(error) => error,
+        Ok(_) => return false,
+    };
+    if hex_remaining != 0 {
+        if !error.is_eof() { return false; }
+        let zeros = b"0000";
+        if json_incomplete_with_suffix(decoded, &zeros[..hex_remaining]) { return true; }
+        let prefix_length = 4 - hex_remaining;
+        let prefix = &decoded[decoded.len() - prefix_length..];
+        let low_surrogate = b"dc00";
+        return prefix.eq_ignore_ascii_case(&low_surrogate[..prefix_length])
+            && json_incomplete_with_suffix(decoded, &low_surrogate[prefix_length..]);
+    }
+    if error.is_eof() { return true; }
+    // serde_json reports incomplete exponents and decimal points as invalid
+    // numbers; a digit must turn the exact prefix into an EOF-only error.
+    !in_string && decoded.last().is_some_and(|b| matches!(*b, b'-' | b'+' | b'.' | b'e' | b'E'))
+        && json_incomplete_with_suffix(decoded, b"0")
+}
+
+fn json_incomplete_with_suffix(decoded: &[u8], suffix: &[u8]) -> bool {
+    use std::io::Read;
+    matches!(serde_json::from_reader::<_, serde_json::Value>(decoded.chain(suffix)), Err(error) if error.is_eof())
+}
+
+fn json_string_tail(decoded: &[u8]) -> Option<(bool, usize)> {
+    let mut in_string = false;
+    let mut escape = false;
+    let mut hex_remaining = 0usize;
+    for &byte in decoded {
+        if hex_remaining != 0 {
+            if !byte.is_ascii_hexdigit() { return None; }
+            hex_remaining -= 1;
+        } else if in_string {
+            if escape {
+                escape = false;
+                match byte {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => (),
+                    b'u' => hex_remaining = 4,
+                    _ => return None,
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = false,
+                    b'\\' => escape = true,
+                    0..=31 => return None,
+                    _ => (),
+                }
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        }
+    }
+    Some((in_string, hex_remaining))
+}
+
+// Unlike the native permissive decoder, the override requires standard,
+// canonical Base64. Whitespace and one terminal WAV pad byte are allowed.
+fn valid_marker_base64(payload: &[u8]) -> bool {
+    let mut count = 0usize;
+    let mut padding = 0u8;
+    let mut last = 0u8;
+    for (index, &byte) in payload.iter().enumerate() {
+        let value = match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => {
+                padding += 1;
+                if padding > 2 { return false; }
+                None
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => None,
+            0 if index + 1 == payload.len() => None,
+            _ => return false,
+        };
+        if let Some(value) = value {
+            if padding != 0 { return false; }
+            count += 1;
+            last = value;
+        }
+    }
+    if count == 0 { return false; }
+    match count % 4 {
+        0 => padding == 0,
+        2 => padding == 2 && last & 15 == 0,
+        3 => padding == 1 && last & 3 == 0,
+        _ => false,
+    }
+}
+
 /// RIFF PLTN chunk as written by the PN inserter. Unlike ordinary RIFF chunk
 /// lengths, this writer stores the payload length *rounded up to even* and
 /// includes the zero pad in that declared length. `None` models nil tagData.
@@ -250,6 +374,103 @@ pub fn wav_pltn_chunk(payload: Option<&[u8]>) -> Result<Vec<u8>, MarkerError> {
 
 fn wav_io(operation: &'static str, source: std::io::Error) -> MarkerError {
     MarkerError::Io { operation, source }
+}
+
+/// Bounded WAV marker inventory for processing. The count is capped at two,
+/// meaning "two or more"; possible out-of-RIFF PLTN byte sequences or partial
+/// identifiers are reported without interpreting them as valid RIFF chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WavMarkerLayout {
+    pub(crate) marker_count: u8,
+    pub(crate) trailing_bytes: bool,
+    pub(crate) trailing_marker_risk: bool,
+}
+
+pub(crate) fn wav_marker_layout<R: std::io::Read + std::io::Seek>(input: &mut R) -> Result<WavMarkerLayout, MarkerError> {
+    use std::io::SeekFrom;
+    let file_length = input.seek(SeekFrom::End(0)).map_err(|e| wav_io("measure WAV", e))?;
+    if file_length < 12 { return Err(MarkerError::InvalidWave("missing RIFF/WAVE header")); }
+    input.seek(SeekFrom::Start(0)).map_err(|e| wav_io("seek WAV header", e))?;
+    let mut header = [0u8; 12];
+    input.read_exact(&mut header).map_err(|e| wav_io("read WAV header", e))?;
+    if &header[..4] != b"RIFF" || &header[8..] != b"WAVE" {
+        return Err(MarkerError::InvalidWave("expected little-endian RIFF/WAVE"));
+    }
+    let riff_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+    if riff_length < 4 { return Err(MarkerError::InvalidWave("RIFF size is shorter than the WAVE type")); }
+    let end = riff_length + 8;
+    if end > file_length { return Err(MarkerError::InvalidWave("RIFF extends beyond input")); }
+    let mut position = 12u64;
+    let mut marker_count = 0u8;
+    while position < end {
+        if end - position < 8 { return Err(MarkerError::InvalidWave("truncated WAV chunk header")); }
+        input.seek(SeekFrom::Start(position)).map_err(|e| wav_io("seek WAV chunk", e))?;
+        let mut chunk = [0u8; 8];
+        input.read_exact(&mut chunk).map_err(|e| wav_io("read WAV chunk header", e))?;
+        if !chunk[..4].iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b' ') {
+            return Err(MarkerError::InvalidWave("invalid WAV chunk identifier"));
+        }
+        position += 8;
+        let length = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        let padded = length + (length & 1);
+        if padded > end - position { return Err(MarkerError::InvalidWave("truncated WAV chunk")); }
+        if &chunk[..4] == b"PLTN" && marker_count < 2 { marker_count += 1; }
+        position += padded;
+    }
+    let trailing_bytes = end < file_length;
+    let trailing_marker_risk = if trailing_bytes { wav_trailing_marker_risk(input, end, file_length)? } else { false };
+    Ok(WavMarkerLayout { marker_count, trailing_bytes, trailing_marker_risk })
+}
+
+// Scan the trailer and the three preceding bytes so a FourCC split at the
+// RIFF boundary cannot hide. Only treat a partial EOF identifier as a marker
+// when it starts at a plausible trailer chunk boundary.
+fn wav_trailing_marker_risk<R: std::io::Read + std::io::Seek>(
+    input: &mut R, riff_end: u64, file_length: u64,
+) -> Result<bool, MarkerError> {
+    let start = riff_end.saturating_sub(3);
+    input.seek(std::io::SeekFrom::Start(start)).map_err(|e| wav_io("seek WAV trailer", e))?;
+    let mut remaining = file_length - start;
+    let mut matched = 0usize;
+    let mut buffer = [0u8; 8192];
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..count]).map_err(|e| wav_io("read WAV trailer", e))?;
+        for &byte in &buffer[..count] {
+            if byte == b"PLTN"[matched] {
+                matched += 1;
+            } else {
+                matched = if byte == b'P' { 1 } else { 0 };
+            }
+            if matched == 4 { return Ok(true); }
+        }
+        remaining -= count as u64;
+    }
+    if matched == 0 { return Ok(false); }
+    let candidate = file_length - matched as u64;
+    if candidate < riff_end { return Ok(false); }
+    wav_trailer_chunk_boundary(input, riff_end, candidate)
+}
+
+fn wav_trailer_chunk_boundary<R: std::io::Read + std::io::Seek>(
+    input: &mut R, riff_end: u64, candidate: u64,
+) -> Result<bool, MarkerError> {
+    let mut position = riff_end;
+    while position < candidate {
+        if candidate - position < 8 { return Ok(false); }
+        input.seek(std::io::SeekFrom::Start(position)).map_err(|e| wav_io("seek WAV trailer chunk", e))?;
+        let mut header = [0u8; 8];
+        input.read_exact(&mut header).map_err(|e| wav_io("read WAV trailer chunk", e))?;
+        if !header[..4].iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b' ') {
+            return Ok(false);
+        }
+        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        let padded = length + (length & 1);
+        position += 8;
+        if padded > candidate - position { return Ok(false); }
+        position += padded;
+    }
+    Ok(position == candidate)
 }
 
 // The parser stops on invalid/truncated child headers and skips the remaining
@@ -645,4 +866,110 @@ fn with_foundation_json<T>(marker: &Marker, use_bytes: impl FnOnce(&[u8]) -> Res
         unsafe { slice::from_raw_parts(ptr, len) }
     };
     use_bytes(bytes).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(payload: &[u8]) -> Option<&'static str> {
+        ambiguous_wav_marker(payload, &decode_marker_base64(payload))
+    }
+
+    #[test]
+    fn process_override_recognizes_only_empty_or_incomplete_object_payloads() {
+        assert_eq!(classify(b""), Some("empty_wav_pltn"));
+        for json in [
+            br#"{"isProcessed":"#.as_slice(),
+            br#"{"isProcessed":true"#,
+            br#"{"items":[1,2"#,
+            br#"{"osType":"Mac"#,
+            br#"{"value":1e-"#,
+            br#"{"value":1."#,
+            br#"{"text":"\uD800\uD"#,
+            b"{\"text\":\"\xc3",
+        ] {
+            let mut payload = encode_marker_base64(json).unwrap();
+            assert_eq!(classify(&payload), Some("incomplete_json"));
+            if payload.len() & 1 != 0 { payload.push(0); }
+            assert_eq!(classify(&payload), Some("incomplete_json"));
+        }
+        for json in [
+            br#"{"isProcessed":true}"#.as_slice(),
+            br#"{"isProcessed":false}"#,
+            br#"{"isProcessed":true,}"#,
+            br#"{"isProcessed":truX}"#,
+            br#"[{"isProcessed":true"#,
+            br#"{"x":1} trailing"#,
+            br#"{"bad":"\udc00","next":"#,
+            b"{\"bad\":\"\xff\",\"next\":",
+            br#"{"bad":"\uZ"#,
+            br#"{"bad":"\uDC0"#,
+            b"{\"bad\":\"\xff",
+        ] {
+            assert_eq!(classify(&encode_marker_base64(json).unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn process_override_rejects_invalid_base64_even_if_native_decoder_skips_it() {
+        let valid = encode_marker_base64(br#"{"isProcessed":"#).unwrap();
+        let mut invalid_character = valid.clone();
+        invalid_character.push(b'!');
+        let mut embedded_nul = valid.clone();
+        embedded_nul.insert(1, 0);
+        for payload in [
+            b"!!!!".as_slice(), b"====", b"\0", b"ex==",
+            invalid_character.as_slice(), embedded_nul.as_slice(),
+        ] {
+            assert_eq!(classify(payload), None);
+        }
+        let padded = encode_marker_base64(br#"{"x":"#).unwrap();
+        let mut extra_padding = padded.clone();
+        extra_padding.extend_from_slice(b"==");
+        assert_eq!(classify(&extra_padding), None);
+        let mut trailing_sextet = padded;
+        trailing_sextet.push(b"A"[0]);
+        assert_eq!(classify(&trailing_sextet), None);
+    }
+
+    #[test]
+    fn wav_processing_layout_counts_markers_and_reports_trailing_bytes() {
+        fn wave(chunks: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = b"RIFF\0\0\0\0WAVE".to_vec();
+            for chunk in chunks { bytes.extend_from_slice(chunk); }
+            let length = (bytes.len() - 8) as u32;
+            bytes[4..8].copy_from_slice(&length.to_le_bytes());
+            bytes
+        }
+        let empty = wav_pltn_chunk(Some(b"")).unwrap();
+        let processed = wav_pltn_chunk(Some(&encode_marker_base64(br#"{"isProcessed":true}"#).unwrap())).unwrap();
+        let unprocessed = wav_pltn_chunk(Some(&encode_marker_base64(br#"{"isProcessed":false}"#).unwrap())).unwrap();
+        let layout = |bytes| wav_marker_layout(&mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(layout(wave(&[])), WavMarkerLayout { marker_count: 0, trailing_bytes: false, trailing_marker_risk: false });
+        assert_eq!(layout(wave(&[empty.clone()])), WavMarkerLayout { marker_count: 1, trailing_bytes: false, trailing_marker_risk: false });
+        assert_eq!(layout(wave(&[processed.clone(), unprocessed.clone()])), WavMarkerLayout { marker_count: 2, trailing_bytes: false, trailing_marker_risk: false });
+        let mut trailing = wave(&[empty.clone()]);
+        trailing.extend_from_slice(&processed);
+        assert_eq!(layout(trailing), WavMarkerLayout { marker_count: 1, trailing_bytes: true, trailing_marker_risk: true });
+        let mut benign = wave(&[]);
+        benign.extend_from_slice(b"helloP");
+        assert_eq!(layout(benign), WavMarkerLayout { marker_count: 0, trailing_bytes: true, trailing_marker_risk: false });
+        let mut partial_at_boundary = wave(&[]);
+        partial_at_boundary.extend_from_slice(b"PLT");
+        assert!(layout(partial_at_boundary).trailing_marker_risk);
+        let mut partial_after_chunk = wave(&[]);
+        partial_after_chunk.extend_from_slice(b"JUNK\x04\0\0\0dataPL");
+        assert!(layout(partial_after_chunk).trailing_marker_risk);
+        let mut split_buffer = wave(&[]);
+        split_buffer.extend(std::iter::repeat_n(b'x', 8188));
+        split_buffer.extend_from_slice(b"PLTN");
+        assert!(layout(split_buffer).trailing_marker_risk);
+        let mut split_riff = wave(&[b"JUNK\x04\0\0\0xPLT".to_vec()]);
+        split_riff.extend_from_slice(b"N");
+        assert!(layout(split_riff).trailing_marker_risk);
+        let mut truncated = wave(&[empty]);
+        truncated.pop();
+        assert!(wav_marker_layout(&mut std::io::Cursor::new(truncated)).is_err());
+    }
 }

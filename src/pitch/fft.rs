@@ -52,24 +52,54 @@ unsafe extern "C" {
     fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
 }
 
-// vDSP selects numerically distinct kernels based on scratch alignment on the
-// reference host. Pin the aligned path observed in the captured native FFTs
-// instead of letting unrelated heap allocations change sample bits.
+// Changing the original splitter FFT's scratch alignment changed sample bits
+// in controlled reference runs. Pin the aligned-0 path seen in some captures
+// instead of letting unrelated heap allocations choose the scratch alignment.
 #[repr(C, align(64))]
 struct ScratchBlock([f32; 16]);
 
 struct FftScratch {
     storage: Box<[MaybeUninit<ScratchBlock>]>,
     len: usize,
+    #[cfg(test)]
+    offset: usize,
 }
 
 impl FftScratch {
     fn new(len: usize) -> Self {
-        Self { storage: Box::<[ScratchBlock]>::new_uninit_slice(len.div_ceil(16)), len }
+        Self {
+            storage: Box::<[ScratchBlock]>::new_uninit_slice(len.div_ceil(16)),
+            len,
+            #[cfg(test)]
+            offset: 0,
+        }
+    }
+
+    // The alternate offset is a controlled experiment, not an inferred GUI
+    // allocation policy. Both planes must have room for all logical samples.
+    #[cfg(test)]
+    fn new_offset48(len: usize) -> Self {
+        let offset = 12;
+        Self {
+            storage: Box::<[ScratchBlock]>::new_uninit_slice((len + offset).div_ceil(16)),
+            len,
+            offset,
+        }
     }
 
     fn as_mut_ptr(&mut self) -> *mut f32 {
-        self.storage.as_mut_ptr().cast()
+        let ptr = self.storage.as_mut_ptr().cast::<f32>();
+        // The test-only allocation reserves `offset` additional floats.
+        #[cfg(test)]
+        let ptr = unsafe { ptr.add(self.offset) };
+        ptr
+    }
+
+    fn as_ptr(&self) -> *const f32 {
+        let ptr = self.storage.as_ptr().cast::<f32>();
+        #[cfg(test)]
+        let ptr = unsafe { ptr.add(self.offset) };
+        ptr
     }
 
     fn copy_from_slice(&mut self, source: &[f32]) {
@@ -83,8 +113,7 @@ impl FftScratch {
     unsafe fn copy_into(&self, destination: &mut [f32]) {
         assert_eq!(destination.len(), self.len);
         unsafe {
-            std::ptr::copy_nonoverlapping(self.storage.as_ptr().cast::<f32>(),
-                                         destination.as_mut_ptr(), self.len);
+            std::ptr::copy_nonoverlapping(self.as_ptr(), destination.as_mut_ptr(), self.len);
         }
     }
 }
@@ -118,6 +147,16 @@ impl RealFft {
             imaginary: FftScratch::new(len / 2),
             time: FftScratch::new(len),
         })
+    }
+
+    // Only the splitter's real/imaginary work planes were changed in the
+    // native intervention. Keep the time plane and other FFTs untouched.
+    #[cfg(test)]
+    pub(super) fn use_offset48_for_test(&mut self) {
+        self.real = FftScratch::new_offset48(self.len / 2);
+        self.imaginary = FftScratch::new_offset48(self.len / 2);
+        assert_eq!(self.real.as_ptr() as usize % 64, 48);
+        assert_eq!(self.imaginary.as_ptr() as usize % 64, 48);
     }
 
     /// Forward FFT, in-place, with the selected packed-real layout and 0.5 scale.
@@ -310,3 +349,4 @@ pub(crate) fn exp_in_place(data: &mut [f32]) {
     let count = i32::try_from(data.len()).expect("vForce input exceeds i32");
     unsafe { vvexpf(data.as_mut_ptr(), data.as_ptr(), &count) };
 }
+

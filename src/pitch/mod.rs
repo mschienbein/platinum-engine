@@ -1,7 +1,7 @@
 //! Recovered PitchShiftUnit primitives and adapter scheduling.
 //!
-//! The selected one-group AU/Pro/Eff pipeline is a static reconstruction,
-//! not a reference-validated or general Elastique implementation. The host
+//! The selected one-group AU/Pro/Eff pipeline has bounded synthetic-component
+//! comparisons, not general Elastique or GUI file-parity validation. The host
 //! supplies source exhaustion/zero padding and owns the surrounding FP mode.
 
 pub mod fft;
@@ -1385,10 +1385,11 @@ impl From<SchedulingError> for PitchError {
 }
 
 /// Selected Platinum Notes AU/Pro/Eff pipeline for the detector-constrained
-/// tuning range and the two visible modes. This static reconstruction has not
-/// yet been compared end-to-end against the reference component; it is not a
-/// byte-parity claim. It does not invent an EOS/flush protocol: the host's
-/// source callback supplies any zero-filled tail and decides when to stop.
+/// tuning range and the two visible modes. Some synthetic component captures
+/// match, but the original GUI's splitter scratch alignment is not established,
+/// and the pinned aligned-0 profile is not a universal byte-parity claim.
+/// The host supplies any zero-filled source tail and decides when to stop;
+/// no EOS/flush protocol is assumed.
 pub struct PitchProcessor {
     scheduler: AuScheduler<ProDirect<ProCore>>,
     mode: PitchMode,
@@ -1558,7 +1559,7 @@ mod tests {
                 ("pro_high_l_bits", &pro.high[0][..hop]),
                 ("pro_high_r_bits", &pro.high[1][..hop]),
             ] {
-                let native = expected[key].as_array().expect("aligned native high-buffer bits");
+                let native = expected[key].as_array().expect("controlled native high-buffer bits");
                 assert_eq!(native.len(), samples.len(), "{key} native hop length");
                 let mut count = 0usize;
                 let mut first = 0usize;
@@ -1589,8 +1590,8 @@ mod tests {
     }
 
     /// Compare state after actual original and Rust 512-frame adapter calls.
-    /// The native oracle uses generated signal only and an identity-pinned
-    /// process-local component; no app or user data is accessed.
+    /// Each run must identify one controlled native splitter scratch profile;
+    /// this does not infer the original GUI's allocator or claim file parity.
     #[test]
     #[ignore = "requires PITCH_SCHEDULER_ORACLE from state-oracle.cpp"]
     fn scheduler_checkpoints_match_original_component() {
@@ -1603,11 +1604,17 @@ mod tests {
         let entries: Vec<serde_json::Value> = source.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         let config = &entries[0];
         assert_eq!(config["kind"], "config");
-        assert_eq!(config["scratch_mode"], "aligned0",
-            "this bit-exact checkpoint targets the explicitly intervened aligned0 native profile");
+        let scratch_offset = match config["scratch_mode"].as_str() {
+            Some("aligned0") => 0,
+            Some("offset48") => 48,
+            _ => panic!("checkpoint must identify a controlled splitter scratch intervention"),
+        };
         for entry in entries.iter().skip(1) {
-            assert_eq!(entry["split_fft_real_mod64"], 0);
-            assert_eq!(entry["split_fft_imag_mod64"], 0);
+            assert_eq!(entry["split_fft_real_mod64"], scratch_offset);
+            assert_eq!(entry["split_fft_imag_mod64"], scratch_offset);
+            for key in ["split_fft_time_mod64", "voc_fft_real_mod64", "voc_fft_imag_mod64", "voc_fft_time_mod64"] {
+                assert_eq!(entry[key], 0, "unexpected non-intervened scratch alignment: {key}");
+            }
         }
         let mode = match config["mode"].as_u64().unwrap() {
             0 => PitchMode::PreserveTempo,
@@ -1627,6 +1634,9 @@ mod tests {
             })
         });
         let mut processor = PitchProcessor::new(48_000.0, 2, 512, mode, ratio).unwrap();
+        if scratch_offset == 48 {
+            processor.scheduler.adapter.core.core.splitter.use_offset48_for_test();
+        }
         let adapter = &mut processor.scheduler.adapter;
         let mut mismatches = 0usize;
         compare_checkpoint(adapter, &entries[1], -1, &mut mismatches);
@@ -1737,6 +1747,10 @@ mod tests {
             assert_eq!(a["split_fft_imag_mod64"], 0);
             assert_eq!(b["split_fft_real_mod64"], 48);
             assert_eq!(b["split_fft_imag_mod64"], 48);
+            for key in ["split_fft_time_mod64", "voc_fft_real_mod64", "voc_fft_imag_mod64", "voc_fft_time_mod64"] {
+                assert_eq!(a[key], 0, "aligned control {key}");
+                assert_eq!(b[key], 0, "offset control {key}");
+            }
             for key in ["fpcr_before", "fpcr_after", "demand", "consumed", "pulled"] {
                 assert_eq!(a[key], b[key], "controlled checkpoint {key}");
             }

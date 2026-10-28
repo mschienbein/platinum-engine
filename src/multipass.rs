@@ -365,6 +365,18 @@ impl MultipassBandSplitter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn first_low_section_state(&self) -> [u64; 9] {
+        let section = &self.crossovers[0].low[0];
+        [
+            section.integrator_1[0].to_bits(), section.integrator_1[1].to_bits(),
+            section.integrator_2[0].to_bits(), section.integrator_2[1].to_bits(),
+            section.coefficients[0].to_bits(), section.coefficients[1].to_bits(),
+            section.coefficients[2].to_bits(), section.coefficients[3].to_bits(),
+            section.coefficients[4].to_bits(),
+        ]
+    }
+
     pub fn process(
         &mut self,
         input: [&[f32]; 2],

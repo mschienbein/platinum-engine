@@ -711,7 +711,7 @@ fn cleanup_failed_stage(path: &Path, cause: SettingsError) -> SettingsError {
         Err(source) => SettingsError::Cleanup { operation: "remove temporary file", path: path.to_owned(), cause: Box::new(cause), source },
     }
 }
-fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, SettingsError> {
+pub(crate) fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, SettingsError> {
     for _ in 0..16 {
         let path = directory.join(format!(".platinum-{kind}-{}.tmp", uuid()?));
         let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path);
@@ -729,4 +729,4 @@ fn write_stage(directory: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, Se
     }
     Err(SettingsError::UuidUnavailable)
 }
-fn sync_directory(path: &Path) -> io::Result<()> { File::open(path)?.sync_all() }
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> { File::open(path)?.sync_all() }

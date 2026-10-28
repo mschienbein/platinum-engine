@@ -172,3 +172,14 @@ For real files, use a separate output folder first and retain an independent bac
 ## Licenses and distribution
 
 Project-owned contributions are licensed under the [MIT license](../LICENSE) to the extent their contributors can grant those rights. This does not change third-party terms or grant rights to the reference application. Review the upstream source packages and their license files before distribution: TagLib includes `COPYING.LGPL` and `COPYING.MPL`, FLAC includes `COPYING.Xiph`, and LAME includes `COPYING`; Rust dependencies have their own terms. In particular, the static TagLib linkage and the LAME export-list modification are facts to account for when evaluating distribution obligations. No reference-app binaries or audio are needed for this build.
+
+The pinned upstream license files identify TagLib's LGPL 2.1 and MPL alternatives,
+the Xiph/BSD-style libFLAC grant, and LAME's Library GPL version 2 text. The
+macOS-arm64 Cargo metadata inventory has 37 packages with declared license
+expressions, including MIT/Apache alternatives, ISC, Zlib and Unicode terms.
+An unfiltered offline inventory could not inspect an uncached Windows-only
+dependency; this is a host-target audit, not a cross-platform license clearance.
+The curated source snapshot does not bundle those native libraries or a compiled
+release executable. Anyone distributing a compiled bridge, codec or CLI must
+also meet the applicable dependency notices and other terms; the project MIT
+file does not replace them.

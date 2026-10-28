@@ -377,6 +377,7 @@ pub struct MultipassGraph {
     preset: ShippedPreset,
     crossover_scale: CrossoverFrequencyScale,
     crossover_hz: [f32; 4],
+    crossover_ramps: [AutomationRamp; 4],
     lanes: [Lane; 7],
     splitter: MultipassBandSplitter,
     routers: [BandRouteMixer; 5],
@@ -459,6 +460,7 @@ impl MultipassGraph {
             let editor_physical = crossover_scale.from_normalized(crossover_scale.to_normalized(raw));
             crossover_scale.from_normalized(crossover_scale.to_normalized(editor_physical))
         });
+        let crossover_ramps = crossover_hz.map(|frequency| AutomationRamp::new(crossover_scale.to_normalized(frequency)));
         // Initial editor source values precede host events and are not child
         // DSP fields; apply the same source descriptor clamp as before.
         let automation = std::array::from_fn(|slot| {
@@ -466,7 +468,7 @@ impl MultipassGraph {
         });
         Ok(Self {
             rate: sample_rate, preset, crossover_scale,
-            crossover_hz, lanes, splitter: MultipassBandSplitter::new(sample_rate),
+            crossover_hz, crossover_ramps, lanes, splitter: MultipassBandSplitter::new(sample_rate),
             routers: std::array::from_fn(|_| BandRouteMixer::new()), dry_allpass: RootDryAllpass::new(sample_rate),
             output_gain: RootStereoGain::new(), output_mix: LaneDryWetMixer::new(),
             root_dry: [DryDelay::new(), DryDelay::new()], dry_reference: [DryDelay::new(), DryDelay::new()],
@@ -496,7 +498,8 @@ impl MultipassGraph {
             match write.id {
                 0..=3 => {
                     let raw = self.crossover_scale.from_normalized(write.value);
-                    self.crossover_hz[write.id as usize] = self.crossover_scale.from_normalized(self.crossover_scale.to_normalized(raw));
+                    let target = self.crossover_scale.to_normalized(raw);
+                    self.crossover_ramps[write.id as usize].schedule(target, segment_remaining);
                 }
                 34 | 40 => {
                     let index = if write.id == 34 { 5 } else { 6 };
@@ -560,6 +563,13 @@ impl MultipassGraph {
             return Err(GraphError::InvalidBlock);
         }
         self.deliver_writes(context.segment_remaining);
+        // The crossover controls ramp over the host event segment before the
+        // splitter and dry allpass receive each 64-frame chunk's frequencies.
+        for index in 0..self.crossover_ramps.len() {
+            if let Some(value) = self.crossover_ramps[index].advance(n) {
+                self.crossover_hz[index] = self.crossover_scale.from_normalized(value);
+            }
+        }
         self.advance_automation(n);
         let published_latency = self.latency_frames();
         let dry_latency = published_latency.min(10_112);
@@ -704,6 +714,70 @@ mod graph_intermediate_reference {
 
     fn word(value: &Value) -> u32 {
         u32::from_str_radix(value.as_str().expect("hex word"), 16).expect("valid hex word")
+    }
+
+    #[test]
+    fn crossover_trajectory_and_splitter_state_match_native_host_grouping() {
+        // Native ID-0 event, 48 kHz, with an initially silent splitter.
+        // Captured separately for one 512-frame host call and eight 64-frame
+        // calls; each row is the frequency and first low-section coefficients
+        // after its 64-frame chunk.
+        let grouped = [
+            (0x427e_308e, 0x3f71_093a_c88d_5500, 0x3fe6_a09e_6cfe_705d, 0x3fef_ffff_ffff_d962),
+            (0x4286_9bec, 0x3f72_0b15_071f_30c0, 0x3fe6_a09e_6cfe_641d, 0x3fef_ffff_ffff_cea2),
+            (0x428e_9150, 0x3f73_1c2e_a5ed_d380, 0x3fe6_a09e_6cfe_661d, 0x3fef_ffff_ffff_b6a2),
+            (0x4296_ff25, 0x3f74_3d6d_6f1a_5540, 0x3fe6_a09e_6cfe_5f1d, 0x3fef_ffff_ffff_cbe2),
+            (0x429f_ec93, 0x3f75_6fc6_fff7_0640, 0x3fe6_a09e_6cfe_849d, 0x3ff0_0000_0000_0cdc),
+            (0x42a9_6120, 0x3f76_b43d_91d8_c880, 0x3fe6_a09e_6cfe_879d, 0x3ff0_0000_0000_0a9c),
+            (0x42b3_64c4, 0x3f78_0be2_a8d8_f540, 0x3fe6_a09e_6cfe_745d, 0x3fef_ffff_ffff_f054),
+            (0x42be_0000, 0x3f79_77da_29a3_2380, 0x3fe6_a09e_6cfe_755d, 0x3fef_ffff_ffff_ed14),
+        ];
+        let separate = [(0x42be_0000, 0x3f79_77da_29a3_2398, 0x3fe6_a09e_6cfe_754e, 0x3fef_ffff_ffff_ecf8); 8];
+        with_flush_to_zero(|| {
+            for (single_host_call, expected) in [(true, grouped), (false, separate)] {
+                let mut graph = MultipassGraph::new(48_000.0, ShippedPreset::Dynamics).unwrap();
+                graph.set_parameter(0, f32::from_bits(0x3db1_a06a)).unwrap();
+                for (index, (frequency, g, k, low)) in expected.into_iter().enumerate() {
+                    let segment_remaining = if single_host_call { 512 - 64 * index } else { 64 };
+                    let mut context = GraphContext { silent: false, bypass: false, segment_remaining };
+                    graph.process_chunk(&mut context, &mut [0.0; 64], &mut [0.0; 64]).unwrap();
+                    assert_eq!(graph.crossover_hz[0].to_bits(), frequency, "grouped={single_host_call} chunk={index}");
+                    assert_eq!(
+                        graph.splitter.first_low_section_state(),
+                        [0, 0, 0, 0, g, k, 0, 0, low],
+                        "grouped={single_host_call} chunk={index}",
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn crossover_retarget_after_reset_uses_current_value_and_remaining_segment() {
+        // This is a candidate lifecycle invariant, not an observed native
+        // retarget or reset trace.
+        with_flush_to_zero(|| {
+            let mut graph = MultipassGraph::new(48_000.0, ShippedPreset::Dynamics).unwrap();
+            graph.set_parameter(0, f32::from_bits(0x3db1_a06a)).unwrap();
+            let mut context = GraphContext { silent: false, bypass: false, segment_remaining: 512 };
+            graph.process_chunk(&mut context, &mut [0.0; 64], &mut [0.0; 64]).unwrap();
+            assert_eq!(graph.crossover_ramps[0].current.to_bits(), 0x3c31_a068);
+
+            graph.set_parameter(0, 0.0).unwrap();
+            graph.reset();
+            context.segment_remaining = 448;
+            graph.process_chunk(&mut context, &mut [0.0; 64], &mut [0.0; 64]).unwrap();
+            assert_eq!(graph.crossover_ramps[0].current.to_bits(), 0x3c18_4059);
+            assert_eq!(graph.crossover_ramps[0].remaining, 384);
+
+            for remaining in [384, 320, 256, 192, 128, 64] {
+                context.segment_remaining = remaining;
+                graph.process_chunk(&mut context, &mut [0.0; 64], &mut [0.0; 64]).unwrap();
+            }
+            assert_eq!(graph.crossover_ramps[0].current.to_bits(), 0);
+            assert_eq!(graph.crossover_ramps[0].remaining, 0);
+            assert_eq!(graph.crossover_hz[0].to_bits(), graph.crossover_scale.from_normalized(0.0).to_bits());
+        });
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use platinum_engine::engine::{self, EngineError};
 use platinum_engine::file_workflow::{self, AudioFormat, Cancellation, DiscoveredFile, OutputMode, RestoreStatus, SourceType, WorkflowError};
-use platinum_engine::settings::{LoadedSettings, SelectedTemplate, Settings, SettingsStore, TemplateRef};
+use platinum_engine::settings::{LoadedSettings, SelectedTemplate, Settings, SettingsError, SettingsStore, TemplateRef};
+use platinum_engine::statistics::{StatisticsError, StatisticsStore};
 use platinum_engine::templates::{Band, Template};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -40,6 +41,8 @@ enum Command {
     Templates { #[command(subcommand)] command: TemplateCommand },
     /// Read or change persistent Engine preferences.
     Config { #[command(subcommand)] command: ConfigCommand },
+    /// Show or explicitly reset cumulative Engine-owned processing gauges.
+    Statistics { #[command(subcommand)] command: StatisticsCommand },
     /// Print the Engine version.
     Version,
     /// Print the compatibility target and implementation provenance.
@@ -103,6 +106,9 @@ struct ProcessArgs {
     /// Explicitly authorize replacement, with a verified retained backup.
     #[arg(long, requires = "backup_dir", conflicts_with_all = ["output_dir", "same_folder", "mirror", "no_mirror"])]
     replace_originals: bool,
+    /// Atomically replace an existing output file; never overwrite an input.
+    #[arg(long, conflicts_with = "replace_originals")]
+    overwrite: bool,
     /// Existing directory for replacement backups; required on every replacement run.
     #[arg(long, value_name = "DIRECTORY", requires = "replace_originals")]
     backup_dir: Option<PathBuf>,
@@ -115,6 +121,14 @@ struct ProcessArgs {
     /// Override the configured MP3 encoding mode for this invocation.
     #[arg(long, value_enum, value_name = "MODE")]
     mp3_mode: Option<Mp3Arg>,
+    /// Allow a WAV PLTN with an empty payload or incomplete JSON for processing.
+    /// This may reprocess an already processed file; inspection and restore stay strict.
+    #[arg(long)]
+    allow_ambiguous_marker: bool,
+    /// Diagnostic only: write this second (since 1904) to the MP4 header time
+    /// fields of AAC/ALAC outputs instead of the AudioToolbox wall clock.
+    #[arg(long, hide = true, value_name = "SECONDS_SINCE_1904")]
+    controlled_mp4_time_1904: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -138,7 +152,7 @@ struct RestoreArgs {
     /// Processed files, in the same order as the --backup options.
     #[arg(required = true, value_name = "FILE")]
     files: Vec<PathBuf>,
-    /// Absolute recorded backup for the corresponding FILE; repeat for each file.
+    /// Absolute recorded backup for the corresponding FILE; consumed after verified restore.
     #[arg(long, required = true, action = clap::ArgAction::Append, value_name = "PATH")]
     backup: Vec<PathBuf>,
 }
@@ -197,12 +211,24 @@ enum ConfigCommand {
     Reset { field: Option<String> },
 }
 
+#[derive(Debug, Subcommand)]
+enum StatisticsCommand {
+    /// Show totals since the first recorded Engine report or the last reset.
+    Show,
+    /// Reset only the Engine gauges; requires explicit confirmation.
+    Reset { #[arg(long, required = true)] confirm: bool },
+}
+
 #[derive(Debug)]
-struct AppError { kind: &'static str, message: String }
+struct AppError { kind: &'static str, message: String, publication: Option<&'static str>, cleanup: Option<Value> }
 impl AppError {
-    fn usage(message: impl Into<String>) -> Self { Self { kind: "usage", message: message.into() } }
-    fn settings(error: impl std::fmt::Display) -> Self { Self { kind: "settings", message: error.to_string() } }
-    fn io(message: impl Into<String>) -> Self { Self { kind: "io", message: message.into() } }
+    fn usage(message: impl Into<String>) -> Self { Self { kind: "usage", message: message.into(), publication: None, cleanup: None } }
+    fn settings(error: impl std::fmt::Display) -> Self { Self { kind: "settings", message: error.to_string(), publication: None, cleanup: None } }
+    fn io(message: impl Into<String>) -> Self { Self { kind: "io", message: message.into(), publication: None, cleanup: None } }
+    fn statistics(error: StatisticsError) -> Self {
+        Self { kind: if error.is_cancelled() { "cancelled" } else { "statistics" }, cleanup: statistics_cleanup(&error),
+            message: error.to_string(), publication: Some(error.publication_status()) }
+    }
 }
 
 struct Outcome { value: Value, exit: i32 }
@@ -326,6 +352,19 @@ fn config(command: ConfigCommand, store: &SettingsStore, loaded: &mut LoadedSett
     Ok(success("config", data))
 }
 
+fn statistics(command: StatisticsCommand, store: &StatisticsStore, cancel: &Cancellation) -> Result<Outcome, AppError> {
+    let state = match command {
+        StatisticsCommand::Show => store.show(cancel),
+        StatisticsCommand::Reset { confirm: true } => store.reset(cancel),
+        StatisticsCommand::Reset { confirm: false } => return Err(AppError::usage("statistics reset requires --confirm")),
+    }.map_err(AppError::statistics)?;
+    let mut data = as_value(state)?;
+    data["baseline"] = json!("Engine-owned totals start at zero when statistics are absent or reset; no pre-upgrade or Platinum Notes totals are imported.");
+    data["first_recorded_time"] = json!("Unix milliseconds from the recording host clock at the first recorded report after the baseline; null until then.");
+    data["publication"] = json!("Audio and statistics are separate, not crash-atomic publications; crashes can leave a published output uncounted.");
+    Ok(success("statistics", data))
+}
+
 // JSON strings cannot represent arbitrary Unix filenames. Preserve such paths
 // as their exact bytes alongside a display rendering instead of panicking.
 fn path_value(path: &Path) -> Value {
@@ -349,22 +388,77 @@ struct ItemResult {
     report: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistics: Option<Value>,
 }
 impl ItemResult {
-    fn ok(input: &Path, report: Value) -> Self { Self { input: path_value(input), status: "ok", report: Some(report), error: None } }
-    fn failed(input: &Path, error: Value) -> Self { Self { input: path_value(input), status: "failed", report: None, error: Some(error) } }
+    fn ok(input: &Path, report: Value) -> Self { Self { input: path_value(input), status: "ok", report: Some(report), error: None, statistics: None } }
+    fn failed(input: &Path, error: Value) -> Self { Self { input: path_value(input), status: "failed", report: None, error: Some(error), statistics: None } }
     fn not_started(input: &Path, message: &str) -> Self {
-        Self { input: path_value(input), status: "not_started", report: None, error: Some(json!({"message": message})) }
+        Self { input: path_value(input), status: "not_started", report: None, error: Some(json!({"message": message})), statistics: None }
     }
     fn engine_error(input: &Path, error: EngineError) -> Self {
         Self { input: path_value(input), status: if error.cancelled { "cancelled" } else { "failed" }, report: None,
             error: Some(json!({"stage": error.stage, "message": error.message, "cancelled": error.cancelled,
-                "retained_backup": error.retained_backup.as_deref().map(path_value), "partial_publication": error.partial_publication})) }
+                "retained_backup": error.retained_backup.as_deref().map(path_value),
+                "recovery_path": error.recovery_path.as_deref().map(path_value), "partial_publication": error.partial_publication})), statistics: None }
     }
     fn workflow_error(input: &Path, error: WorkflowError) -> Self {
         let cancelled = error.is_cancelled();
         Self { input: path_value(input), status: if cancelled { "cancelled" } else { "failed" },
-            report: None, error: Some(workflow_error(error)) }
+            report: None, error: Some(workflow_error(error)), statistics: None }
+    }
+}
+
+fn statistics_cleanup(error: &StatisticsError) -> Option<Value> {
+    match error {
+        StatisticsError::Cleanup { path, cause, source } => Some(json!({
+            "stage_path":path_value(path), "cause_kind":if cause.is_cancelled() { "cancelled" } else { "error" },
+            "cause":cause.to_string(), "message":source.to_string()
+        })),
+        StatisticsError::Storage(SettingsError::Cleanup { path, cause, source, .. }) => Some(json!({
+            "stage_path":path_value(path), "cause_kind":"error",
+            "cause":cause.to_string(), "message":source.to_string()
+        })),
+        _ => None,
+    }
+}
+
+fn statistics_accounting(result: Result<(), StatisticsError>) -> Value {
+    match result {
+        Ok(()) => json!({"status":"recorded"}),
+        Err(error) if error.is_cancelled() => json!({"status":"not_recorded", "reason":"cancelled",
+            "message":error.to_string(), "publication":error.publication_status(), "audio_published":true}),
+        Err(error) => {
+            let mut value = json!({"status":"failed", "message":error.to_string(),
+                "publication":error.publication_status(), "audio_published":true});
+            if let Some(cleanup) = statistics_cleanup(&error) { value["cleanup"] = cleanup; }
+            value
+        }
+    }
+}
+
+// Audio has already been published when a ProcessReport is returned. Account
+// before report serialization and never discard that result on a store error.
+fn processed_report(input: &Path, report: engine::ProcessReport, store: &StatisticsStore, cancel: &Cancellation) -> ItemResult {
+    let accounting = statistics_accounting(store.record(&report, cancel));
+    match serde_json::to_value(&report) {
+        Ok(value) => ItemResult { input: path_value(input), status: "ok", report: Some(value), error: None, statistics: Some(accounting) },
+        Err(error) => ItemResult {
+            input: path_value(input), status: "failed",
+            report: Some(json!({"output_path":path_value(&report.output_path),
+                "backup_path":report.backup_path.as_deref().map(path_value), "replaced_existing_output":report.replaced_existing_output,
+                "clip_count":report.clip_count, "input_volume":effective_float(report.input_volume), "output_volume":effective_float(report.output_volume)})),
+            error: Some(json!({"stage":"report", "message":error.to_string(), "partial_publication":true})),
+            statistics: Some(accounting),
+        },
+    }
+}
+
+fn process_result(input: &Path, result: Result<engine::ProcessReport, EngineError>, store: &StatisticsStore, cancel: &Cancellation) -> ItemResult {
+    match result {
+        Ok(report) => processed_report(input, report, store, cancel),
+        Err(error) => ItemResult::engine_error(input, error),
     }
 }
 fn workflow_error(error: WorkflowError) -> Value {
@@ -378,11 +472,26 @@ fn workflow_error(error: WorkflowError) -> Value {
         _ => json!({"message": message}),
     }
 }
+fn restored_report(input: &Path, report: file_workflow::RestoreReport) -> ItemResult {
+    ItemResult::ok(input, json!({
+        "destination": path_value(&report.destination), "backup": path_value(&report.backup),
+        "backup_removed": report.backup_removed,
+        "backup_removal_error": report.backup_removal_error.as_ref().map(|error| json!({
+            "operation": error.operation, "path": path_value(&report.backup), "message": error.message,
+            "retained_path": error.retained_path.as_deref().map(path_value),
+            "unexpected_path": error.unexpected_path.as_deref().map(path_value),
+        })),
+    }))
+}
 fn batch_outcome(command: &str, results: Vec<ItemResult>, cancel: &Cancellation, extras: Value, batch_error: Option<Value>) -> Outcome {
     let ok = results.iter().filter(|r| r.status == "ok").count();
-    let failed = results.iter().any(|r| r.status == "failed" || r.status == "not_started") || batch_error.is_some();
+    let failed = results.iter().any(|r| r.status == "failed" || r.status == "not_started"
+        || r.statistics.as_ref().is_some_and(|s| s["status"] != "recorded")) || batch_error.is_some();
     let cancelled = cancel.is_cancelled() || results.iter().any(|r| r.status == "cancelled");
-    let (status, exit) = if cancelled { ("cancelled", 130) }
+    let cleanup_failed = results.iter().any(|r| r.statistics.as_ref().is_some_and(|s| s.get("cleanup").is_some()));
+    let (status, exit) = if cleanup_failed && ok > 0 { ("partial_failure", 1) }
+        else if cleanup_failed { ("failed", 1) }
+        else if cancelled { ("cancelled", 130) }
         else if failed && ok > 0 { ("partial_failure", 1) }
         else if failed || results.is_empty() { ("failed", 1) }
         else { ("ok", 0) };
@@ -477,13 +586,17 @@ fn prepare_output(settings: &Settings, home: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize, cancel: &Cancellation) -> Result<Outcome, AppError> {
+fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize, cancel: &Cancellation, statistics: &StatisticsStore) -> Result<Outcome, AppError> {
     apply_process_options(&mut settings, &args, cores)?;
     let template = settings.selected_template().map_err(AppError::settings)?;
     let jobs = worker_count(args.batch.jobs, &settings, cores);
     let (files, mut errors) = discovery(&args.batch.inputs);
-    let details = json!({"jobs": jobs, "requested_jobs": args.batch.jobs.map(NonZeroUsize::get),
-        "effective_config": settings.config_show().map_err(AppError::settings)?, "effective_template": effective_template(&template)});
+    let mut details = json!({"jobs": jobs, "requested_jobs": args.batch.jobs.map(NonZeroUsize::get),
+        "effective_config": settings.config_show().map_err(AppError::settings)?, "effective_template": effective_template(&template),
+        "overwrite": args.overwrite, "allow_ambiguous_marker": args.allow_ambiguous_marker, "input_marker_overrides": [],
+        "controlled_mp4_time_1904": args.controlled_mp4_time_1904,
+        "marker_override_warning": if args.allow_ambiguous_marker { Some("An ambiguous marker can belong to an already processed file.") } else { None }});
+    details["effective_config"]["overwrite"] = json!(args.overwrite);
     if files.is_empty() { return Ok(batch_outcome("process", errors, cancel, details, None)); }
     if !cancel.is_cancelled() { prepare_output(&settings, home)?; }
     let mut results: Vec<Option<ItemResult>> = (0..files.len()).map(|_| None).collect();
@@ -491,34 +604,116 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
     let mut ready = Vec::new();
     for (index, file) in files.iter().enumerate() {
         if cancel.is_cancelled() { break; }
-        match engine::prepare_file(file, &settings) {
-            Ok(item) => { prepared.push(item); ready.push(index); }
+        match engine::prepare_file(file, &settings, args.allow_ambiguous_marker) {
+            Ok(item) => {
+                let item = match args.controlled_mp4_time_1904 { Some(seconds) => item.with_controlled_mp4_time(seconds), None => item };
+                prepared.push(item); ready.push(index);
+            }
             Err(error) => results[index] = Some(ItemResult::engine_error(&file.path, error)),
         }
     }
+    details["input_marker_overrides"] = Value::Array(prepared.iter().zip(&ready).filter_map(|(item, &index)| {
+        item.input_marker_override().map(|kind| json!({"input": path_value(&files[index].path), "kind": kind}))
+    }).collect());
+    let overwrite_error = if args.overwrite && !errors.is_empty() {
+        Some(json!({"message": "cannot authorize overwrite because a selected input could not be discovered"}))
+    } else if args.overwrite {
+        let destinations: Vec<_> = prepared.iter().map(|item| item.output_plan().destination().to_owned()).collect();
+        match file_workflow::OverwriteGuard::new(&files, &destinations) {
+            Ok(guard) => {
+                let guard = Arc::new(guard);
+                prepared.iter_mut().find_map(|item| item.enable_overwrite(Arc::clone(&guard)).err()
+                    .map(|error| json!({"stage": error.stage, "message": error.message})))
+            }
+            Err(error) => Some(workflow_error(error)),
+        }
+    } else { None };
     let plans: Vec<_> = prepared.iter().map(|item| item.output_plan()).collect();
-    let conflict = file_workflow::validate_batch(&plans).err().map(workflow_error).or_else(|| {
+    let conflict = overwrite_error.or_else(|| file_workflow::validate_batch(&plans).err().map(workflow_error)).or_else(|| {
         // Also protect selected inputs whose own preflight failed.
         plans.iter().find_map(|plan| files.iter().find(|file| plan.destination() == file.path.as_path() && plan.source() != file.path.as_path())
             .map(|file| json!({"message": format!("destination {} conflicts with selected input {}", plan.destination().display(), file.path.display())})))
     });
     if conflict.is_none() && !cancel.is_cancelled() {
+        let job_trace = JobTrace::from_env()?;
         let slots: Vec<_> = (0..ready.len()).collect();
         for (slot, result) in parallel_items(&slots, jobs, cancel, |slot| {
             let file = &files[ready[slot]];
-            match engine::process_file(&prepared[slot], &template, &settings, cancel) {
-                Ok(report) => match serde_json::to_value(report) {
-                    Ok(report) => ItemResult::ok(&file.path, report),
-                    Err(error) => ItemResult::failed(&file.path, json!({"stage":"report", "message":error.to_string()})),
-                },
-                Err(error) => ItemResult::engine_error(&file.path, error),
-            }
+            if let Some(trace) = &job_trace { trace.event("begin", slot, &file.path); }
+            let processed = engine::process_file(&prepared[slot], &template, &settings, cancel);
+            if let Some(trace) = &job_trace { trace.event("end", slot, &file.path); }
+            process_result(&file.path, processed, statistics, cancel)
         }) { results[ready[slot]] = Some(result); }
     }
     errors.extend(results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| {
         ItemResult::not_started(&files[i].path, if cancel.is_cancelled() { "cancelled before starting" } else { "batch preflight failed" })
     })));
     Ok(batch_outcome("process", errors, cancel, details, conflict))
+}
+
+/// Diagnostic only: `PLATINUM_DIAGNOSTIC_JOB_TRACE` names a new file that
+/// receives one JSON line when each file job enters and leaves processing, and
+/// one line for every Mach-O image dyld maps while tracing (with its in-memory
+/// LC_UUID), so evidence tooling can bind libraries loaded during a job.
+struct JobTrace { file: std::sync::Mutex<std::fs::File>, origin: std::time::Instant }
+static JOB_TRACE: std::sync::OnceLock<JobTrace> = std::sync::OnceLock::new();
+impl JobTrace {
+    fn from_env() -> Result<Option<&'static Self>, AppError> {
+        unsafe extern "C" { fn _dyld_register_func_for_add_image(callback: extern "C" fn(*const u8, isize)); }
+        let Some(path) = std::env::var_os("PLATINUM_DIAGNOSTIC_JOB_TRACE") else { return Ok(None) };
+        if JOB_TRACE.get().is_some() { return Err(AppError::io("job trace already initialized")); }
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|e| AppError::io(format!("create job trace {}: {e}", Path::new(&path).display())))?;
+        let trace = JOB_TRACE.get_or_init(|| Self { file: std::sync::Mutex::new(file), origin: std::time::Instant::now() });
+        // SAFETY: the callback only reads the supplied mapped header and writes
+        // to the process-lifetime trace; dyld also replays already-loaded images.
+        unsafe { _dyld_register_func_for_add_image(image_added) };
+        Ok(Some(trace))
+    }
+    fn write(&self, mut line: Value) {
+        use std::io::Write as _;
+        let unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        line["thread"] = json!(format!("{:?}", std::thread::current().id()));
+        line["unix_ns"] = json!(unix_ns.to_string());
+        line["elapsed_ns"] = json!(self.origin.elapsed().as_nanos().to_string());
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(file, "{line}").and_then(|()| file.sync_data());
+    }
+    fn event(&self, event: &str, slot: usize, input: &Path) {
+        self.write(json!({"event": event, "slot": slot, "input": path_value(input)}));
+    }
+}
+
+extern "C" fn image_added(header: *const u8, _slide: isize) {
+    #[repr(C)]
+    struct DlInfo { fname: *const std::ffi::c_char, fbase: *mut std::ffi::c_void, sname: *const std::ffi::c_char, saddr: *mut std::ffi::c_void }
+    unsafe extern "C" { fn dladdr(address: *const std::ffi::c_void, info: *mut DlInfo) -> i32; }
+    const LC_UUID: u32 = 0x1b;
+    let Some(trace) = JOB_TRACE.get() else { return };
+    if header.is_null() { return; }
+    // SAFETY: dyld passes the mapped 64-bit Mach-O header of a loaded image;
+    // its load commands follow the 32-byte header for `ncmds` entries.
+    let (path, uuid) = unsafe {
+        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        let path = if dladdr(header.cast(), &mut info) != 0 && !info.fname.is_null() {
+            Some(std::ffi::CStr::from_ptr(info.fname).to_string_lossy().into_owned())
+        } else { None };
+        let read = |offset: usize| u32::from_ne_bytes(std::ptr::read_unaligned(header.add(offset).cast::<[u8; 4]>()));
+        let (ncmds, mut offset, mut uuid) = (read(16), 32usize, None);
+        for _ in 0..ncmds {
+            let (cmd, size) = (read(offset), read(offset + 4) as usize);
+            if cmd == LC_UUID {
+                let bytes = std::ptr::read_unaligned(header.add(offset + 8).cast::<[u8; 16]>());
+                uuid = Some(bytes.iter().map(|b| format!("{b:02X}")).collect::<String>());
+                break;
+            }
+            if size < 8 { break; }
+            offset += size;
+        }
+        (path, uuid)
+    };
+    if path.as_deref().is_some_and(|p| p.starts_with("/System/") || p.starts_with("/usr/lib/")) { return; }
+    trace.write(json!({"event": "image", "path": path, "uuid": uuid}));
 }
 fn analyze(args: AnalyzeArgs, mut settings: Settings, cores: usize, cancel: &Cancellation) -> Result<Outcome, AppError> {
     apply_run_template(&mut settings, &args.template)?;
@@ -560,23 +755,48 @@ fn inspect(args: InspectArgs, settings: &Settings, cores: usize, cancel: &Cancel
 }
 fn restore(args: RestoreArgs, settings: &Settings, cancel: &Cancellation) -> Result<Outcome, AppError> {
     if args.files.len() != args.backup.len() { return Err(AppError::usage("supply one --backup PATH for each FILE, in the same order")); }
-    let mut results = Vec::with_capacity(args.files.len());
-    for (path, backup) in args.files.iter().zip(&args.backup) {
-        if cancel.is_cancelled() { results.push(ItemResult::not_started(path, "cancelled before starting")); continue; }
-        let (identity, marker) = match engine::read_restore_marker(path, settings) {
-            Ok(result) => result,
-            Err(error) => { results.push(ItemResult::engine_error(path, error)); continue; }
+    let snapshot = file_workflow::RestoreBatchSnapshot::capture(&args.files, &args.backup).map_err(|error| {
+        if matches!(&error, WorkflowError::RestoreInputConflict { .. } | WorkflowError::InvalidMarkerBackup) {
+            AppError::usage(error.to_string())
+        } else { AppError::io(error.to_string()) }
+    })?;
+    let mut results: Vec<Option<ItemResult>> = (0..args.files.len()).map(|_| None).collect();
+    let mut prepared: Vec<Option<_>> = (0..args.files.len()).map(|_| None).collect();
+    for (index, path) in args.files.iter().enumerate() {
+        if cancel.is_cancelled() {
+            results[index] = Some(ItemResult::not_started(path, "cancelled before starting")); continue;
+        }
+        let marker = match engine::read_restore_marker(path, settings) {
+            Ok((_, marker)) => marker,
+            Err(error) => { results[index] = Some(ItemResult::engine_error(path, error)); continue; }
         };
-        if cancel.is_cancelled() { results.push(ItemResult::not_started(path, "cancelled before restore")); continue; }
+        if let Err(error) = snapshot.target(index).verify(path) {
+            results[index] = Some(ItemResult::workflow_error(path, error)); continue;
+        }
         let status = if matches!(file_workflow::source_type(path), Some(SourceType::ProtectedM4p | SourceType::ProtectedWlMp3)) {
             RestoreStatus::Protected
         } else { RestoreStatus::Inactive };
-        match file_workflow::restore(path, backup, marker.as_ref(), status, &identity, cancel) {
-            Ok(report) => results.push(ItemResult::ok(path, json!({"destination": path_value(&report.destination), "backup": path_value(&report.backup)}))),
-            Err(error) => results.push(ItemResult::workflow_error(path, error)),
+        prepared[index] = Some((marker, status));
+    }
+    for members in snapshot.groups() {
+        let ready: Vec<_> = members.iter().copied().filter(|&index| prepared[index].is_some()).collect();
+        let allow_consumption = ready.len() == members.len();
+        let requests: Vec<_> = ready.iter().map(|&index| {
+            let (marker, status) = prepared[index].as_ref().unwrap();
+            file_workflow::RestoreRequest { processed: &args.files[index], backup: &args.backup[index],
+                marker: marker.as_ref(), status: *status, identity: snapshot.target(index), frozen_backup: snapshot.backup(index) }
+        }).collect();
+        for (index, outcome) in ready.into_iter().zip(file_workflow::restore_group(&requests, allow_consumption, cancel)) {
+            results[index] = Some(match outcome {
+                Ok(report) => restored_report(&args.files[index], report),
+                Err(error) => ItemResult::workflow_error(&args.files[index], error),
+            });
         }
     }
-    Ok(batch_outcome("restore", results, cancel, json!({"backup_policy":"retained_on_success"}), None))
+    let results = results.into_iter().enumerate().map(|(index, result)| result.unwrap_or_else(|| {
+        ItemResult::not_started(&args.files[index], "cancelled before restore")
+    })).collect();
+    Ok(batch_outcome("restore", results, cancel, json!({"backup_policy":"remove_after_verified_restore"}), None))
 }
 
 fn execute(cli: Cli, cancel: &Cancellation) -> Result<Outcome, AppError> {
@@ -594,15 +814,21 @@ fn execute(cli: Cli, cancel: &Cancellation) -> Result<Outcome, AppError> {
                 .ok_or_else(|| AppError::settings("HOME is not set; cannot resolve Engine defaults"))?;
             let cores = std::thread::available_parallelism().map(NonZeroUsize::get).unwrap_or(1);
             let store = match cli.state_dir { Some(path) => SettingsStore::new(path, home, cores), None => SettingsStore::in_home(home, cores) };
-            let mut loaded = store.load().map_err(AppError::settings)?;
+            let statistics_store = StatisticsStore::new(store.directory());
             match command {
-                Command::Process(args) => process(args, loaded.settings, store.home(), cores, cancel),
-                Command::Analyze(args) => analyze(args, loaded.settings, cores, cancel),
-                Command::Inspect(args) => Ok(inspect(args, &loaded.settings, cores, cancel)),
-                Command::Restore(args) => restore(args, &loaded.settings, cancel),
-                Command::Templates { command } => templates(command, &store, &mut loaded),
-                Command::Config { command } => config(command, &store, &mut loaded),
-                Command::Version | Command::Provenance => unreachable!(),
+                Command::Statistics { command } => statistics(command, &statistics_store, cancel),
+                command => {
+                    let mut loaded = store.load().map_err(AppError::settings)?;
+                    match command {
+                        Command::Process(args) => process(args, loaded.settings, store.home(), cores, cancel, &statistics_store),
+                        Command::Analyze(args) => analyze(args, loaded.settings, cores, cancel),
+                        Command::Inspect(args) => Ok(inspect(args, &loaded.settings, cores, cancel)),
+                        Command::Restore(args) => restore(args, &loaded.settings, cancel),
+                        Command::Templates { command } => templates(command, &store, &mut loaded),
+                        Command::Config { command } => config(command, &store, &mut loaded),
+                        Command::Statistics { .. } | Command::Version | Command::Provenance => unreachable!(),
+                    }
+                }
             }
         }
     }
@@ -620,6 +846,9 @@ fn emit(value: &Value, machine: bool) {
             println!("{}: {}", path, result["status"].as_str().unwrap_or("unknown"));
             if let Some(report) = result.get("report") { println!("{}", serde_json::to_string_pretty(report).expect("JSON value serializes")); }
             if let Some(error) = result.get("error") { eprintln!("  {error}"); }
+            if let Some(statistics) = result.get("statistics").filter(|v| v["status"] != "recorded") {
+                eprintln!("  statistics: {statistics}");
+            }
         }
     } else {
         println!("{}", serde_json::to_string_pretty(value).expect("JSON value serializes"));
@@ -650,10 +879,265 @@ fn main() {
     match execute(cli, &cancel) {
         Ok(outcome) => { emit(&outcome.value, machine); std::process::exit(outcome.exit); }
         Err(error) => {
-            let exit = if error.kind == "usage" { 2 } else { 1 };
-            let value = json!({"status":"error", "error":{"kind":error.kind, "message":error.message}});
+            let exit = if error.kind == "usage" { 2 } else if error.kind == "cancelled" { 130 } else { 1 };
+            let mut value = json!({"status":if error.kind == "cancelled" { "cancelled" } else { "error" },
+                "error":{"kind":error.kind, "message":error.message}});
+            if let Some(publication) = error.publication { value["error"]["publication"] = json!(publication); }
+            if let Some(cleanup) = error.cleanup { value["error"]["cleanup"] = cleanup; }
             if machine { emit(&value, true); } else { eprintln!("{}", value["error"]["message"].as_str().unwrap_or("operation failed")); }
             std::process::exit(exit);
         }
+    }
+}
+
+#[cfg(test)]
+mod statistics_outcome_tests {
+    use super::*;
+    use std::fs;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+
+    #[link(name = "System")]
+    unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            loop {
+                let path = std::env::temp_dir().join(format!("platinum-statistics-outcome-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create fixture: {error}"),
+                }
+            }
+        }
+        fn store(&self) -> StatisticsStore { StatisticsStore::new(&self.0) }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+
+    fn report() -> engine::ProcessReport {
+        engine::ProcessReport {
+            input_path: "input.wav".into(), input_sample_rate: 48000.0, processing_sample_rate: 48000.0,
+            output_path: "output.wav".into(), backup_path: None, replaced_existing_output: false, input_format: "WAV".into(), output_format: "WAV".into(),
+            sample_rate: 48000.0, channels: 2, output_channels: 2, output_bit_depth: 16,
+            encoded_length_frames: 1, input_frames: 1, healed_frames: 1, output_frames: 1,
+            input_volume: 0.0, healed_volume: 0.0, output_volume: 0.6, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
+            tempo_factor: 1.0, clip_count: 3, applied_stages: Vec::new(),
+            processing_marker_status: "present", input_marker_override: None, controlled_mp4_time_1904: None,
+        }
+    }
+
+    #[test]
+    fn restore_report_preserves_structured_backup_removal_failure() {
+        let input = Path::new("/fixture/processed.wav");
+        let report = file_workflow::RestoreReport {
+            destination: input.to_owned(), backup: "/fixture/backup.wav".into(), backup_removed: false,
+            backup_removal_error: Some(file_workflow::BackupRemovalError {
+                operation: "remove verified backup", message: "permission denied".to_owned(),
+                retained_path: Some("/fixture/backup.wav".into()), unexpected_path: None,
+            }),
+        };
+        let item = restored_report(input, report);
+        assert_eq!(item.status, "ok");
+        let value = item.report.unwrap();
+        assert_eq!(value["backup_removed"], false);
+        assert_eq!(value["backup_removal_error"]["operation"], "remove verified backup");
+        assert_eq!(value["backup_removal_error"]["path"], "/fixture/backup.wav");
+        assert_eq!(value["backup_removal_error"]["retained_path"], "/fixture/backup.wav");
+        assert!(value["backup_removal_error"]["unexpected_path"].is_null());
+        assert_eq!(value["backup_removal_error"]["message"], "permission denied");
+    }
+
+    #[test]
+    fn accounting_failure_retains_published_report_and_fails_batch() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fs::write(store.statistics_path(), b"corrupt").unwrap();
+        let item = processed_report(Path::new("input.wav"), report(), &store, &Cancellation::new());
+        assert_eq!(item.status, "ok");
+        assert_eq!(item.report.as_ref().unwrap()["output_path"], "output.wav");
+        assert_eq!(item.statistics.as_ref().unwrap()["status"], "failed");
+        assert_eq!(item.statistics.as_ref().unwrap()["publication"], "not_published");
+        assert_eq!(item.statistics.as_ref().unwrap()["audio_published"], true);
+        let outcome = batch_outcome("process", vec![item], &Cancellation::new(), json!({}), None);
+        assert_eq!(outcome.exit, 1);
+        assert_eq!(outcome.value["status"], "partial_failure");
+        assert_eq!(outcome.value["results"][0]["report"]["clip_count"], 3);
+        assert_eq!(fs::read(store.statistics_path()).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn uncertain_state_publication_is_not_reported_as_unpublished() {
+        let error = StatisticsError::AfterPublish { path: "statistics.json".into(), source: io::Error::other("injected") };
+        let accounting = statistics_accounting(Err(error));
+        assert_eq!(accounting["publication"], "published_durability_uncertain");
+        let mut item = ItemResult::ok(Path::new("input.wav"), json!({"output_path":"output.wav"}));
+        item.statistics = Some(accounting);
+        let outcome = batch_outcome("process", vec![item], &Cancellation::new(), json!({}), None);
+        assert_eq!(outcome.exit, 1);
+        assert_eq!(outcome.value["results"][0]["statistics"]["publication"], "published_durability_uncertain");
+        let app_error = AppError::statistics(StatisticsError::AfterPublish {
+            path: "statistics.json".into(), source: io::Error::other("injected"),
+        });
+        assert_eq!(app_error.publication, Some("published_durability_uncertain"));
+    }
+
+    #[test]
+    fn cancellation_with_cleanup_failure_is_a_failure_with_retained_details() {
+        let make_error = || StatisticsError::Cleanup {
+            path: "staged.tmp".into(), cause: Box::new(StatisticsError::Cancelled),
+            source: io::Error::other("injected cleanup failure"),
+        };
+        let accounting = statistics_accounting(Err(make_error()));
+        assert_eq!(accounting["status"], "failed");
+        assert_eq!(accounting["publication"], "not_published");
+        assert_eq!(accounting["cleanup"]["stage_path"], "staged.tmp");
+        assert_eq!(accounting["cleanup"]["cause_kind"], "cancelled");
+        assert!(accounting["cleanup"]["cause"].is_string());
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        let mut item = ItemResult::ok(Path::new("input.wav"), json!({"output_path":"output.wav"}));
+        item.statistics = Some(accounting);
+        let outcome = batch_outcome("process", vec![item], &cancel, json!({}), None);
+        assert_eq!(outcome.exit, 1);
+        assert_eq!(outcome.value["status"], "partial_failure");
+        assert_eq!(outcome.value["results"][0]["report"]["output_path"], "output.wav");
+        let app_error = AppError::statistics(make_error());
+        assert_eq!(app_error.kind, "statistics");
+        assert_eq!(app_error.cleanup.unwrap()["stage_path"], "staged.tmp");
+    }
+
+    #[test]
+    fn nested_stage_cleanup_failure_survives_cancellation_as_a_failure() {
+        let make_error = || StatisticsError::Storage(SettingsError::Cleanup {
+            operation: "remove temporary file", path: "retained-stage.tmp".into(),
+            cause: Box::new(SettingsError::Io { operation: "write temporary file", path: "retained-stage.tmp".into(),
+                source: io::Error::other("injected write failure") }),
+            source: io::Error::other("injected cleanup failure"),
+        });
+        let accounting = statistics_accounting(Err(make_error()));
+        assert_eq!(accounting["status"], "failed");
+        assert_eq!(accounting["publication"], "not_published");
+        assert_eq!(accounting["cleanup"]["stage_path"], "retained-stage.tmp");
+        assert_eq!(accounting["cleanup"]["cause_kind"], "error");
+        assert!(accounting["cleanup"]["cause"].is_string());
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        let mut item = ItemResult::ok(Path::new("input.wav"), json!({"output_path":"output.wav"}));
+        item.statistics = Some(accounting);
+        let outcome = batch_outcome("process", vec![item], &cancel, json!({}), None);
+        assert_eq!(outcome.exit, 1);
+        assert_eq!(outcome.value["status"], "partial_failure");
+        assert_eq!(outcome.value["results"][0]["report"]["output_path"], "output.wav");
+        let app_error = AppError::statistics(make_error());
+        assert_eq!(app_error.kind, "statistics");
+        assert_eq!(app_error.cleanup.unwrap()["stage_path"], "retained-stage.tmp");
+    }
+
+    #[test]
+    fn cancellation_before_dispatch_does_not_record_but_after_publication_does() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        let started = AtomicBool::new(false);
+        let items = parallel_items(&[0], 1, &cancel, |_| {
+            started.store(true, Ordering::Relaxed);
+            processed_report(Path::new("input.wav"), report(), &store, &cancel)
+        });
+        assert!(items.is_empty());
+        assert!(!started.load(Ordering::Relaxed));
+        assert_eq!(store.show(&Cancellation::new()).unwrap().processed_songs, 0);
+        // Simulate the independent cancellation arriving after Engine returned
+        // a published report: the returned report must still be counted.
+        let item = processed_report(Path::new("input.wav"), report(), &store, &cancel);
+        let outcome = batch_outcome("process", vec![item], &cancel, json!({}), None);
+        assert_eq!(outcome.exit, 130);
+        assert_eq!(outcome.value["results"][0]["statistics"]["status"], "recorded");
+        assert_eq!(store.show(&Cancellation::new()).unwrap().processed_songs, 1);
+    }
+
+    #[test]
+    fn failed_engine_result_is_not_counted_even_if_audio_was_partly_published() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let error = EngineError { stage: "publish output", message: "injected failure".into(),
+            cancelled: false, retained_backup: None, recovery_path: Some("/fixture/recovery".into()), partial_publication: true };
+        let item = process_result(Path::new("input.wav"), Err(error), &store, &Cancellation::new());
+        assert_eq!(item.status, "failed");
+        let error = item.error.unwrap();
+        assert_eq!(error["partial_publication"], true);
+        assert_eq!(error["recovery_path"], "/fixture/recovery");
+        assert!(item.statistics.is_none());
+        assert_eq!(store.show(&Cancellation::new()).unwrap().processed_songs, 0);
+    }
+
+    #[test]
+    fn restore_error_reports_rollback_recovery_and_cleanup_together() {
+        let error = WorkflowError::Transaction {
+            cause: Box::new(WorkflowError::BackupChanged("/fixture/backup".into())),
+            backup: None, recovery: Some("/fixture/original".into()), rollback: None, published: true,
+            cleanup: vec![file_workflow::CleanupFailure { operation: "release reservation",
+                path: "/fixture/reservation".into(), source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied") }],
+        };
+        let value = workflow_error(error);
+        assert_eq!(value["retained_original"], "/fixture/original");
+        assert_eq!(value["partial_publication"], true);
+        assert_eq!(value["cleanup_errors"][0]["path"], "/fixture/reservation");
+    }
+
+    #[test]
+    fn report_serialization_failure_still_records_and_retains_output_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let mut published = report();
+        published.output_path = std::ffi::OsString::from_vec(b"output-\xff.wav".to_vec()).into();
+        let item = process_result(Path::new("input.wav"), Ok(published), &store, &Cancellation::new());
+        assert_eq!(item.status, "failed");
+        assert_eq!(item.report.as_ref().unwrap()["output_path"]["unix_bytes_hex"], "6f75747075742dff2e776176");
+        assert_eq!(item.report.as_ref().unwrap()["clip_count"], 3);
+        assert_eq!(item.error.as_ref().unwrap()["partial_publication"], true);
+        assert_eq!(item.statistics.as_ref().unwrap()["status"], "recorded");
+        assert_eq!(store.show(&Cancellation::new()).unwrap().processed_songs, 1);
+    }
+
+    #[test]
+    fn cancelled_contended_accounting_retains_published_report() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        store.reset(&Cancellation::new()).unwrap();
+        let before = fs::read(store.statistics_path()).unwrap();
+        let held = fs::OpenOptions::new().read(true).write(true).open(fixture.0.join("statistics.lock")).unwrap();
+        // SAFETY: held owns a valid descriptor until it is dropped below.
+        assert_eq!(unsafe { flock(held.as_raw_fd(), 2) }, 0);
+        let cancel = Cancellation::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                result_tx.send(processed_report(Path::new("input.wav"), report(), &store, &cancel)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancel.cancel();
+            let received = result_rx.recv_timeout(Duration::from_secs(3));
+            let unchanged = fs::read(store.statistics_path()).unwrap();
+            drop(held);
+            let item = received.expect("accounting did not stop while the lock remained held");
+            assert_eq!(unchanged, before);
+            assert_eq!(item.status, "ok");
+            assert_eq!(item.report.as_ref().unwrap()["output_path"], "output.wav");
+            assert_eq!(item.statistics.as_ref().unwrap()["status"], "not_recorded");
+            assert_eq!(item.statistics.as_ref().unwrap()["reason"], "cancelled");
+            assert_eq!(item.statistics.as_ref().unwrap()["publication"], "not_published");
+            let outcome = batch_outcome("process", vec![item], &cancel, json!({}), None);
+            assert_eq!(outcome.exit, 130);
+            assert_eq!(outcome.value["results"][0]["statistics"]["audio_published"], true);
+        });
     }
 }

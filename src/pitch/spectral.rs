@@ -161,6 +161,12 @@ impl FftSplitter {
         Some(this)
     }
 
+    // Match the controlled native intervention on the splitter FFT only.
+    #[cfg(test)]
+    pub(super) fn use_offset48_for_test(&mut self) {
+        self.fft.use_offset48_for_test();
+    }
+
     /// Pro's reset calls `0x39ae4`, which restores ratio 1 and the half-window
     /// input/output history. The window and lifter coefficients are retained.
     pub fn reset(&mut self) {
