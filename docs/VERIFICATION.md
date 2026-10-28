@@ -2,6 +2,21 @@
 
 The project uses complete-file identity as its reference-comparison criterion: audio, container headers, encoder output and metadata all count. Component tests and decoded PCM comparisons help locate differences; they do not substitute for a complete-file match.
 
+## macOS reference tests and CI
+
+The default macOS build uses that system's Accelerate and math libraries, as
+the original application does. Tests asserting exact native values are tied to
+the recorded Apple M4/SME and macOS reference environment; another Mac or OS
+release can produce different bits without a build failure. The release battery
+runs those default-mode reference tests on the reference Mac.
+
+GitHub's macOS CI builds the default release and compiles its all-target tests
+without running them. It then runs the all-target suite with the `portable`
+feature and `--no-fail-fast`; the portable math and vector implementations
+model the recorded M4 reference rather than dispatching to the CI host's
+Accelerate or math routines. This distinction does not turn finite test coverage
+into a universal cross-platform parity guarantee.
+
 ## v0.1.0 source freeze
 
 The regression-fixed source freeze has source-manifest SHA-256
@@ -14,15 +29,60 @@ native-library images its offline locked all-target suite passed **400**, failed
 executable SHA-256 values were
 `6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
 and `1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`.
-The remapped optimized macOS binary SHA-256 was
+The earlier source-path-remapped optimized macOS binary SHA-256 was
 `82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`.
 These architecture-specific binary hashes and test results do not themselves
 establish complete-file parity. The freeze's full-tree manifest records the
 tree at that point, not later documentation or export-related edits.
 
-### macOS identity-gated battery
+### Shipped macOS identity-gated battery
 
-The binary above (LC_UUID `5348303E-C012-3ECD-9023-D9A444C57F73`) passed
+The v0.1.0 macOS executable SHA-256 is
+`198e0091a212e8af05e0934b1249fd698bfa2300f643e3b430d2b188d30913b8`
+(LC_UUID `4D4554E4-7EE2-39F1-9681-CDF11CC1A5A2`). It was rebuilt from the
+same compile-time sources with additional home, Cargo and Rustup path remaps;
+the earlier `82d8b489…` build already remapped the source path. The binaries
+are not byte-identical, so the new executable received its own battery rather
+than inheriting a byte-equivalence claim. The build export differed from the
+previously verified export only in release workflow and Linux documentation;
+later CI and documentation changes are not represented by that build manifest.
+
+The public-export default-mode all-target suite passed **440**, failed **0**,
+and ignored **179** tests across 42 suites. A separate selected public-library
+run passed 38 tests, and the waveform replay and Xing caller-byte oracle each
+passed one. These runs overlap and ignored tests are not passes.
+
+Without normalizing bytes, the new binary matched **71/71** selected stable
+files, **8/8** dynamics/pitch cases, **10/10** MP4 exports at their recorded
+header seconds, 15 boundary files, all six x01–x06 extension cases, the Xing
+E05 case and W04 exact-path replacement/restore. Nine family cases matched
+only in the documented **path-relocated context review**; the original strict
+toolkit rejected the different output folders. The supplemental workflow,
+gauge and waveform checks matched; timed W03 cancellation landed in healing
+rather than the recorded native analysis stage, while an early cancellation
+reached analysis. The native application was not launched or controlled.
+
+The shipped bridge and LAME libraries use neutral install names and ad-hoc
+signatures. Their SHA-256 values are
+`14ca6f03b65a2cb0c4bc8bd06df540ae1707796f59f2d4f117a5d33447dfd79e`
+and `2986f34cca6a4fbfb05934ac33b4bb919c8c47de1594e227b2f0fa4c930b377f`;
+libFLAC remains
+`d9b3a64df9eeab7556aad9877492ad07ba51e6459e3725f90b0a9203078ac6a5`.
+The bridge and LAME section and non-metadata segment bytes were checked
+against their prior libraries; changes are confined to install-name/load-command
+layout and code-signature-related data. The CLI and these libraries were
+checked for host-specific home-directory strings.
+
+The private primary and supplement receipts are
+`hash-parity/release-final-198e0091.json` and
+`hash-parity/release-final-198e0091-supplement.json`, SHA-256
+`566c93b7f848ede1f2846221218b1a587b2894b84206dc810f0a21e293f2c7a4`
+and `35e1efaa9d7c3ab7911c6f07f61448bfa246625570468fbd4a27e327919029bb`.
+These finite, overlapping synthetic cases do not prove universal parity.
+
+### Earlier macOS identity-gated battery
+
+The earlier `82d8b489…` binary (LC_UUID `5348303E-C012-3ECD-9023-D9A444C57F73`) passed
 **440** top-level regular tests, with **0 failed** and **181 ignored**, in
 44 suites. A separate selected public-dependency run passed 38 tests; the
 native waveform replay and Xing caller-byte oracle each passed one. The

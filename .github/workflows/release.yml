@@ -82,7 +82,7 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern SHA256SUMS --pattern "$asset" --dir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          printf '%s  %s\n' 4969a179f607f6228a6eb72f87fac6a0a4e1cd732aa151203ffcd6985400b690 SHA256SUMS | sha256sum -c -
+          printf '%s  %s\n' 20509370f870a410dac648017718a32c192097a78ef66e80e6c30006a611bcd1 SHA256SUMS | sha256sum -c -
           grep -Fx -- "$ARCHIVE_SHA256  $asset" SHA256SUMS
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$asset" | sha256sum -c -
           tar -xzf "$asset" -C "$RUNNER_TEMP/runtime-context/linux-$ARCH"

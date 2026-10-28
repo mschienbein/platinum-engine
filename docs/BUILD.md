@@ -30,6 +30,21 @@ cargo build --locked --bin platinum
 
 Building the CLI does not itself build the native libraries. Configuration/template commands do not require them. `research/templates/builtins.json` and `src/portable/fft_sme_coefficients.bin` are compile-time resources, not optional research reports; both must be present with the source tree.
 
+On the recorded M4 reference Mac, the release battery runs the default-mode
+native-value tests. Their exact expected values can differ on another Mac or
+macOS version because the default build uses that system's libraries. CI
+builds the default release and compiles those tests, then runs the portable
+all-target tests against the recorded M4 implementation:
+
+```sh
+cargo build --locked --release
+cargo test --locked --no-run --all-targets
+cargo test --locked --all-targets --features portable --no-fail-fast
+```
+
+See [VERIFICATION.md](VERIFICATION.md#macos-reference-tests-and-ci) for the
+reference and coverage boundaries.
+
 ## Required: TagLib 1.11.1 and ABI-5 bridge v07
 
 The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073b7`. This uses a public TagLib build, never the framework supplied with the reference application. The checksum is for that exact archive, not for an arbitrary 1.11.1 archive.
@@ -63,7 +78,7 @@ The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073
 )
 ```
 
-The bridge ABI must be 5; the v07 source adds source-container status and read-failure handling. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge. The recorded v07 macOS bridge SHA-256 was `7e2f65614f2ad87322e030213b3b2fb2914a3e69635b434fd96cf6b1da38d585`; a locally rebuilt file can differ. The older `ab36bcd5…` bridge was an earlier build. The loader checks the ABI and pins the opened file, not its provenance. A dynamic library is executable code, so configure only a library you trust. A writer able to modify that same file's inode during loading can defeat the integrity check before its post-load verification; prevent concurrent modification.
+The bridge ABI must be 5; the v07 source adds source-container status and read-failure handling. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge. The earlier v07 macOS bridge SHA-256 was `7e2f65614f2ad87322e030213b3b2fb2914a3e69635b434fd96cf6b1da38d585`; the v0.1.0 package uses the same bridge with a neutral install name and an ad-hoc signature, SHA-256 `14ca6f03b65a2cb0c4bc8bd06df540ae1707796f59f2d4f117a5d33447dfd79e`. A locally rebuilt file can differ. The older `ab36bcd5…` bridge was an earlier build. The loader checks the ABI and pins the opened file, not its provenance. A dynamic library is executable code, so configure only a library you trust. A writer able to modify that same file's inode during loading can defeat the integrity check before its post-load verification; prevent concurrent modification.
 
 Configure its path as a JSON string. The helper handles spaces and other characters that need JSON escaping:
 
@@ -141,7 +156,7 @@ LAME_SHA="$(shasum -a 256 "$LAME_LIB")"; LAME_SHA="${LAME_SHA%% *}"
 "$PN" --state-dir "$PN_STATE" config set libraries.lame_sha256 "$(json_string "$LAME_SHA")"
 ```
 
-The recorded library hash was `58d3a0dba8271d00f0a88704708a6a0caa5610d8da0b1f7dcbbad64c9a165981`; configure the digest of your own trusted build. Homebrew LAME 4.0 is not the pinned 3.100 build.
+The earlier recorded library hash was `58d3a0dba8271d00f0a88704708a6a0caa5610d8da0b1f7dcbbad64c9a165981`; the v0.1.0 package uses a neutral install name and ad-hoc signature, SHA-256 `2986f34cca6a4fbfb05934ac33b4bb919c8c47de1594e227b2f0fa4c930b377f`. Configure the digest of your own trusted build. Homebrew LAME 4.0 is not the pinned 3.100 build.
 
 ## Try the pinned synthetic fixture
 
@@ -172,7 +187,7 @@ For real files, use a separate output folder first and retain an independent bac
 
 The following is the recorded macOS arm64 release-build environment, from the
 root of the reviewed public source export. It uses cached locked dependencies,
-a fresh target directory and a fixed source-path remap. It does not install or
+a fresh target directory and path remaps. It does not install or
 publish anything. Compiler, OS, SDK and dependency changes can change the
 binary; compare the result rather than assuming identity.
 
@@ -180,17 +195,22 @@ binary; compare the result rather than assuming identity.
 EXPORT="$(pwd -P)"
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/platinum-release.XXXXXX")"
 mkdir "$RUN/home" "$RUN/tmp"
-env PATH=/opt/homebrew/opt/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin \
+env -i PATH=/opt/homebrew/opt/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin \
   RUSTUP_TOOLCHAIN=1.99.1 RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" \
   CARGO_TARGET_DIR="$RUN/target" HOME="$RUN/home" CFFIXED_USER_HOME="$RUN/home" \
   TMPDIR="$RUN/tmp/" LANG=C LC_ALL=C TZ=UTC \
-  RUSTFLAGS="--remap-path-prefix=$EXPORT=/platinum-source" \
+  RUSTFLAGS="--remap-path-prefix=$HOME=/user --remap-path-prefix=$HOME/.rustup=/rustup --remap-path-prefix=$HOME/.cargo/registry/src=/cargo/registry/src --remap-path-prefix=$HOME/.cargo/git/checkouts=/cargo/git/checkouts --remap-path-prefix=$EXPORT=/platinum-source" \
   cargo build --offline --locked --release --bin platinum
 shasum -a 256 "$RUN/target/release/platinum"
 ```
 
-The frozen macOS battery executable SHA-256 was
-`82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`.
+The v0.1.0 macOS battery executable SHA-256 was
+`198e0091a212e8af05e0934b1249fd698bfa2300f643e3b430d2b188d30913b8`.
+The earlier source-path-remapped battery executable was
+`82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`;
+the release rebuild adds home, Cargo and Rustup path remaps and has its own
+identity-gated battery.
+
 For Linux, run on the target's native Docker host with a prepared offline
 registry cache (`index/` and `cache/`), a new output directory and the
 appropriate v07 image identity:

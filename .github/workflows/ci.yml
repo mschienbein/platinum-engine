@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Test with the repository toolchain
+      - name: Build default mode and test portable mode
         shell: bash
         run: |
           test "$(uname -m)" = arm64
@@ -30,7 +30,9 @@ jobs:
           esac
           rustup show active-toolchain
           rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
-          cargo test --locked --all-targets
+          cargo build --locked --release
+          cargo test --locked --no-run --all-targets
+          cargo test --locked --all-targets --features portable --no-fail-fast
 
   linux:
     name: Linux ${{ matrix.uname }}
