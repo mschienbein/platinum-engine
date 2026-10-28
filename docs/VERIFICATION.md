@@ -111,6 +111,20 @@ the input untouched, source replacement with a verified backup, rejection of an
 interdependent restore without changes, and backup consumption after restore.
 Receipt: `local-artifacts/hash-parity/release-final-dd4b5fd0.json`.
 
+The final binary also repeated the recorded candidate workflows. The W01 mixed
+folder exited 1 with a partial failure for the Ogg file, and its three WAV
+outputs matched native. The W02 same-folder and mirror-tree outputs matched
+native; the mirror root matched native B, since native A has the known marker
+variant. An existing destination was refused by default and replaced
+identically with `--overwrite`. W03 output-permission failure published
+nothing. SIGINT exited 130 without publication when sent during analysis and
+during healing; with this faster binary, the original 5-second signal timing
+lands in healing rather than analysis. The gauge fixture output matched the
+native export, totals reached one song, eight dB and zero clips, and reset
+behaved as before. CLI waveform bins equaled the composed native decoder and
+reducer words for all four generated WAV fixtures. Receipt:
+`local-artifacts/hash-parity/release-final-dd4b5fd0-supplement.json`.
+
 ## Additional native boundary cases
 
 Two generated nonzero-width dynamics gates were imported natively. Native
