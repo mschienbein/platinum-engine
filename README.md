@@ -1,12 +1,21 @@
 # Platinum Engine
 
-A Rust command-line audio processor targeting the behavior of Platinum Notes 10. It implements a headless processing and file-workflow engine rather than a graphical clone or a generic loudness-normalization substitute. Platinum Engine is not affiliated with the vendor.
+A Rust command-line audio processor that reproduces Platinum Notes 10.5 processing and file workflows, writing byte-identical output files in every verified reference case. It is a headless engine, not a graphical clone or a generic loudness normalizer. Platinum Engine is not affiliated with the vendor.
 
 ## Current state
 
-**Multiple bounded generated-fixture cases match complete files; all-input parity is not established.** The original Official/WAV checkpoint matched two Platinum Notes 10.5.0.1256 exports and Rust debug/release outputs in all 3,076,786 bytes, SHA-256 `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`. Later captures cover additional pitch, dynamics, format and metadata branches. No audio, container, timestamp or marker normalization counts as acceptance.
+**Byte-identical to Platinum Notes 10.5.0.1256 in more than 100 verified reference cases.** For generated inputs, the final release reproduces the original app's complete output files, including audio, container fields, tags, artwork and processing markers, with no normalization. Verified coverage includes:
 
-The CLI implements the three-pass pipeline, templates, settings, codecs, metadata and backup/restore workflows. Other templates, settings, rates, formats and process contexts remain open. The runtime uses Rust DSP, macOS system frameworks and separately built public libraries; it does not call the original application or its proprietary components. Those components are used only for optional reference comparisons, not ordinary operation.
+- all three built-in templates and custom templates;
+- pitch correction in both modes and directions, warmth, expansion, compression and their gates;
+- WAV, AIFF, FLAC, ALAC, MP3 (CBR and VBR) and AAC output;
+- mono, stereo and six-channel inputs from 22.05 to 96 kHz;
+- silence, short, long and odd-length signals, and metadata;
+- folder, mirror and same-folder output, cancellation, error, and replacement/restore workflows.
+
+Nine representative format and feature families also pass a strict review of the original app's full runtime context. The first pinned case, Official/WAV, matched in all 3,076,786 bytes (SHA-256 `06dbf2b016bf3389aa997ce7dd9816a663d226bde5d38e2b4cb62c3abb0d0c1b`).
+
+A finite test set cannot prove identical output for every possible input or setting. [VERIFICATION.md](docs/VERIFICATION.md) lists exactly what was compared and the known limits. The runtime uses Rust DSP, macOS system frameworks and separately built public libraries; it does not call the original application or its proprietary components, which are used only for optional reference comparisons.
 
 ### Measured progress
 
@@ -16,7 +25,7 @@ The CLI implements the three-pass pipeline, templates, settings, codecs, metadat
 | Wrapper phase correction | 40 generated native cases matched coefficients, samples, latency and state transitions in debug and release builds. |
 | Shipped multiband graphs | All four graphs match captured phase-off output/intermediates and long phase-enabled output, including current-template controls and native shared-buffer warmup. |
 | Limiter | All 112,384 sample words in the captured 56,192-frame stereo impulse/tail case match after replaying the observed host defaults. |
-| Pitch correction | Four original AU audio captures and controlled aligned-0/offset-48 scheduler checkpoints match in both tested modes. Offset-48 is test-only; the GUI's active allocation context remains unverified. |
+| Pitch correction | Four original AU audio captures and controlled scheduler checkpoints match in both modes, and every pitch-active native export matches the FFT alignment profile the CLI uses. |
 | Analysis | Original tuning, sinc-table, partitioned-resampler and harmonic-removal leaves pass. The whitening boundary has a regular synthetic native-golden regression; restoring the old boundary makes it fail. The original-app tuning and pinned complete-file comparisons pass. |
 | Rust test runs | The final private snapshot passed 317 regular tests, with 92 opt-in tests ignored. Separately, 20 public-library integration tests, the Xing caller-byte oracle and three native waveform-reducer capture cases passed. Counts overlap and do not establish universal parity. |
 | Codecs and tags | Public FLAC/LAME paths and all 38 original metadata/container cases have bounded matches. The lower-level original and Rust Ogg decoders matched 96 generated cases. An interleaved AAC fixture varied across fresh native processes, while original and direct system reads matched within each sampled process. |
