@@ -32,7 +32,37 @@ jobs:
           rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
           cargo build --locked --release
           cargo test --locked --no-run --all-targets
-          cargo test --locked --all-targets --features portable --no-fail-fast
+          # These live Accelerate/libSystem comparisons run on the M4 reference
+          # Mac in the release battery. Guard the substring skips against
+          # excluding any unrelated target's tests.
+          cargo test --locked --all-targets --features portable -- --list > "$RUNNER_TEMP/all-tests.txt"
+          cargo test --locked --test portable_math --features portable -- --list > "$RUNNER_TEMP/math-tests.txt"
+          cargo test --locked --test portable_vdsp --features portable -- --list > "$RUNNER_TEMP/vdsp-tests.txt"
+          cargo test --locked --test portable_vforce --features portable -- --list > "$RUNNER_TEMP/vforce-tests.txt"
+          python3 - "$RUNNER_TEMP/all-tests.txt" "$RUNNER_TEMP/math-tests.txt" "$RUNNER_TEMP/vdsp-tests.txt" "$RUNNER_TEMP/vforce-tests.txt" <<'PY'
+          from collections import Counter
+          import sys
+
+          def names(path):
+              with open(path, encoding="utf-8") as source:
+                  for line in source:
+                      name, separator, kind = line.rstrip("\n").rpartition(": ")
+                      if separator and kind in {"test", "benchmark"}:
+                          yield name
+
+          patterns = ("mac_reference::", "system::")
+          actual = Counter(name for name in names(sys.argv[1]) if any(p in name for p in patterns))
+          expected = Counter(
+              name
+              for path, prefix in zip(sys.argv[2:], ("mac_reference::", "system::", "system::"))
+              for name in names(path)
+              if name.startswith(prefix)
+          )
+          if not expected or actual != expected:
+              raise SystemExit(f"unexpected CI skip matches: extra={actual - expected}, missing={expected - actual}")
+          print(f"CI excludes {sum(expected.values())} M4 reference-platform test names")
+          PY
+          cargo test --locked --all-targets --features portable --no-fail-fast -- --skip mac_reference:: --skip system::
 
   linux:
     name: Linux ${{ matrix.uname }}

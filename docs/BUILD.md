@@ -34,16 +34,17 @@ On the recorded M4 reference Mac, the release battery runs the default-mode
 native-value tests. Their exact expected values can differ on another Mac or
 macOS version because the default build uses that system's libraries. CI
 builds the default release and compiles those tests, then runs the portable
-all-target tests against the recorded M4 implementation:
+all-target tests with the live-system reference modules excluded:
 
 ```sh
 cargo build --locked --release
 cargo test --locked --no-run --all-targets
-cargo test --locked --all-targets --features portable --no-fail-fast
+cargo test --locked --all-targets --features portable --no-fail-fast -- --skip mac_reference:: --skip system::
 ```
 
-See [VERIFICATION.md](VERIFICATION.md#macos-reference-tests-and-ci) for the
-reference and coverage boundaries.
+CI first checks that these substring filters match only the intended reference
+modules. See [VERIFICATION.md](VERIFICATION.md#macos-reference-tests-and-ci)
+for the reference and coverage boundaries.
 
 ## Required: TagLib 1.11.1 and ABI-5 bridge v07
 

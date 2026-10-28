@@ -11,11 +11,14 @@ release can produce different bits without a build failure. The release battery
 runs those default-mode reference tests on the reference Mac.
 
 GitHub's macOS CI builds the default release and compiles its all-target tests
-without running them. It then runs the all-target suite with the `portable`
-feature and `--no-fail-fast`; the portable math and vector implementations
-model the recorded M4 reference rather than dispatching to the CI host's
-Accelerate or math routines. This distinction does not turn finite test coverage
-into a universal cross-platform parity guarantee.
+without running them. It then runs the `portable` all-target suite with
+`--no-fail-fast`, excluding the `portable_math` `mac_reference::` module and
+the `portable_vdsp` and `portable_vforce` `system::` modules, which compare
+against the live host's math or Accelerate libraries. CI inventories test
+names first and fails if those filters would exclude unrelated tests. These
+reference-platform comparisons run on the M4 Mac in the release battery.
+The portable math and vector implementations model the recorded M4 reference;
+finite test coverage does not establish universal cross-platform parity.
 
 ## v0.1.0 source freeze
 
