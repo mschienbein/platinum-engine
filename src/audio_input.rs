@@ -32,10 +32,15 @@ const CONVERTER_FRAMES: usize = 4096;
 /// No library is loaded for non-FLAC inputs. Supply a trusted open-source
 /// libFLAC 1.4.2 path and the expected full-file SHA-256. A pin does not prove
 /// source provenance; the caller is responsible for trusting the actual build.
+///
+/// `allow_non_identical` lets Linux and `portable` builds decode MP3 with the
+/// open-source decoder instead of refusing it. It is ignored by macOS default
+/// builds, which always use AudioToolbox.
 #[derive(Clone, Debug, Default)]
 pub struct InputLibraries {
     pub flac: Option<PathBuf>,
     pub flac_sha256: Option<String>,
+    pub allow_non_identical: bool,
 }
 
 #[derive(Debug)]
@@ -99,7 +104,23 @@ impl AudioReader {
             let digest = libraries.flac_sha256.as_deref().ok_or(AudioInputError::MissingFlacDigest)?;
             Ok(Self::Flac(FlacReader::open(path, lib, digest)?))
         } else {
-            Ok(Self::Apple(apple_codec::Reader::open(path, processing_rate)?))
+            #[cfg(any(target_os = "linux", feature = "portable"))]
+            let reader = apple_codec::Reader::open_with(path, processing_rate,
+                apple_codec::ReaderOptions { non_identical_mp3: libraries.allow_non_identical })?;
+            #[cfg(not(any(target_os = "linux", feature = "portable")))]
+            let reader = apple_codec::Reader::open(path, processing_rate)?;
+            Ok(Self::Apple(reader))
+        }
+    }
+    /// Whether a path that is not proven byte-identical to the macOS reference
+    /// (the open-source MP3 decoder) produces this reader's samples.
+    pub fn non_identical(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "linux", feature = "portable"))]
+            Self::Apple(r) => r.non_identical(),
+            #[cfg(not(any(target_os = "linux", feature = "portable")))]
+            Self::Apple(_) => false,
+            Self::Flac(_) => false,
         }
     }
     pub fn source_format(&self) -> StreamDescription {

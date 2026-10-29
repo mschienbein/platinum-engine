@@ -331,6 +331,30 @@ test('typed reference values are independently compared to candidate processing 
   assert.ok(run.report.flags.some(flag => flag.includes('processing settings differ')));
 });
 
+test('v0.2.0 default parity members of the effective configuration are accepted and nothing else is', async t => {
+  const note = "no effect in this macOS default build: Apple's decoder and image pipeline are always used, so this setting is stored but ignored";
+  const withMembers = x => Object.assign(x.values.r.details.effective_config, { parity: { allow_non_identical: false }, parity_effect: { effective: false, note } });
+  await t.test('default members are accepted', t => {
+    const x = makeCase(t); withMembers(x); x.save('r');
+    const run = x.compare('candidate', x.review);
+    assert.equal(run.result.status, 0, run.result.stderr); assert.equal(run.report.status, 'reviewed-complete-file-match-for-this-case');
+  });
+  const rejected = [
+    ['opt-in enabled', config => { config.parity.allow_non_identical = true; }],
+    ['effect claimed', config => { config.parity_effect.effective = true; }],
+    ['unknown parity member', config => { config.parity.extra = 1; }],
+    ['unknown effect member', config => { config.parity_effect.extra = 1; }],
+    ['missing effect note', config => { delete config.parity_effect.note; }],
+    ['empty effect note', config => { config.parity_effect.note = ''; }],
+    ['unknown configuration member', config => { config.other = 1; }]
+  ];
+  for (const [name, mutate] of rejected) await t.test(name, t => {
+    const x = makeCase(t); withMembers(x); mutate(x.values.r.details.effective_config); x.save('r');
+    const { result, report } = x.compare('candidate', x.review);
+    assert.equal(result.status, 2, result.stderr); assert.ok(report.flags.some(flag => flag.includes('effective configuration is incomplete or invalid')), JSON.stringify(report.flags));
+  });
+});
+
 test('effective floats compare as binary32 while integer settings remain exact', t => {
   const x = makeCase(t);
   let run = x.compare('candidate', x.review); assert.equal(run.result.status, 0, run.result.stderr);

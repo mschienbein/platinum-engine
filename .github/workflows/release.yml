@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published release tag to package (currently v0.1.0)
+        description: Published release tag to package (currently v0.2.0)
         required: true
         type: string
 
@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: platinum-runtime-v0.1.0
+  group: platinum-runtime-v0.2.0
   cancel-in-progress: false
 
 env:
@@ -32,17 +32,17 @@ jobs:
           - arch: amd64
             machine: x86_64
             runner: ubuntu-24.04
-            archive_sha256: c5b3f3ec384cbcc8ceef8589172e2e073833db909ff7bbe029f2d229e9c9d0ea
-            binary_sha256: 1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff
-            bridge_sha256: 27922fdf10e6c7efbb43f8645f74138b82c4598edf0c3f2e2f55410cbaf3714d
+            archive_sha256: afe09e3dab51aacd02e279c93c82698631ff9005855598a8037962c5898c6985
+            binary_sha256: eb62ec42c73f233c94dd1e855655c1cc4548756acab743fe3b37abecf02275d0
+            bridge_sha256: ea86881cb6615d7cf8614dfb285e8670d978de621957b15611b8bd6d5b0e1ad5
             flac_sha256: 9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755
             lame_sha256: cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b
           - arch: arm64
             machine: aarch64
             runner: ubuntu-24.04-arm
-            archive_sha256: b9d861435928a79c05091d61fb28b67f543389bb73bdcebc28a70b0de8ffd36b
-            binary_sha256: 6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e
-            bridge_sha256: 10eb77c1e12d7a12959300da3a1d853fe4907a3c7872bb4f83b12ab255549a9b
+            archive_sha256: bb0c753ec216088a4ca8b9002f153f05192dc66359609fd19152c1bc01f4cf00
+            binary_sha256: 7f2fea4fd1fee5ee265fc63f809c868cea6179f3293ace4faaa1ac69b1e4a56d
+            bridge_sha256: 8708af52d83fc7fdb6a487d72abc90ff4bd9f9b94e313436cc6fb68cc9db2aa0
             flac_sha256: 41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72
             lame_sha256: c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87
     runs-on: ${{ matrix.runner }}
@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
-          test "$RELEASE_TAG" = v0.1.0
+          test "$RELEASE_TAG" = v0.2.0
           test "$(uname -m)" = "$MACHINE"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease \
             | jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and .isDraft == false and .isPrerelease == false'
@@ -82,7 +82,7 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern SHA256SUMS --pattern "$asset" --dir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          printf '%s  %s\n' 20509370f870a410dac648017718a32c192097a78ef66e80e6c30006a611bcd1 SHA256SUMS | sha256sum -c -
+          printf '%s  %s\n' d043b6da14ed916f5fa0d29534a19b01460601ef6dd8fcab10182b05c7e81595 SHA256SUMS | sha256sum -c -
           grep -Fx -- "$ARCHIVE_SHA256  $asset" SHA256SUMS
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$asset" | sha256sum -c -
           tar -xzf "$asset" -C "$RUNNER_TEMP/runtime-context/linux-$ARCH"
@@ -144,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
-          test "$RELEASE_TAG" = v0.1.0
+          test "$RELEASE_TAG" = v0.2.0
           amd=$(cat "$RUNNER_TEMP/amd64/digest.txt")
           arm=$(cat "$RUNNER_TEMP/arm64/digest.txt")
           [[ "$amd" =~ ^sha256:[0-9a-f]{64}$ && "$arm" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -188,7 +188,7 @@ jobs:
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           image="$IMAGE@$MANIFEST_DIGEST"
           docker pull "$image"
-          test "$(docker run --rm "$image" --version)" = 'platinum 0.1.0'
+          test "$(docker run --rm "$image" --version)" = 'platinum 0.2.0'
           python3 - "$RUNNER_TEMP/reference.wav" <<'PY'
           import struct, sys, wave
           with open(sys.argv[1], 'xb') as raw:

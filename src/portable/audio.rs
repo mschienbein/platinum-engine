@@ -10,6 +10,8 @@ pub mod alac;
 pub mod gsm;
 #[path = "audio/mp4.rs"]
 pub mod mp4;
+#[path = "audio/mp3.rs"]
+pub mod mp3;
 
 use std::error::Error;
 use std::fmt;
@@ -762,6 +764,15 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
     Ok(ParsedPcm { source, encoding, data_offset, frames, coefficients })
 }
 
+/// Opt-in switches for decoders whose output is deterministic but not
+/// byte-identical to AudioToolbox. Everything is off by default; `Reader::open`
+/// uses the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderOptions {
+    /// Decode MP3 with the open-source portable decoder instead of refusing.
+    pub non_identical_mp3: bool,
+}
+
 /// Sequential same-rate PCM, ALAC, companded, ADPCM, GSM and float32 CAF reader.
 ///
 /// macOS arm64 comparisons cover WAVE/AIFF integer depths 1..=32 (all 8/16-bit
@@ -791,9 +802,17 @@ pub struct Reader {
     raw: Vec<u8>,
     packets: Option<PacketState>,
     alac: Option<AlacReadState>,
+    non_identical: bool,
+    mp3: Option<Box<Mp3ReadState>>,
 }
 impl Reader {
     pub fn open(path: impl AsRef<Path>, sample_rate: Option<f64>) -> Result<Self, CodecError> {
+        Self::open_with(path, sample_rate, ReaderOptions::default())
+    }
+    /// True when the samples came from a backend that is not byte-identical to
+    /// the AudioToolbox reference (currently only the opt-in MP3 decoder).
+    pub fn non_identical(&self) -> bool { self.non_identical }
+    pub fn open_with(path: impl AsRef<Path>, sample_rate: Option<f64>, options: ReaderOptions) -> Result<Self, CodecError> {
         let path = path.as_ref();
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b"flac") {
@@ -842,7 +861,14 @@ impl Reader {
             let client = client_format(rate, source.channels_per_frame, false)?;
             let frames = info.frames;
             return Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Alac,
-                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)) });
+                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)), non_identical: false, mp3: None });
+        }
+        // `NotMp3` (no confirmed MP3 stream) falls through, so every other input keeps the classification
+        // and error it has without the opt-in.
+        if options.non_identical_mp3 && !is_pcm_container(&header) {
+            if let Some(stream) = open_mp3_stream(path)? {
+                return Self::from_mp3(file, path, stream, sample_rate);
+            }
         }
         let parsed = parse_pcm(&mut file, path, length, &header)?;
         let rate = same_rate(parsed.source.sample_rate, sample_rate)?;
@@ -858,14 +884,16 @@ impl Reader {
             _ => None,
         };
         Ok(Self { file, path: path.to_owned(), source: parsed.source, client, encoding: parsed.encoding,
-            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None })
+            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None, non_identical: false, mp3: None })
     }
     pub fn source_format(&self) -> StreamDescription { self.source }
     pub fn client_format(&self) -> StreamDescription { self.client }
     pub fn file_length_frames(&self) -> Result<i64, CodecError> {
+        if let Some(mp3) = &self.mp3 { return Ok(mp3.stream.info().length_frames); }
         i64::try_from(self.frames).map_err(|_| CodecError::InvalidInput("frame count exceeds i64"))
     }
     pub fn bitrate(&self) -> Result<u32, CodecError> {
+        if let Some(mp3) = &self.mp3 { return Ok(mp3.stream.info().bitrate); }
         if let Some(alac) = &self.alac {
             return alac.bitrate.ok_or(CodecError::InvalidInput("ALAC bitrate exceeds u32"));
         }
@@ -875,7 +903,7 @@ impl Reader {
         Ok(value as u32)
     }
     pub fn set_stereo_planar(&mut self, sample_rate: f64) -> Result<(), CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
+        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
         let rate = same_rate(self.source.sample_rate, Some(sample_rate))?;
         self.client = client_format(rate, 2, true)?;
         Ok(())
@@ -960,12 +988,13 @@ impl Reader {
     }
     /// Read complete interleaved frames; the unused output tail is untouched.
     pub fn read(&mut self, output: &mut [f32]) -> Result<usize, CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
+        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 != 0 { return Err(CodecError::InvalidInput("use read_stereo_planar for a planar reader")); }
         let channels = self.source.channels_per_frame as usize;
         if output.len() % channels != 0 { return Err(CodecError::InvalidInput("buffer does not contain whole interleaved frames")); }
         if output.len().checked_mul(4).is_none_or(|n| n > u32::MAX as usize) { return Err(CodecError::InvalidInput("buffer is too large")); }
         if self.alac.is_some() { return self.read_alac(output, None); }
+        if self.mp3.is_some() { return self.read_mp3(output, None); }
         if self.packets.is_some() { return self.read_packets(output, None); }
         let frames = self.fetch(output.len() / channels)?;
         let width = self.encoding.width();
@@ -977,11 +1006,12 @@ impl Reader {
     /// Read stereo planes, duplicating mono. PCM uses the first two channels;
     /// ALAC follows the verified default layout's left/right channel positions.
     pub fn read_stereo_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize, CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
+        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 == 0 { return Err(CodecError::InvalidInput("reader is not configured for planar stereo")); }
         if left.len() != right.len() { return Err(CodecError::InvalidInput("stereo plane lengths differ")); }
         if left.len().checked_mul(4).is_none_or(|n| n > u32::MAX as usize) { return Err(CodecError::InvalidInput("stereo plane is too large")); }
         if self.alac.is_some() { return self.read_alac(left, Some(right)); }
+        if self.mp3.is_some() { return self.read_mp3(left, Some(right)); }
         if self.packets.is_some() { return self.read_packets(left, Some(right)); }
         let frames = self.fetch(left.len())?;
         let width = self.encoding.width();
@@ -993,6 +1023,87 @@ impl Reader {
         Ok(frames)
     }
     pub fn close(self) -> Result<(), CodecError> { Ok(()) }
+}
+
+/// State of the opt-in MP3 backend (see `audio/mp3.rs`).
+struct Mp3ReadState {
+    stream: mp3::Mp3Stream,
+    failed: bool,
+}
+
+/// WAVE, AIFF/AIFC and CAF inputs are never probed as MP3.
+fn is_pcm_container(header: &[u8; 12]) -> bool {
+    (&header[..4] == b"RIFF" && &header[8..12] == b"WAVE")
+        || (&header[..4] == b"FORM" && matches!(&header[8..12], b"AIFF" | b"AIFC"))
+        || &header[..4] == b"caff"
+}
+
+fn mp3_error(path: &Path, error: mp3::Mp3Error) -> CodecError {
+    match error {
+        mp3::Mp3Error::NotMp3 => CodecError::UnsupportedFormat("data is not an MP3 stream"),
+        mp3::Mp3Error::Unsupported(reason) => CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason },
+        mp3::Mp3Error::Corrupt(message) => CodecError::InvalidInput(message),
+        mp3::Mp3Error::Io(operation, source) => io_error(operation, path, source),
+    }
+}
+
+/// Probe `path` with a fresh handle; `None` means it is not an MP3 stream.
+fn open_mp3_stream(path: &Path) -> Result<Option<mp3::Mp3Stream>, CodecError> {
+    let file = File::open(path).map_err(|e| io_error("open input", path, e))?;
+    match mp3::Mp3Stream::open(file) {
+        Ok(stream) => Ok(Some(stream)),
+        Err(mp3::Mp3Error::NotMp3) => Ok(None),
+        Err(error) => Err(mp3_error(path, error)),
+    }
+}
+
+impl Reader {
+    /// A reader over the portable MP3 decoder; its source description is the
+    /// one AudioToolbox reports for MP3 files.
+    fn from_mp3(file: File, path: &Path, stream: mp3::Mp3Stream, sample_rate: Option<f64>) -> Result<Self, CodecError> {
+        let info = stream.info();
+        let source = StreamDescription { sample_rate: f64::from(info.sample_rate), format_id: u32::from_be_bytes(*b".mp3"),
+            format_flags: 0, bytes_per_packet: 0, frames_per_packet: info.frames_per_packet, bytes_per_frame: 0,
+            channels_per_frame: info.channels, bits_per_channel: 0, reserved: 0 };
+        let rate = same_rate(source.sample_rate, sample_rate)?;
+        let client = client_format(rate, info.channels, false)?;
+        Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Float32 { big_endian: false },
+            frames: info.length_frames.max(0) as u64, position: 0, raw: Vec::new(), packets: None, alac: None,
+            non_identical: true, mp3: Some(Box::new(Mp3ReadState { stream, failed: false })) })
+    }
+    /// Interleaved (source channels) or planar read; AudioToolbox's MP3 path
+    /// delivers the same 16-bit-grid samples for both.
+    fn read_mp3(&mut self, output: &mut [f32], right: Option<&mut [f32]>) -> Result<usize, CodecError> {
+        let channels = self.source.channels_per_frame as usize;
+        let state = self.mp3.as_mut().expect("MP3 state");
+        let result = match right {
+            Some(right) => state.stream.read_planar(output, right),
+            None => {
+                let frames = output.len() / channels;
+                let mut left = [0.0f32; 1152];
+                let mut other = [0.0f32; 1152];
+                let mut done = 0usize;
+                let mut outcome = Ok(());
+                while done < frames {
+                    let want = (frames - done).min(1152);
+                    match state.stream.read_planar(&mut left[..want], &mut other[..want]) {
+                        Ok(0) => break,
+                        Ok(got) => {
+                            for i in 0..got {
+                                if channels == 1 { output[done + i] = left[i]; }
+                                else { output[(done + i) * 2] = left[i]; output[(done + i) * 2 + 1] = other[i]; }
+                            }
+                            done += got;
+                            if got < want { break; }
+                        }
+                        Err(error) => { outcome = Err(error); break; }
+                    }
+                }
+                outcome.map(|()| done)
+            }
+        };
+        result.map_err(|error| { state.failed = true; mp3_error(&self.path, error) })
+    }
 }
 
 #[cfg(test)]

@@ -2,6 +2,15 @@
 
 A Rust command-line audio processor that reproduces Platinum Notes 10.5 processing and file workflows, writing byte-identical output files in every verified reference case. It is a headless engine, not a graphical clone or a generic loudness normalizer. Platinum Engine is not affiliated with the vendor.
 
+## What changed in v0.2.0
+
+- **Opt-in MP3 input and cover art on Linux.** `platinum --state-dir DIR config set parity.allow_non_identical true` (default `false`) makes Linux decode MP3 input with an open-source, deterministic decoder and copy embedded cover art unchanged. The command line is unchanged. Items that use these paths list them in `report.non_identical_paths`; their output is not guaranteed byte-identical to macOS. Without the setting Linux behaves as in v0.1.0; on macOS the setting has no effect and `config show` says so. AAC input and output stay refused on Linux.
+- **Error codes.** Every failed item, batch error and top-level error now carries a stable machine-readable `code` (for example `unsupported_input_codec`, `unsupported_sample_rate_conversion`, `artwork_conversion_unavailable`) next to `stage` and `message`. The full table is in the [CLI contract](research/CLI_CONTRACT.md#error-codes).
+- Everything else is unchanged: the command line, exit statuses (0/1/2/130), the existing per-file JSON (additive members only), no-clobber and atomic publication.
+- **Evidence.** The v0.2.0 macOS release build (`75c2ac87…`) passed 512 regular tests (0 failed, 190 ignored), 71/71 retained replay cases, 8/8 dynamics/pitch cases, 10/10 MP4 exports and 11/11 strict family cases, and its default behavior matches v0.1.0 on 212 comparison records. Each Linux architecture matched the macOS reference exactly in 104 of 132 native cases (25 typed refusals, 3 matching native errors), 535 of 575 stress cases (40 sample-rate refusals) and 30 of 30 pitch cases, with every output hash identical to v0.1.0; with the opt-in on, aarch64 and x86_64 agree on 160/160 MP3, 157/157 cover-art and 165/165 error-code scenarios. Details, limits and known differences are in [VERIFICATION.md](docs/VERIFICATION.md#v020-release-evidence).
+
+The sections below describe the v0.1.0 evidence; v0.2.0's evidence is listed separately in [VERIFICATION.md](docs/VERIFICATION.md).
+
 ## v0.1.0 at a glance
 
 Platinum Engine supports **macOS arm64**, the reference platform, and Linux
@@ -46,7 +55,7 @@ A finite test set cannot prove identical output for every possible input, settin
 | Earlier final-binary files | Release `dd4b5fd0…` matched both native references in nine full-context family captures, eight dynamics/pitch cases, 71 selected cases, all ten controlled-second MP4 exports, the Xing E05 case and 15 dynamics/pitch-gate cases. These sets overlap and are historical, not a claim about a later binary. |
 | File safety | Review corrections passed: retained preflight identities, metadata/resource-fork/ACL-preserving backups, collision reservations, decoder-independent restore, native nil markers, synchronized cancellation/publication, identity- and digest-checked `--overwrite` swaps that retain rollback files, and backup consumption only after a synced, verified restore. Real CLI SIGINT exited 130 without publishing; replacement/restore preserved generated source bytes and metadata. |
 
-**Known limits:** Pitch correction uses the observed aligned-0 FFT profile; the original GUI's literal allocation context was not observed. AudioToolbox AAC decoding can depend on stack context and original process; AAC and ALAC MP4 headers also contain the export second. Linux refuses MP3/AAC input decoding, AAC encoding, unreproduced sample-rate conversion (including non-44.1 kHz waveforms), artwork transcoding, unverified codec/container variants and ALAC native-loss cases. Linux aarch64 is the stricter cross-platform target. On x86_64, ordinary operations can retain a minimum normal result where ARM flushes before rounding; invalid-operation NaN signs and NaN payload selection, including vectorized FMA operand order, can also differ. These are known residual classes, not a promise that every affected input is detected and refused. Other Apple Silicon generations or OS versions may dispatch Accelerate differently or change AudioToolbox behavior. See [Linux](docs/LINUX.md) and [verification](docs/VERIFICATION.md) for precise scope.
+**Known limits:** Pitch correction uses the observed aligned-0 FFT profile; the original GUI's literal allocation context was not observed. AudioToolbox AAC decoding can depend on stack context and original process; AAC and ALAC MP4 headers also contain the export second. By default Linux refuses MP3/AAC input decoding, AAC encoding, unreproduced sample-rate conversion (including non-44.1 kHz waveforms), artwork transcoding, unverified codec/container variants and ALAC native-loss cases; the explicit opt-in `parity.allow_non_identical` replaces only the MP3-input and artwork refusals with paths that are **not** claimed identical to macOS, and AAC stays refused. Linux aarch64 is the stricter cross-platform target. On x86_64, ordinary operations can retain a minimum normal result where ARM flushes before rounding; invalid-operation NaN signs and NaN payload selection, including vectorized FMA operand order, can also differ. These are known residual classes, not a promise that every affected input is detected and refused. Other Apple Silicon generations or OS versions may dispatch Accelerate differently or change AudioToolbox behavior. See [Linux](docs/LINUX.md) and [verification](docs/VERIFICATION.md) for precise scope.
 
 **Marker limitation:** Duplicate AIFF ID3 chunks are refused, but source
 review found that deliberately conflicting markers inside a single ID3 tag,
@@ -68,12 +77,12 @@ required to run the CLI.
 
 ## Install and run
 
-Release archives are named `platinum-engine-v0.1.0-macos-arm64.tar.gz`,
-`platinum-engine-v0.1.0-linux-arm64.tar.gz`, and
-`platinum-engine-v0.1.0-linux-amd64.tar.gz`. Obtain the appropriate archive and
+Release archives are named `platinum-engine-v0.2.0-macos-arm64.tar.gz`,
+`platinum-engine-v0.2.0-linux-arm64.tar.gz`, and
+`platinum-engine-v0.2.0-linux-amd64.tar.gz`. Obtain the appropriate archive and
 the accompanying `SHA256SUMS` from the
-[GitHub Releases page](https://github.com/mschienbein/platinum-engine/releases)
-when published, verify its digest using a trusted release checksum, and unpack
+[GitHub Releases page](https://github.com/mschienbein/platinum-engine/releases),
+verify its digest using a trusted release checksum, and unpack
 it in a new directory. The archive's `README.txt` gives commands to verify its
 internal checksums and explicitly configure its library paths and codec
 digests; it does not configure them automatically. Checksums alone do not
@@ -103,9 +112,9 @@ with archive.open("rb") as file:
 if digest.hexdigest() != matches[0]:
     raise SystemExit("release archive checksum mismatch")
 PY
-  mkdir "$HOME/platinum-engine-v0.1.0"
-  tar -xzf "$ARCHIVE" -C "$HOME/platinum-engine-v0.1.0"
-  cd "$HOME/platinum-engine-v0.1.0"
+  mkdir "$HOME/platinum-engine-v0.2.0"
+  tar -xzf "$ARCHIVE" -C "$HOME/platinum-engine-v0.2.0"
+  cd "$HOME/platinum-engine-v0.2.0"
   if [ "$(uname -s)" = Darwin ]; then shasum -a 256 -c SHA256SUMS
   else sha256sum -c SHA256SUMS; fi
   ./bin/platinum --help
@@ -113,8 +122,38 @@ PY
 )
 ```
 
-The intended multi-architecture container image is
-`ghcr.io/mschienbein/platinum-engine:v0.1.0` when published. The image runs as
+### Opt in to MP3 input and cover art on Linux
+
+A Linux caller that must process MP3 files and keep embedded cover art sets one
+boolean in its state directory, once, after the libraries are configured (the
+archive's `README.txt` shows how); the `process` command line does not change:
+
+```sh
+./bin/platinum --state-dir "$HOME/platinum-state" config set parity.allow_non_identical true
+```
+
+The default is `false`. With it on, MP3 input is decoded by the project's
+open-source decoder and cover art is copied byte for byte; items that took
+either path say so in `report.non_identical_paths`, and their output is **not**
+guaranteed byte-identical to macOS. AAC input and output stay refused on Linux.
+The setting has no effect on the macOS build. Details and limits:
+[LINUX.md](docs/LINUX.md#opt-in-mp3-input-and-cover-art).
+
+### Upgrading from v0.1.0
+
+Unpack v0.2.0 into a new directory next to v0.1.0; do not overwrite it. Library
+configuration lives in the state directory, so after unpacking, point
+`libraries.tag_bridge` at the v0.2.0 bridge (and, if you want the new
+directory to be self-contained, `libraries.flac` and `libraries.lame` at its
+copies). On Linux the v0.2.0 bridge has a new SHA-256 and the v0.1.0 bridge is
+refused by the v0.2.0 CLI, so this step is required there; the libFLAC and LAME
+files are byte-identical to v0.1.0 and keep their SHA-256 pins. Without the
+opt-in, Linux behaves as in v0.1.0; every JSON change is additive (error
+`code` members, `report.non_identical_paths`).
+
+The multi-architecture container image is built by the release workflow from the
+verified Linux archives and published as `ghcr.io/mschienbein/platinum-engine:v0.2.0`
+(also `:latest`). The image runs as
 an unprivileged user, does not auto-configure libraries, and needs durable state
 and deliberately selected input/output mounts. In Docker Desktop on macOS, use
 a container volume or tmpfs for state, and use the libraries already inside

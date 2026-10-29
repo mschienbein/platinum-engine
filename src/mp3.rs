@@ -541,9 +541,27 @@ fn output_frame(word: u32) -> Option<OutputFrame> {
 }
 
 enum OutputTag { Info, Xing }
+
+/// How AudioToolbox classifies the encoder identifier of a Xing/Info tag. The
+/// classification, not the text, decides how the tag is trusted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagEncoder {
+    /// `LAME…`: the delay and padding are trusted without checking the tag CRC.
+    Lame,
+    /// `Lavf…`/`Lavc…`: the delay and padding are trusted only when the tag
+    /// CRC16 verifies, and an `Info` tag still reports its declared frame count.
+    Other,
+    /// The native source-header update erased the identifier. The delay and
+    /// padding are trusted only when the tag CRC16 verifies, but an `Info` tag
+    /// is still extrapolated from its declared byte count like a LAME tag.
+    Erased,
+}
+
 struct OutputGapless {
     kind: OutputTag,
+    encoder: TagEncoder,
     declared_frames: u32,
+    declared_bytes: Option<u32>,
     delay: u32,
     padding: u32,
 }
@@ -559,19 +577,30 @@ fn output_gapless(frame: &[u8], header: OutputFrame) -> Result<Option<OutputGapl
     let flags = read_u32(offset + 4)?;
     if flags & 1 == 0 || flags & !15 != 0 { return Err(invalid()); }
     let declared_frames = read_u32(offset + 8)?;
+    let declared_bytes = if flags & 2 != 0 { Some(read_u32(offset + 12)?) } else { None };
     let lame = offset + 8 + 4 + if flags & 2 != 0 { 4 } else { 0 }
         + if flags & 4 != 0 { 100 } else { 0 } + if flags & 8 != 0 { 4 } else { 0 };
-    let packed = match frame.get(lame..lame + 4).ok_or_else(invalid)? {
-        b"LAME" | b"Lavc" | b"Lavf" => {
-            let bytes = frame.get(lame + 21..lame + 24).ok_or_else(invalid)?;
-            (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2])
-        }
-        // The native source-header update can erase the LAME identifier;
-        // AudioToolbox then reports no encoder delay or padding.
-        [0, 0, 0, 0] => 0,
+    let encoder = match frame.get(lame..lame + 4).ok_or_else(invalid)? {
+        b"LAME" => TagEncoder::Lame,
+        b"Lavc" | b"Lavf" => TagEncoder::Other,
+        [0, 0, 0, 0] => TagEncoder::Erased,
         _ => return Err(invalid()),
     };
-    Ok(Some(OutputGapless { kind, declared_frames, delay: packed >> 12, padding: packed & 0xfff }))
+    let delay_padding = frame.get(lame + 21..lame + 24).ok_or_else(invalid)?;
+    let checksum = frame.get(lame + 34..lame + 36).ok_or_else(invalid)?;
+    // The checksum is CRC-16/ARC from the frame header through the tag's music
+    // length field, stored big-endian. A LAME tag is trusted regardless.
+    let trusted = encoder == TagEncoder::Lame
+        || crc16(&frame[..lame + 34]) == u16::from_be_bytes([checksum[0], checksum[1]]);
+    // An `Info` tag of a LAME or erased identifier has its gapless trim applied
+    // only together with the byte-count extrapolation; with no byte count the
+    // declared frame count stands untrimmed.
+    let extrapolated = matches!(kind, OutputTag::Info) && encoder != TagEncoder::Other;
+    let packed = if trusted && (declared_bytes.is_some() || !extrapolated) {
+        (u32::from(delay_padding[0]) << 16) | (u32::from(delay_padding[1]) << 8) | u32::from(delay_padding[2])
+    } else { 0 };
+    Ok(Some(OutputGapless { kind, encoder, declared_frames, declared_bytes,
+        delay: packed >> 12, padding: packed & 0xfff }))
 }
 
 /// Validate a staged LAME output and reproduce the native report's MP3
@@ -598,7 +627,9 @@ fn inspect_encoded_reader<R: Read + Seek>(file: R, file_len: u64) -> Result<Enco
     input.seek(SeekFrom::Start(start))?;
     let mut offset = start;
     let mut frame_count = 0u64;
-    let mut audio_bytes = 0u64;
+    // Bitrate of the first frame after the tag frame: the one AudioToolbox
+    // extrapolates the stream length from for an `Info` tag.
+    let mut first_audio_bitrate = None;
     let mut first = None;
     let mut gapless = None;
     while offset < file_len {
@@ -613,13 +644,10 @@ fn inspect_encoded_reader<R: Read + Seek>(file: R, file_len: u64) -> Result<Enco
         }
         if let Some(initial) = first {
             let initial: OutputFrame = initial;
-            if header.rate != initial.rate || header.channels != initial.channels || header.samples != initial.samples
-                || matches!(gapless.as_ref().map(|value: &OutputGapless| &value.kind), Some(OutputTag::Info))
-                    && header.bitrate != initial.bitrate {
+            if header.rate != initial.rate || header.channels != initial.channels || header.samples != initial.samples {
                 return Err(Mp3Error::InvalidBuffer("MP3 output changes stream parameters"));
             }
-            audio_bytes = audio_bytes.checked_add(header.size)
-                .ok_or(Mp3Error::InvalidBuffer("MP3 audio length overflow"))?;
+            first_audio_bitrate.get_or_insert(header.bitrate);
             input.seek_relative((header.size - 4) as i64)?;
         } else {
             let size = usize::try_from(header.size).map_err(|_| Mp3Error::InvalidBuffer("MP3 frame too large"))?;
@@ -638,20 +666,26 @@ fn inspect_encoded_reader<R: Read + Seek>(file: R, file_len: u64) -> Result<Enco
         if u64::from(gapless.declared_frames) != frame_count - 1 {
             return Err(Mp3Error::InvalidBuffer("MP3 gapless frame count does not match the file"));
         }
-        let packets = match gapless.kind {
-            OutputTag::Xing => u128::from(gapless.declared_frames),
-            // AudioToolbox estimates duration in binary64 and then converts it
-            // to packets. The operation order matters: an integral packet count
-            // can round slightly upward before the final ceil.
-            OutputTag::Info => {
-                let duration = (audio_bytes as f64 * 8.0) / f64::from(initial.bitrate);
+        let packets = match (&gapless.kind, gapless.encoder, gapless.declared_bytes) {
+            // AudioToolbox reads an `Info` tag as constant bitrate: it never
+            // counts the stream, it extrapolates the duration from the tag's
+            // declared byte count (less the tag frame) and the bitrate of the
+            // first frame after the tag frame. A variable-bitrate stream that
+            // kept `Info` therefore reports a length that follows only that one
+            // frame's bitrate. The binary64 operation order matters: an
+            // integral packet count can round slightly upward before the ceil.
+            (OutputTag::Info, TagEncoder::Lame | TagEncoder::Erased, Some(bytes)) => {
+                let audio_bytes = i128::from(bytes) - i128::from(initial.size);
+                let bitrate = first_audio_bitrate.unwrap_or(initial.bitrate);
+                let duration = (audio_bytes as f64 * 8.0) / f64::from(bitrate);
                 let packets_per_second = f64::from(initial.rate) / f64::from(initial.samples);
-                (duration * packets_per_second).ceil() as u128
+                (duration * packets_per_second).ceil() as i128
             }
+            _ => i128::from(gapless.declared_frames),
         };
-        let samples = packets * u128::from(initial.samples);
-        let trimmed = samples.checked_sub(u128::from(gapless.delay) + u128::from(gapless.padding))
-            .ok_or(Mp3Error::InvalidBuffer("invalid MP3 gapless delay or padding"))?;
+        let samples = packets * i128::from(initial.samples);
+        let trimmed = samples - i128::from(gapless.delay) - i128::from(gapless.padding);
+        if trimmed < 0 { return Err(Mp3Error::InvalidBuffer("MP3 length is negative after gapless trimming")); }
         u64::try_from(trimmed).map_err(|_| Mp3Error::InvalidBuffer("MP3 frame count overflow"))?
     } else {
         frame_count.checked_mul(u64::from(initial.samples))
@@ -1013,6 +1047,7 @@ mod output_inspection_tests {
             bytes[tag..tag + 4].copy_from_slice(b"Info");
             bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
             bytes[tag + 8..tag + 12].copy_from_slice(&3u32.to_be_bytes());
+            bytes[tag + 12..tag + 16].copy_from_slice(&((frame_size * 4) as u32).to_be_bytes());
             let lame = tag + 120;
             bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
             let packed = (576u32 << 12) | 720;
@@ -1039,14 +1074,26 @@ mod output_inspection_tests {
                     assert!(inspect_encoded_reader(io::Cursor::new(&bad_count), bad_count.len() as u64).is_err());
                     let mut erased = bytes.clone();
                     let identifier = usize::from(id3) * 15 + 36 + 120;
+                    // Outside a LAME tag the delay and padding count only when the
+                    // tag's CRC16 verifies, and an Info tag reports its declared
+                    // frame count rather than a byte-based estimate.
                     for name in [b"Lavc", b"Lavf"] {
                         let mut alias = bytes.clone();
                         alias[identifier..identifier + 4].copy_from_slice(name);
-                        assert_eq!(inspect_encoded_reader(io::Cursor::new(&alias), alias.len() as u64).unwrap().frames, 2160);
+                        assert_eq!(inspect_encoded_reader(io::Cursor::new(&alias), alias.len() as u64).unwrap().frames, 3456,
+                            "{name:?}: an unverified tag does not trim");
+                        let crc = crc16(&alias[usize::from(id3) * 15..identifier + 34]);
+                        alias[identifier + 34..identifier + 36].copy_from_slice(&crc.to_be_bytes());
+                        assert_eq!(inspect_encoded_reader(io::Cursor::new(&alias), alias.len() as u64).unwrap().frames, 2160,
+                            "{name:?}: a verified tag trims");
                     }
                     erased[identifier..identifier + 9].fill(0);
                     let parsed = inspect_encoded_reader(io::Cursor::new(&erased), erased.len() as u64).unwrap();
-                    assert_eq!(parsed.frames, 3456, "an erased LAME identifier disables gapless trimming");
+                    assert_eq!(parsed.frames, 3456, "an erased identifier without a verified CRC does not trim");
+                    let crc = crc16(&erased[usize::from(id3) * 15..identifier + 34]);
+                    erased[identifier + 34..identifier + 36].copy_from_slice(&crc.to_be_bytes());
+                    let parsed = inspect_encoded_reader(io::Cursor::new(&erased), erased.len() as u64).unwrap();
+                    assert_eq!(parsed.frames, 2160, "an erased identifier with a verified CRC trims");
                 }
             }
         }
@@ -1067,6 +1114,8 @@ mod output_inspection_tests {
         bytes[tag..tag + 4].copy_from_slice(b"Info");
         bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
         bytes[tag + 8..tag + 12].copy_from_slice(&10u32.to_be_bytes());
+        let stream_bytes = bytes.len() as u32;
+        bytes[tag + 12..tag + 16].copy_from_slice(&stream_bytes.to_be_bytes());
         let lame = tag + 120;
         bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
         let packed = (576u32 << 12) | 1088;
@@ -1090,6 +1139,8 @@ mod output_inspection_tests {
             bytes[tag..tag + 4].copy_from_slice(b"Info");
             bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
             bytes[tag + 8..tag + 12].copy_from_slice(&declared.to_be_bytes());
+            let stream_bytes = bytes.len() as u32;
+            bytes[tag + 12..tag + 16].copy_from_slice(&stream_bytes.to_be_bytes());
             let lame = tag + 120;
             bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
             let packed = (576u32 << 12) | 832;
@@ -1098,6 +1149,142 @@ mod output_inspection_tests {
             assert_eq!(parsed, EncodedMp3Info { sample_rate: 32_000, channels: 1,
                 frames_per_packet: 1152, frames: estimated * 1152 - 576 - 832 });
         }
+    }
+
+    /// A zero-bodied stream laid out like the engine's output: a LAME-style tag
+    /// frame (`tag_word`, tag at `4 + side`) followed by one frame per word in
+    /// `audio`. AudioToolbox and the inspector read only frame headers and the
+    /// tag. The tag declares one packet per audio frame, 576 samples of delay and
+    /// 1000 of padding; its CRC16 verifies only when `crc_valid`.
+    fn tagged_stream(tag_word: u32, side: usize, audio: &[u32], marker: &[u8; 4], ident: [u8; 4], crc_valid: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in std::iter::once(&tag_word).chain(audio) {
+            let start = bytes.len();
+            bytes.resize(start + frame_size(*word), 0);
+            bytes[start..start + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        let tag = 4 + side;
+        bytes[tag..tag + 4].copy_from_slice(marker);
+        bytes[tag + 4..tag + 8].copy_from_slice(&15u32.to_be_bytes());
+        bytes[tag + 8..tag + 12].copy_from_slice(&(audio.len() as u32).to_be_bytes());
+        let stream_bytes = bytes.len() as u32;
+        bytes[tag + 12..tag + 16].copy_from_slice(&stream_bytes.to_be_bytes());
+        let lame = tag + 120;
+        bytes[lame..lame + 4].copy_from_slice(&ident);
+        let packed = (576u32 << 12) | 1000;
+        bytes[lame + 21..lame + 24].copy_from_slice(&packed.to_be_bytes()[1..]);
+        let crc = crc16(&bytes[..lame + 34]);
+        bytes[lame + 34..lame + 36].copy_from_slice(&(if crc_valid { crc } else { !crc }).to_be_bytes());
+        bytes
+    }
+
+    /// MPEG-1 Layer III 44.1 kHz joint stereo: a 128 kbps tag frame, then audio
+    /// frames from this bitrate-index ladder (192, 320, 64, … kbps) with the
+    /// padding bit set on every odd frame.
+    fn vbr_44k_stereo(marker: &[u8; 4], ident: [u8; 4], crc_valid: bool) -> Vec<u8> {
+        const LADDER: [u32; 20] = [11, 14, 5, 13, 9, 7, 12, 10, 14, 5, 9, 11, 13, 7, 10, 12, 9, 14, 5, 11];
+        let audio: Vec<u32> = LADDER.iter().enumerate()
+            .map(|(index, &step)| 0xfffb_0040 | (step << 12) | (((index as u32) & 1) << 9)).collect();
+        tagged_stream(0xfffb_9040, 32, &audio, marker, ident, crc_valid)
+    }
+
+    /// MPEG-2 Layer III 22.05 kHz mono: a 64 kbps tag frame, then audio frames
+    /// from this ladder (96, 160, 8, … kbps), padding on every odd frame.
+    fn vbr_22k_mono(marker: &[u8; 4], ident: [u8; 4], crc_valid: bool) -> Vec<u8> {
+        const LADDER: [u32; 20] = [10, 14, 1, 12, 8, 11, 4, 13, 14, 5, 9, 10, 7, 12, 3, 14, 6, 11, 8, 10];
+        let audio: Vec<u32> = LADDER.iter().enumerate()
+            .map(|(index, &step)| 0xfff3_00c4 | (step << 12) | (((index as u32) & 1) << 9)).collect();
+        tagged_stream(0xfff3_80c4, 9, &audio, marker, ident, crc_valid)
+    }
+
+    fn inspected_frames(bytes: &[u8]) -> u64 {
+        inspect_encoded_reader(io::Cursor::new(bytes), bytes.len() as u64).unwrap().frames
+    }
+
+    // Lengths AudioToolbox reports for the streams above, observed with the
+    // macOS default build's reader for every (marker, identifier, CRC) cell:
+    // (`Info`?, identifier, CRC verifies?, frames). The delay and padding are 576
+    // and 1000 samples and the tag declares 20 packets. Only an `Info` tag of a
+    // LAME or erased identifier is extrapolated from the first audio frame's
+    // bitrate; everything else reports the declared packets, trimmed when the
+    // identifier is LAME or the CRC verifies.
+    const VBR_44K: [(bool, [u8; 4], bool, u64); 16] = [
+        (true, *b"LAME", true, 20_312), (true, *b"LAME", false, 20_312),
+        (true, *b"Lavf", true, 21_464), (true, *b"Lavf", false, 23_040),
+        (true, *b"Lavc", true, 21_464), (true, *b"Lavc", false, 23_040),
+        (true, [0; 4], true, 20_312), (true, [0; 4], false, 21_888),
+        (false, *b"LAME", true, 21_464), (false, *b"LAME", false, 21_464),
+        (false, *b"Lavf", true, 21_464), (false, *b"Lavf", false, 23_040),
+        (false, *b"Lavc", true, 21_464), (false, *b"Lavc", false, 23_040),
+        (false, [0; 4], true, 21_464), (false, [0; 4], false, 23_040),
+    ];
+    const VBR_22K: [(bool, [u8; 4], bool, u64); 16] = [
+        (true, *b"LAME", true, 9_368), (true, *b"LAME", false, 9_368),
+        (true, *b"Lavf", true, 9_944), (true, *b"Lavf", false, 11_520),
+        (true, *b"Lavc", true, 9_944), (true, *b"Lavc", false, 11_520),
+        (true, [0; 4], true, 9_368), (true, [0; 4], false, 10_944),
+        (false, *b"LAME", true, 9_944), (false, *b"LAME", false, 9_944),
+        (false, *b"Lavf", true, 9_944), (false, *b"Lavf", false, 11_520),
+        (false, *b"Lavc", true, 9_944), (false, *b"Lavc", false, 11_520),
+        (false, [0; 4], true, 9_944), (false, [0; 4], false, 11_520),
+    ];
+
+    #[test]
+    fn info_tagged_variable_bitrate_streams_match_native_lengths() {
+        for (build, table, rate, channels, spp) in [
+            (vbr_44k_stereo as fn(&[u8; 4], [u8; 4], bool) -> Vec<u8>, &VBR_44K, 44_100, 2, 1152),
+            (vbr_22k_mono, &VBR_22K, 22_050, 1, 576),
+        ] {
+            for &(info, ident, crc_valid, frames) in table {
+                let bytes = build(if info { b"Info" } else { b"Xing" }, ident, crc_valid);
+                let parsed = inspect_encoded_reader(io::Cursor::new(&bytes), bytes.len() as u64)
+                    .unwrap_or_else(|e| panic!("info={info} {ident:?} crc={crc_valid}: {e}"));
+                assert_eq!(parsed, EncodedMp3Info { sample_rate: rate, channels, frames_per_packet: spp, frames },
+                    "info={info} {ident:?} crc={crc_valid}");
+            }
+        }
+    }
+
+    #[test]
+    fn variable_bitrate_info_extrapolates_from_the_first_audio_frame_not_the_tag_frame() {
+        // The stream's first audio frame is 192 kbps; the tag frame is 128 kbps
+        // and the 20 audio frames average about 160 kbps. Only the first audio
+        // frame's bitrate reproduces AudioToolbox's estimate.
+        let bytes = vbr_44k_stereo(b"Info", *b"LAME", true);
+        let audio_bytes: u64 = bytes.len() as u64 - frame_size(0xfffb_9040) as u64;
+        let estimate = |kbps: f64| ((audio_bytes as f64 * 8.0) / (kbps * 1000.0) * (44_100.0 / 1152.0)).ceil() as u64;
+        let frames = inspected_frames(&bytes);
+        assert_eq!(frames, estimate(192.0) * 1152 - 576 - 1000);
+        assert_ne!(estimate(128.0), estimate(192.0));
+    }
+
+    #[test]
+    fn info_extrapolation_follows_the_declared_byte_count_not_the_stream() {
+        // Observed lengths for the 44.1 kHz LAME `Info` stream above after
+        // rewriting the tag's declared byte count (offset 36 + 12).
+        let bytes = vbr_44k_stereo(b"Info", *b"LAME", true);
+        let length = bytes.len() as u32;
+        for (declared, frames) in [(length, 20_312), (length * 2, 42_200), (length / 2, 8_792), (length + 1000, 22_616)] {
+            let mut patched = bytes.clone();
+            patched[48..52].copy_from_slice(&declared.to_be_bytes());
+            assert_eq!(inspected_frames(&patched), frames, "declared bytes {declared}");
+        }
+        // A byte count below the tag frame extrapolates a negative length.
+        let mut empty = bytes.clone();
+        empty[48..52].copy_from_slice(&0u32.to_be_bytes());
+        assert!(inspect_encoded_reader(io::Cursor::new(&empty), empty.len() as u64).is_err());
+
+        // Without the byte-count field the declared packet count stands and no
+        // delay or padding is trimmed, even for a LAME tag.
+        let tag = 36;
+        let lame = tag + 120;
+        let mut no_bytes = bytes.clone();
+        no_bytes.copy_within(tag + 16..lame + 36, tag + 12);
+        no_bytes[lame + 32..lame + 36].fill(0);
+        no_bytes[tag + 4..tag + 8].copy_from_slice(&13u32.to_be_bytes());
+        let crc = crc16(&no_bytes[..lame - 4 + 34]);
+        no_bytes[lame - 4 + 34..lame - 4 + 36].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(inspected_frames(&no_bytes), 20 * 1152);
     }
 
     #[cfg(all(target_os = "macos", not(feature = "portable")))]

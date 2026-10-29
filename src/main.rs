@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use platinum_engine::error_code::ErrorCode;
 use platinum_engine::engine::{self, EngineError};
 use platinum_engine::file_workflow::{self, AudioFormat, Cancellation, DiscoveredFile, OutputMode, RestoreStatus, SourceType, WorkflowError};
 use platinum_engine::settings::{LoadedSettings, SelectedTemplate, Settings, SettingsError, SettingsStore, TemplateRef};
@@ -220,14 +221,17 @@ enum StatisticsCommand {
 }
 
 #[derive(Debug)]
-struct AppError { kind: &'static str, message: String, publication: Option<&'static str>, cleanup: Option<Value> }
+struct AppError { kind: &'static str, code: ErrorCode, message: String, publication: Option<&'static str>, cleanup: Option<Value> }
 impl AppError {
-    fn usage(message: impl Into<String>) -> Self { Self { kind: "usage", message: message.into(), publication: None, cleanup: None } }
-    fn settings(error: impl std::fmt::Display) -> Self { Self { kind: "settings", message: error.to_string(), publication: None, cleanup: None } }
-    fn io(message: impl Into<String>) -> Self { Self { kind: "io", message: message.into(), publication: None, cleanup: None } }
+    fn usage(message: impl Into<String>) -> Self { Self { kind: "usage", code: ErrorCode::Usage, message: message.into(), publication: None, cleanup: None } }
+    fn settings(error: impl std::fmt::Display) -> Self { Self { kind: "settings", code: ErrorCode::SettingsError, message: error.to_string(), publication: None, cleanup: None } }
+    fn io(message: impl Into<String>) -> Self { Self { kind: "io", code: ErrorCode::IoError, message: message.into(), publication: None, cleanup: None } }
+    /// A filesystem-workflow failure outside any one item; its code is the workflow's.
+    fn workflow(error: &WorkflowError) -> Self { Self { kind: "io", code: error.code(), message: error.to_string(), publication: None, cleanup: None } }
     fn statistics(error: StatisticsError) -> Self {
-        Self { kind: if error.is_cancelled() { "cancelled" } else { "statistics" }, cleanup: statistics_cleanup(&error),
-            message: error.to_string(), publication: Some(error.publication_status()) }
+        let cancelled = error.is_cancelled();
+        Self { kind: if cancelled { "cancelled" } else { "statistics" }, code: if cancelled { ErrorCode::Cancelled } else { ErrorCode::StatisticsError },
+            cleanup: statistics_cleanup(&error), message: error.to_string(), publication: Some(error.publication_status()) }
     }
 }
 
@@ -394,12 +398,12 @@ struct ItemResult {
 impl ItemResult {
     fn ok(input: &Path, report: Value) -> Self { Self { input: path_value(input), status: "ok", report: Some(report), error: None, statistics: None } }
     fn failed(input: &Path, error: Value) -> Self { Self { input: path_value(input), status: "failed", report: None, error: Some(error), statistics: None } }
-    fn not_started(input: &Path, message: &str) -> Self {
-        Self { input: path_value(input), status: "not_started", report: None, error: Some(json!({"message": message})), statistics: None }
+    fn not_started(input: &Path, code: ErrorCode, message: &str) -> Self {
+        Self { input: path_value(input), status: "not_started", report: None, error: Some(json!({"code": code, "message": message})), statistics: None }
     }
     fn engine_error(input: &Path, error: EngineError) -> Self {
         Self { input: path_value(input), status: if error.cancelled { "cancelled" } else { "failed" }, report: None,
-            error: Some(json!({"stage": error.stage, "message": error.message, "cancelled": error.cancelled,
+            error: Some(json!({"stage": error.stage, "code": error.code, "message": error.message, "cancelled": error.cancelled,
                 "retained_backup": error.retained_backup.as_deref().map(path_value),
                 "recovery_path": error.recovery_path.as_deref().map(path_value), "partial_publication": error.partial_publication})), statistics: None }
     }
@@ -410,13 +414,18 @@ impl ItemResult {
     }
 }
 
+/// A cleanup that failed to remove or restore something is an I/O failure, whatever caused the cleanup.
+fn cleanup_failure_code() -> ErrorCode { ErrorCode::IoError }
+
 fn statistics_cleanup(error: &StatisticsError) -> Option<Value> {
     match error {
         StatisticsError::Cleanup { path, cause, source } => Some(json!({
+            "code":cleanup_failure_code(),
             "stage_path":path_value(path), "cause_kind":if cause.is_cancelled() { "cancelled" } else { "error" },
             "cause":cause.to_string(), "message":source.to_string()
         })),
         StatisticsError::Storage(SettingsError::Cleanup { path, cause, source, .. }) => Some(json!({
+            "code":cleanup_failure_code(),
             "stage_path":path_value(path), "cause_kind":"error",
             "cause":cause.to_string(), "message":source.to_string()
         })),
@@ -424,13 +433,15 @@ fn statistics_cleanup(error: &StatisticsError) -> Option<Value> {
     }
 }
 
+// `code` is `cancelled` when the accounting itself was cancelled and `statistics_error` otherwise;
+// the audio is already published in both cases and the item status stays `ok`.
 fn statistics_accounting(result: Result<(), StatisticsError>) -> Value {
     match result {
         Ok(()) => json!({"status":"recorded"}),
-        Err(error) if error.is_cancelled() => json!({"status":"not_recorded", "reason":"cancelled",
+        Err(error) if error.is_cancelled() => json!({"status":"not_recorded", "reason":"cancelled", "code":ErrorCode::Cancelled,
             "message":error.to_string(), "publication":error.publication_status(), "audio_published":true}),
         Err(error) => {
-            let mut value = json!({"status":"failed", "message":error.to_string(),
+            let mut value = json!({"status":"failed", "code":ErrorCode::StatisticsError, "message":error.to_string(),
                 "publication":error.publication_status(), "audio_published":true});
             if let Some(cleanup) = statistics_cleanup(&error) { value["cleanup"] = cleanup; }
             value
@@ -448,11 +459,22 @@ fn processed_report(input: &Path, report: engine::ProcessReport, store: &Statist
             input: path_value(input), status: "failed",
             report: Some(json!({"output_path":path_value(&report.output_path),
                 "backup_path":report.backup_path.as_deref().map(path_value), "replaced_existing_output":report.replaced_existing_output,
-                "clip_count":report.clip_count, "input_volume":effective_float(report.input_volume), "output_volume":effective_float(report.output_volume)})),
-            error: Some(json!({"stage":"report", "message":error.to_string(), "partial_publication":true})),
+                "clip_count":report.clip_count, "input_volume":effective_float(report.input_volume), "output_volume":effective_float(report.output_volume),
+                "non_identical_paths":report.non_identical_paths})),
+            error: Some({ let mut error = report_error(&error); error["partial_publication"] = json!(true); error }),
             statistics: Some(accounting),
         },
     }
+}
+
+/// A report that could not be serialized.
+fn report_error(error: &serde_json::Error) -> Value {
+    json!({"stage":"report", "code":ErrorCode::ReportSerializationFailed, "message":error.to_string()})
+}
+
+/// The top-level outcome of a command that failed outside any item.
+fn error_outcome(kind: &str, code: ErrorCode, message: &str) -> Value {
+    json!({"status":"error", "error":{"kind":kind, "code":code, "message":message}})
 }
 
 fn process_result(input: &Path, result: Result<engine::ProcessReport, EngineError>, store: &StatisticsStore, cancel: &Cancellation) -> ItemResult {
@@ -463,13 +485,17 @@ fn process_result(input: &Path, result: Result<engine::ProcessReport, EngineErro
 }
 fn workflow_error(error: WorkflowError) -> Value {
     let message = error.to_string();
+    let code = error.code();
     match error {
         WorkflowError::Transaction { backup, recovery, rollback, cleanup, published, .. } => json!({
-            "message": message, "retained_backup": backup.as_deref().map(path_value), "retained_original": recovery.as_deref().map(path_value),
-            "rollback_error": rollback.map(|e| e.to_string()), "partial_publication": published,
-            "cleanup_errors": cleanup.into_iter().map(|e| json!({"operation":e.operation, "path":path_value(&e.path), "message":e.source.to_string()})).collect::<Vec<_>>()
+            "code": code, "message": message, "retained_backup": backup.as_deref().map(path_value), "retained_original": recovery.as_deref().map(path_value),
+            // The string stays for compatibility; the code of a failed rollback is never `cancelled`.
+            "rollback_error": rollback.as_ref().map(|e| e.to_string()),
+            "rollback_error_code": rollback.as_ref().map(|e| match e.code() { ErrorCode::Cancelled => cleanup_failure_code(), other => other }),
+            "partial_publication": published,
+            "cleanup_errors": cleanup.into_iter().map(|e| json!({"code":cleanup_failure_code(), "operation":e.operation, "path":path_value(&e.path), "message":e.source.to_string()})).collect::<Vec<_>>()
         }),
-        _ => json!({"message": message}),
+        _ => json!({"code": code, "message": message}),
     }
 }
 fn restored_report(input: &Path, report: file_workflow::RestoreReport) -> ItemResult {
@@ -477,7 +503,7 @@ fn restored_report(input: &Path, report: file_workflow::RestoreReport) -> ItemRe
         "destination": path_value(&report.destination), "backup": path_value(&report.backup),
         "backup_removed": report.backup_removed,
         "backup_removal_error": report.backup_removal_error.as_ref().map(|error| json!({
-            "operation": error.operation, "path": path_value(&report.backup), "message": error.message,
+            "code": cleanup_failure_code(), "operation": error.operation, "path": path_value(&report.backup), "message": error.message,
             "retained_path": error.retained_path.as_deref().map(path_value),
             "unexpected_path": error.unexpected_path.as_deref().map(path_value),
         })),
@@ -534,7 +560,7 @@ fn discovery(inputs: &[PathBuf]) -> (Vec<DiscoveredFile>, Vec<ItemResult>) {
     let mut errors = Vec::new();
     for input in inputs {
         match file_workflow::discover_inputs(std::slice::from_ref(input)) {
-            Ok(found) if found.is_empty() => errors.push(ItemResult::failed(input, json!({"stage":"discovery", "message":"no admitted audio files found"}))),
+            Ok(found) if found.is_empty() => errors.push(ItemResult::failed(input, json!({"stage":"discovery", "code":ErrorCode::NoInputFiles, "message":"no admitted audio files found"}))),
             Ok(found) => for file in found { files.entry(file.path.clone()).or_insert(file); },
             Err(error) => errors.push(ItemResult::failed(input, workflow_error(error))),
         }
@@ -616,14 +642,14 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
         item.input_marker_override().map(|kind| json!({"input": path_value(&files[index].path), "kind": kind}))
     }).collect());
     let overwrite_error = if args.overwrite && !errors.is_empty() {
-        Some(json!({"message": "cannot authorize overwrite because a selected input could not be discovered"}))
+        Some(json!({"code": ErrorCode::BatchPreflightFailed, "message": "cannot authorize overwrite because a selected input could not be discovered"}))
     } else if args.overwrite {
         let destinations: Vec<_> = prepared.iter().map(|item| item.output_plan().destination().to_owned()).collect();
         match file_workflow::OverwriteGuard::new(&files, &destinations) {
             Ok(guard) => {
                 let guard = Arc::new(guard);
                 prepared.iter_mut().find_map(|item| item.enable_overwrite(Arc::clone(&guard)).err()
-                    .map(|error| json!({"stage": error.stage, "message": error.message})))
+                    .map(|error| json!({"stage": error.stage, "code": error.code, "message": error.message})))
             }
             Err(error) => Some(workflow_error(error)),
         }
@@ -642,7 +668,8 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
         }) { results[ready[slot]] = Some(result); }
     }
     errors.extend(results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| {
-        ItemResult::not_started(&files[i].path, if cancel.is_cancelled() { "cancelled before starting" } else { "batch preflight failed" })
+        let (code, message) = if cancel.is_cancelled() { (ErrorCode::Cancelled, "cancelled before starting") } else { (ErrorCode::BatchPreflightFailed, "batch preflight failed") };
+        ItemResult::not_started(&files[i].path, code, message)
     })));
     Ok(batch_outcome("process", errors, cancel, details, conflict))
 }
@@ -804,12 +831,12 @@ fn analyze(args: AnalyzeArgs, mut settings: Settings, cores: usize, cancel: &Can
         match engine::analyze_file(&file.path, &settings, cancel) {
             Ok(report) => match serde_json::to_value(report) {
                 Ok(report) => ItemResult::ok(&file.path, report),
-                Err(error) => ItemResult::failed(&file.path, json!({"stage":"report", "message":error.to_string()})),
+                Err(error) => ItemResult::failed(&file.path, report_error(&error)),
             },
             Err(error) => ItemResult::engine_error(&file.path, error),
         }
     }) { results[index] = Some(result); }
-    errors.extend(results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| ItemResult::not_started(&files[i].path, "cancelled before starting"))));
+    errors.extend(results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| ItemResult::not_started(&files[i].path, ErrorCode::Cancelled, "cancelled before starting"))));
     Ok(batch_outcome("analyze", errors, cancel, json!({"jobs":jobs, "requested_jobs":args.batch.jobs.map(NonZeroUsize::get),
         "effective_template":effective_template(&template)}), None))
 }
@@ -822,12 +849,12 @@ fn inspect(args: InspectArgs, settings: &Settings, cores: usize, cancel: &Cancel
         match engine::inspect_file(path, settings) {
             Ok(report) => match serde_json::to_value(report) {
                 Ok(report) => ItemResult::ok(path, report),
-                Err(error) => ItemResult::failed(path, json!({"stage":"report", "message":error.to_string()})),
+                Err(error) => ItemResult::failed(path, report_error(&error)),
             },
             Err(error) => ItemResult::engine_error(path, error),
         }
     }) { results[index] = Some(result); }
-    let results = results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| ItemResult::not_started(&args.files[i], "cancelled before starting"))).collect();
+    let results = results.into_iter().enumerate().map(|(i, result)| result.unwrap_or_else(|| ItemResult::not_started(&args.files[i], ErrorCode::Cancelled, "cancelled before starting"))).collect();
     batch_outcome("inspect", results, cancel, json!({"jobs":jobs, "requested_jobs":args.jobs.map(NonZeroUsize::get)}), None)
 }
 fn restore(args: RestoreArgs, settings: &Settings, cancel: &Cancellation) -> Result<Outcome, AppError> {
@@ -835,13 +862,13 @@ fn restore(args: RestoreArgs, settings: &Settings, cancel: &Cancellation) -> Res
     let snapshot = file_workflow::RestoreBatchSnapshot::capture(&args.files, &args.backup).map_err(|error| {
         if matches!(&error, WorkflowError::RestoreInputConflict { .. } | WorkflowError::InvalidMarkerBackup) {
             AppError::usage(error.to_string())
-        } else { AppError::io(error.to_string()) }
+        } else { AppError::workflow(&error) }
     })?;
     let mut results: Vec<Option<ItemResult>> = (0..args.files.len()).map(|_| None).collect();
     let mut prepared: Vec<Option<_>> = (0..args.files.len()).map(|_| None).collect();
     for (index, path) in args.files.iter().enumerate() {
         if cancel.is_cancelled() {
-            results[index] = Some(ItemResult::not_started(path, "cancelled before starting")); continue;
+            results[index] = Some(ItemResult::not_started(path, ErrorCode::Cancelled, "cancelled before starting")); continue;
         }
         let marker = match engine::read_restore_marker(path, settings) {
             Ok((_, marker)) => marker,
@@ -871,7 +898,7 @@ fn restore(args: RestoreArgs, settings: &Settings, cancel: &Cancellation) -> Res
         }
     }
     let results = results.into_iter().enumerate().map(|(index, result)| result.unwrap_or_else(|| {
-        ItemResult::not_started(&args.files[index], "cancelled before restore")
+        ItemResult::not_started(&args.files[index], ErrorCode::Cancelled, "cancelled before restore")
     })).collect();
     Ok(batch_outcome("restore", results, cancel, json!({"backup_policy":"remove_after_verified_restore"}), None))
 }
@@ -953,7 +980,7 @@ fn main() {
             return;
         }
         Err(error) => {
-            if json_requested { emit(&json!({"status":"error", "error":{"kind":"usage", "message":error.to_string()}}), true); }
+            if json_requested { emit(&error_outcome("usage", ErrorCode::Usage, &error.to_string()), true); }
             else { let _ = error.print(); }
             std::process::exit(2);
         }
@@ -962,7 +989,7 @@ fn main() {
     let cancel = Arc::new(Cancellation::new());
     let signal_cancel = Arc::clone(&cancel);
     if let Err(error) = ctrlc::set_handler(move || signal_cancel.cancel()) {
-        let value = json!({"status":"error", "error":{"kind":"signal", "message":format!("install Ctrl-C handler: {error}")}});
+        let value = error_outcome("signal", ErrorCode::SignalHandlerFailed, &format!("install Ctrl-C handler: {error}"));
         if machine { emit(&value, true); } else { eprintln!("{}", value["error"]["message"].as_str().unwrap_or("signal handler failed")); }
         std::process::exit(1);
     }
@@ -970,8 +997,8 @@ fn main() {
         Ok(outcome) => { emit(&outcome.value, machine); std::process::exit(outcome.exit); }
         Err(error) => {
             let exit = if error.kind == "usage" { 2 } else if error.kind == "cancelled" { 130 } else { 1 };
-            let mut value = json!({"status":if error.kind == "cancelled" { "cancelled" } else { "error" },
-                "error":{"kind":error.kind, "message":error.message}});
+            let mut value = error_outcome(error.kind, error.code, &error.message);
+            if error.kind == "cancelled" { value["status"] = json!("cancelled"); }
             if let Some(publication) = error.publication { value["error"]["publication"] = json!(publication); }
             if let Some(cleanup) = error.cleanup { value["error"]["cleanup"] = cleanup; }
             if machine { emit(&value, true); } else { eprintln!("{}", value["error"]["message"].as_str().unwrap_or("operation failed")); }
@@ -1030,6 +1057,7 @@ mod statistics_outcome_tests {
             input_volume: 0.0, healed_volume: 0.0, output_volume: 0.6, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
             tempo_factor: 1.0, clip_count: 3, applied_stages: Vec::new(),
             processing_marker_status: "present", input_marker_override: None, source_tags_unavailable: None, controlled_mp4_time_1904: None,
+            non_identical_paths: Vec::new(),
         }
     }
 
@@ -1167,7 +1195,7 @@ mod statistics_outcome_tests {
     fn failed_engine_result_is_not_counted_even_if_audio_was_partly_published() {
         let fixture = Fixture::new();
         let store = fixture.store();
-        let error = EngineError { stage: "publish output", message: "injected failure".into(),
+        let error = EngineError { stage: "publish output", code: ErrorCode::IoError, message: "injected failure".into(),
             cancelled: false, retained_backup: None, recovery_path: Some("/fixture/recovery".into()), partial_publication: true };
         let item = process_result(Path::new("input.wav"), Err(error), &store, &Cancellation::new());
         assert_eq!(item.status, "failed");
@@ -1241,5 +1269,93 @@ mod statistics_outcome_tests {
             assert_eq!(outcome.exit, 130);
             assert_eq!(outcome.value["results"][0]["statistics"]["audio_published"], true);
         });
+    }
+}
+
+#[cfg(test)]
+mod error_code_json_tests {
+    use super::*;
+
+    fn code(value: &Value) -> &str { value["code"].as_str().expect("every error object has a code") }
+
+    #[test]
+    fn every_item_error_shape_carries_a_code_next_to_its_message() {
+        let started = serde_json::to_value(ItemResult::not_started(Path::new("a.wav"), ErrorCode::BatchPreflightFailed, "batch preflight failed")).unwrap();
+        assert_eq!(started["status"], "not_started");
+        assert_eq!((code(&started["error"]), started["error"]["message"].as_str()), ("batch_preflight_failed", Some("batch preflight failed")));
+        let cancelled = serde_json::to_value(ItemResult::not_started(Path::new("a.wav"), ErrorCode::Cancelled, "cancelled before starting")).unwrap();
+        assert_eq!(code(&cancelled["error"]), "cancelled");
+
+        let engine = EngineError { stage: "open input", code: ErrorCode::UnsupportedInputCodec, message: "MP3 decoding is unavailable".into(),
+            cancelled: false, retained_backup: None, recovery_path: None, partial_publication: false };
+        let item = serde_json::to_value(ItemResult::engine_error(Path::new("a.mp3"), engine)).unwrap();
+        assert_eq!(item["status"], "failed");
+        assert_eq!(code(&item["error"]), "unsupported_input_codec");
+        assert_eq!(item["error"]["stage"], "open input");
+
+        let workflow = serde_json::to_value(ItemResult::workflow_error(Path::new("a.wav"), WorkflowError::DestinationExists("/x".into()))).unwrap();
+        assert_eq!(code(&workflow["error"]), "output_exists");
+        let transaction = workflow_error(WorkflowError::Transaction {
+            cause: Box::new(WorkflowError::SourceChanged("/x".into())), backup: None, recovery: None, rollback: None, cleanup: Vec::new(), published: false,
+        });
+        assert_eq!(code(&transaction), "source_changed");
+
+        let report = report_error(&serde_json::from_str::<Value>("{").unwrap_err());
+        assert_eq!((code(&report), report["stage"].as_str()), ("report_serialization_failed", Some("report")));
+        let discovery = serde_json::to_value(ItemResult::failed(Path::new("d"), json!({"stage":"discovery", "code":ErrorCode::NoInputFiles, "message":"m"}))).unwrap();
+        assert_eq!(code(&discovery["error"]), "no_input_files");
+    }
+
+    #[test]
+    fn top_level_errors_carry_kind_and_code() {
+        let signal = error_outcome("signal", ErrorCode::SignalHandlerFailed, "install Ctrl-C handler: x");
+        assert_eq!((signal["status"].as_str(), signal["error"]["kind"].as_str(), code(&signal["error"])), (Some("error"), Some("signal"), "signal_handler_failed"));
+        let kinds = [
+            (AppError::usage("u"), "usage", "usage"), (AppError::settings("s"), "settings", "settings_error"),
+            (AppError::io("i"), "io", "io_error"),
+            (AppError::workflow(&WorkflowError::AtomicRenameUnsupported { operation: "op", path: "/x".into(), source: std::io::Error::other("x") }), "io", "atomic_rename_unsupported"),
+            (AppError::statistics(StatisticsError::Corrupt("c".into())), "statistics", "statistics_error"),
+            (AppError::statistics(StatisticsError::Cancelled), "cancelled", "cancelled"),
+        ];
+        for (error, kind, expected) in kinds {
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.code.as_str(), expected, "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn every_failure_shaped_object_carries_a_code() {
+        let io = || std::io::Error::other("x");
+        let failed = statistics_accounting(Err(StatisticsError::Corrupt("c".into())));
+        assert_eq!((failed["status"].as_str(), code(&failed)), (Some("failed"), "statistics_error"));
+        let cancelled = statistics_accounting(Err(StatisticsError::Cancelled));
+        assert_eq!((cancelled["status"].as_str(), code(&cancelled)), (Some("not_recorded"), "cancelled"));
+        let cleanup_error = || StatisticsError::Cleanup { path: "/x".into(), cause: Box::new(StatisticsError::Cancelled), source: std::io::Error::other("x") };
+        let with_cleanup = statistics_accounting(Err(cleanup_error()));
+        assert_eq!(code(&with_cleanup), "statistics_error");
+        assert_eq!(code(&with_cleanup["cleanup"]), "io_error");
+        let top_level = AppError::statistics(cleanup_error());
+        assert_eq!(code(top_level.cleanup.as_ref().expect("cleanup object")), "io_error");
+
+        let rolled_back = |rollback: Option<WorkflowError>| workflow_error(WorkflowError::Transaction {
+            cause: Box::new(WorkflowError::SourceChanged("/x".into())), backup: None, recovery: None,
+            rollback: rollback.map(Box::new),
+            cleanup: vec![file_workflow::CleanupFailure { operation: "remove", path: "/y".into(), source: io() }], published: true,
+        });
+        let none = rolled_back(None);
+        assert!(none["rollback_error"].is_null() && none["rollback_error_code"].is_null());
+        assert_eq!(code(&none["cleanup_errors"][0]), "io_error");
+        let failed_rollback = rolled_back(Some(WorkflowError::SourceChanged("/z".into())));
+        assert!(failed_rollback["rollback_error"].is_string(), "the string form stays for compatibility");
+        assert_eq!(failed_rollback["rollback_error_code"], "source_changed");
+        let cancelled_rollback = rolled_back(Some(WorkflowError::Cancelled));
+        assert_eq!(cancelled_rollback["rollback_error_code"], "io_error", "a rollback that failed is never a clean cancel");
+
+        let restored = serde_json::to_value(restored_report(Path::new("a.wav"), file_workflow::RestoreReport {
+            destination: "/a.wav".into(), backup: "/b.wav".into(), backup_removed: false,
+            backup_removal_error: Some(file_workflow::BackupRemovalError { operation: "sync", message: "m".into(), retained_path: None, unexpected_path: None }),
+        })).unwrap();
+        assert_eq!(restored["status"], "ok");
+        assert_eq!(code(&restored["report"]["backup_removal_error"]), "io_error");
     }
 }

@@ -717,7 +717,10 @@ function validEffectiveConfig(value, template, receipt, root, manifest) {
   const expected = ['--state-dir', path.join(root, 'state'), '--json', 'process', path.join(root, manifest.input.path), '--template-id', selected.id, '--format', format, '--output-dir', path.join(root, 'output'), '--no-mirror', '--jobs', job, '--mp3-mode', mp3, ...clock];
   // Candidate runs never request --overwrite; current CLIs report it explicitly as false.
   if (Object.hasOwn(value ?? {}, 'overwrite') && value.overwrite !== false) return false;
-  return onlyKnownKeys(value, ['output', 'processor_max', 'mp3_mode', 'libraries', 'selected_template', 'effective_selected_template', 'overwrite']) && Object.hasOwn(value, 'selected_template') && (value.selected_template === null || stable(value.selected_template) === stable(selection)) && positiveInt(value.processor_max) && value.mp3_mode === mp3 && validOutput(value.output, root) &&
+  // v0.2.0 adds `parity` and `parity_effect`; a candidate run may only carry the default-build, default-setting values.
+  if (Object.hasOwn(value ?? {}, 'parity') && stable(value.parity) !== stable({ allow_non_identical: false })) return false;
+  if (Object.hasOwn(value ?? {}, 'parity_effect') && !(onlyKnownKeys(value.parity_effect, ['effective', 'note']) && value.parity_effect.effective === false && typeof value.parity_effect.note === 'string' && value.parity_effect.note.length > 0)) return false;
+  return onlyKnownKeys(value, ['output', 'processor_max', 'mp3_mode', 'libraries', 'parity', 'parity_effect', 'selected_template', 'effective_selected_template', 'overwrite']) && Object.hasOwn(value, 'selected_template') && (value.selected_template === null || stable(value.selected_template) === stable(selection)) && positiveInt(value.processor_max) && value.mp3_mode === mp3 && validOutput(value.output, root) &&
     value.output.format === (format === 'match-input' ? 'match_input' : format) && selected.id === template?.unique_id && stable(args) === stable(expected);
 }
 function checkCandidate(root, manifest, receipt, value, context, label, flags) {

@@ -15,13 +15,13 @@ impl LibraryKind {
         { match self {
             Self::Flac => "41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72",
             Self::Lame => "c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87",
-            Self::TagBridge => "10eb77c1e12d7a12959300da3a1d853fe4907a3c7872bb4f83b12ab255549a9b",
+            Self::TagBridge => "8708af52d83fc7fdb6a487d72abc90ff4bd9f9b94e313436cc6fb68cc9db2aa0",
         } }
         #[cfg(target_arch = "x86_64")]
         { match self {
             Self::Flac => "9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755",
             Self::Lame => "cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b",
-            Self::TagBridge => "27922fdf10e6c7efbb43f8645f74138b82c4598edf0c3f2e2f55410cbaf3714d",
+            Self::TagBridge => "ea86881cb6615d7cf8614dfb285e8670d978de621957b15611b8bd6d5b0e1ad5",
         } }
     }
 }

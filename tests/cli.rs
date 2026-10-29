@@ -622,3 +622,36 @@ fn cli_reports_ambiguous_wav_override_and_keeps_strict_guards() {
     assert_eq!(result["results"][0]["error"]["partial_publication"], false);
     assert_eq!(fs::read(trailing).unwrap(), bytes);
 }
+
+#[test]
+fn parity_opt_in_is_one_stored_setting_that_config_show_and_run_details_explain() {
+    let sandbox = Sandbox::new();
+    let available = cfg!(any(target_os = "linux", feature = "portable"));
+    assert_eq!(sandbox.ok(&["config", "get", "parity.allow_non_identical"])["data"]["value"], false);
+    let shown = sandbox.ok(&["config", "show"]);
+    assert_eq!(shown["data"]["parity"], json!({"allow_non_identical": false}));
+    assert_eq!(shown["data"]["parity_effect"]["effective"], false);
+
+    assert_eq!(sandbox.ok(&["config", "set", "parity.allow_non_identical", "true"])["data"]["value"], true);
+    assert_eq!(sandbox.ok(&["config", "get", "parity"])["data"]["value"], json!({"allow_non_identical": true}));
+    let shown = sandbox.ok(&["config", "show"]);
+    assert_eq!(shown["data"]["parity"], json!({"allow_non_identical": true}));
+    assert_eq!(shown["data"]["parity_effect"]["effective"], available);
+    let note = shown["data"]["parity_effect"]["note"].as_str().unwrap();
+    if available { assert!(note.starts_with("enabled"), "{note}"); }
+    else { assert!(note.starts_with("no effect in this macOS default build"), "{note}"); }
+
+    // Run details carry the same two objects, and a failed batch still reports them.
+    let missing = sandbox.root.join("missing.wav");
+    let (output, outcome) = sandbox.run(&["process", missing.to_str().unwrap(), "--format", "wav"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(outcome["details"]["effective_config"]["parity"], json!({"allow_non_identical": true}));
+    assert_eq!(outcome["details"]["effective_config"]["parity_effect"]["effective"], available);
+
+    let (output, rejected) = sandbox.run(&["config", "set", "parity.allow_non_identical", "\"yes\""]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(rejected["error"]["code"], "settings_error");
+    assert_eq!(sandbox.ok(&["config", "get", "parity.allow_non_identical"])["data"]["value"], true);
+    sandbox.ok(&["config", "reset", "parity.allow_non_identical"]);
+    assert_eq!(sandbox.ok(&["config", "get", "parity"])["data"]["value"], json!({"allow_non_identical": false}));
+}

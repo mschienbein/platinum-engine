@@ -142,6 +142,55 @@ pub(crate) struct StereoBufferList {
 // This is a bounded runtime observation, not a cross-version parity guarantee.
 #[repr(align(64))]
 struct AlignedStereoBufferList(StereoBufferList);
+/// The same 64-byte alignment for the interleaved read: without it the AAC
+/// waveform samples (analysis of AAC input) varied with the caller's frame sizes.
+#[repr(align(64))]
+struct AlignedBufferList(AudioBufferList);
+
+// AudioToolbox's AAC encoder runs 512-point DFTs on stack temporaries. The kernel it
+// uses (SME or NEON) depends on the 64-byte alignment of those temporaries, which derive
+// from the stack pointer at the call: ExtAudioFileWrite uses the SME kernel when
+// `sp % 64 == 48` at entry, and the final drain inside ExtAudioFileDispose when
+// `sp % 64 == 32`. The two kernels round differently, so without a fixed stack pointer the
+// encoded packets (the last ones, for Dispose) varied with the frame sizes of our callers.
+// These calls go through `call_with_sp_residue`, which fixes `sp % 64` at the callee's entry.
+// Residue 0 is neither of those two SME cases, so both calls run the NEON kernel, whose
+// output matches the native application's AAC references (docs/VERIFICATION.md) and the
+// pre-0.2.0 releases' output on the same inputs (the layout study is recorded in
+// local-artifacts/release-v0.2.0/aac-layout-control-01). This is a bounded runtime
+// observation of the tested macOS arm64 AudioToolbox, not a cross-version guarantee.
+const WRITE_SP_RESIDUE: usize = 0;
+const DISPOSE_SP_RESIDUE: usize = 0;
+
+/// Call a C function of up to three integer arguments with `sp % 64 == residue` at its entry.
+/// The previous stack pointer is held in `x20`, which is declared clobbered (callee-saved,
+/// so the compiler preserves it), and is restored after the call; the callee's frames live
+/// below at least 256 bytes of unused stack.
+#[cfg_attr(test, unsafe(no_mangle))]
+#[inline(never)]
+pub(crate) unsafe fn call_with_sp_residue(function: usize, a0: usize, a1: usize, a2: usize, residue: usize) -> i32 {
+    debug_assert!(residue < 64 && residue % 16 == 0, "stack pointers stay 16-byte aligned");
+    let status: usize;
+    // SAFETY: `function` is a C-ABI function taking at most three integer arguments; the asm
+    // switches to a lower 16-byte-aligned stack position, calls it, and restores `sp` from
+    // `x20` before returning. Caller-saved registers (including lr) are clobbered by the ABI.
+    unsafe {
+        std::arch::asm!(
+            "mov x20, sp",
+            "sub x9, sp, #256",
+            "and x9, x9, #0xffffffffffffffc0",
+            "add x9, x9, x11",
+            "mov sp, x9",
+            "blr x10",
+            "mov sp, x20",
+            in("x10") function, in("x11") residue,
+            inout("x0") a0 => status, in("x1") a1, in("x2") a2,
+            out("x20") _,
+            clobber_abi("C"),
+        );
+    }
+    status as i32
+}
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
@@ -213,7 +262,9 @@ impl ExtHandle {
     fn ptr(&self) -> *mut c_void { self.0.expect("live ExtAudioFileRef").as_ptr() }
     fn close(&mut self) -> Result<(), CodecError> {
         match self.0.take() {
-            Some(p) => native_status("ExtAudioFileDispose", unsafe { ExtAudioFileDispose(p.as_ptr()) }),
+            Some(p) => native_status("ExtAudioFileDispose", unsafe {
+                call_with_sp_residue(ExtAudioFileDispose as *const () as usize, p.as_ptr() as usize, 0, 0, DISPOSE_SP_RESIDUE)
+            }),
             None => Ok(()),
         }
     }
@@ -410,10 +461,10 @@ impl Reader {
         let (mut frames, bytes) = buffer_length(output.len(), self.client.channels_per_frame, size_of::<f32>())?;
         if frames == 0 { return Ok(0); }
         let requested = frames;
-        let mut list = audio_buffer(self.client.channels_per_frame, bytes, output.as_mut_ptr().cast());
-        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, &mut list) };
+        let mut list = AlignedBufferList(audio_buffer(self.client.channels_per_frame, bytes, output.as_mut_ptr().cast()));
+        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, &mut list.0) };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileRead", status }); }
-        if frames > requested || list.buffers[0].data_byte_size > bytes {
+        if frames > requested || list.0.buffers[0].data_byte_size > bytes {
             self.failed = true;
             return Err(CodecError::UnexpectedNativeResult("read exceeded supplied buffer"));
         }
@@ -621,7 +672,10 @@ impl Writer {
         let submitted = self.submitted_frames.checked_add(u64::from(frames))
             .ok_or(CodecError::InvalidInput("submitted frame count overflows"))?;
         let list = audio_buffer(self.config.channels, bytes, input.as_ptr().cast_mut().cast());
-        let status = unsafe { ExtAudioFileWrite(self.handle.ptr(), frames, &list) };
+        let status = unsafe {
+            call_with_sp_residue(ExtAudioFileWrite as *const () as usize, self.handle.ptr() as usize, frames as usize,
+                &list as *const AudioBufferList as usize, WRITE_SP_RESIDUE)
+        };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileWrite", status }); }
         self.submitted_frames = submitted;
         Ok(())
@@ -1000,6 +1054,128 @@ mod mp4_time_tests {
         let duplicated = container(b"moov", &[full_box(b"mvhd", 0, 96), full_box(b"mvhd", 0, 96)]);
         for moov in [missing, duplicated] {
             assert_eq!(patch_moov_times(&mut moov[8..].to_vec(), 1).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sp_pin_tests {
+    use super::call_with_sp_residue;
+
+    std::arch::global_asm!(
+        ".text",
+        ".p2align 2",
+        // usize pn_test_probe_sp(): the stack pointer at entry (no prologue touches it).
+        ".globl _pn_test_probe_sp",
+        "_pn_test_probe_sp:",
+        "mov x0, sp",
+        "ret",
+        ".globl _pn_test_sum3",
+        "_pn_test_sum3:",
+        "add x0, x0, x1",
+        "add x0, x0, x2",
+        "ret",
+        // i32 pn_test_check_callee_saved(function, a0, a1, a2, residue): runs the real trampoline
+        // with x19-x28 and d8-d15 holding known values; returns its result, or -1 if any changed.
+        ".globl _pn_test_check_callee_saved",
+        "_pn_test_check_callee_saved:",
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
+        "stp x19, x20, [sp, #-16]!",
+        "stp x21, x22, [sp, #-16]!",
+        "stp x23, x24, [sp, #-16]!",
+        "stp x25, x26, [sp, #-16]!",
+        "stp x27, x28, [sp, #-16]!",
+        "stp d8, d9, [sp, #-16]!",
+        "stp d10, d11, [sp, #-16]!",
+        "stp d12, d13, [sp, #-16]!",
+        "stp d14, d15, [sp, #-16]!",
+        "mov x19, #19", "mov x20, #20", "mov x21, #21", "mov x22, #22", "mov x23, #23",
+        "mov x24, #24", "mov x25, #25", "mov x26, #26", "mov x27, #27", "mov x28, #28",
+        "fmov d8, x19", "fmov d9, x20", "fmov d10, x21", "fmov d11, x22",
+        "fmov d12, x23", "fmov d13, x24", "fmov d14, x25", "fmov d15, x26",
+        "bl _call_with_sp_residue",
+        "mov x9, x0",
+        "cmp x19, #19", "b.ne 1f", "cmp x20, #20", "b.ne 1f", "cmp x21, #21", "b.ne 1f",
+        "cmp x22, #22", "b.ne 1f", "cmp x23, #23", "b.ne 1f", "cmp x24, #24", "b.ne 1f",
+        "cmp x25, #25", "b.ne 1f", "cmp x26, #26", "b.ne 1f", "cmp x27, #27", "b.ne 1f",
+        "cmp x28, #28", "b.ne 1f",
+        "fmov x10, d8", "cmp x10, #19", "b.ne 1f", "fmov x10, d9", "cmp x10, #20", "b.ne 1f",
+        "fmov x10, d10", "cmp x10, #21", "b.ne 1f", "fmov x10, d11", "cmp x10, #22", "b.ne 1f",
+        "fmov x10, d12", "cmp x10, #23", "b.ne 1f", "fmov x10, d13", "cmp x10, #24", "b.ne 1f",
+        "fmov x10, d14", "cmp x10, #25", "b.ne 1f", "fmov x10, d15", "cmp x10, #26", "b.ne 1f",
+        "b 2f",
+        "1:",
+        "mov x9, #-1",
+        "2:",
+        "mov x0, x9",
+        "ldp d14, d15, [sp], #16",
+        "ldp d12, d13, [sp], #16",
+        "ldp d10, d11, [sp], #16",
+        "ldp d8, d9, [sp], #16",
+        "ldp x27, x28, [sp], #16",
+        "ldp x25, x26, [sp], #16",
+        "ldp x23, x24, [sp], #16",
+        "ldp x21, x22, [sp], #16",
+        "ldp x19, x20, [sp], #16",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+    );
+    unsafe extern "C" {
+        fn pn_test_probe_sp() -> usize;
+        fn pn_test_sum3(a: usize, b: usize, c: usize) -> usize;
+        fn pn_test_check_callee_saved(function: usize, a0: usize, a1: usize, a2: usize, residue: usize) -> i32;
+    }
+
+    fn current_sp() -> usize {
+        let sp: usize;
+        // SAFETY: reads the stack pointer register only.
+        unsafe { std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        sp
+    }
+
+    #[test]
+    fn the_callee_enters_with_the_requested_residue_whatever_the_callers_alignment() {
+        fn check<const PAD: usize>(residue: usize) {
+            let mut pad = [0u8; PAD];
+            std::hint::black_box(&mut pad);
+            let before = current_sp();
+            // SAFETY: the probe is a C-ABI function without arguments; it returns its entry sp.
+            let seen = unsafe { call_with_sp_residue(pn_test_probe_sp as *const () as usize, 0, 0, 0, residue) };
+            assert_eq!(current_sp(), before, "the caller's stack pointer is restored (pad {PAD}, residue {residue})");
+            // The i32 result keeps the low 32 bits of the entry sp, which holds `sp % 64`.
+            assert_eq!(seen as u32 as usize % 64, residue, "entry residue (pad {PAD})");
+        }
+        for residue in [0usize, 16, 32, 48] {
+            check::<0>(residue); check::<16>(residue); check::<32>(residue); check::<48>(residue);
+            check::<64>(residue); check::<96>(residue); check::<128>(residue); check::<200>(residue);
+        }
+    }
+
+    #[test]
+    fn arguments_and_the_result_pass_through_unchanged() {
+        for residue in [0usize, 16, 32, 48] {
+            // SAFETY: `pn_test_sum3` is a C-ABI function of three integers.
+            let sum = unsafe { call_with_sp_residue(pn_test_sum3 as *const () as usize, 1, 2, 3, residue) };
+            assert_eq!(sum, 6);
+            let sum = unsafe { call_with_sp_residue(pn_test_sum3 as *const () as usize, 40_000, 2, 0x7fff_0000, residue) };
+            assert_eq!(sum, 0x7fff_0000 + 40_002);
+        }
+    }
+
+    #[test]
+    fn callee_saved_registers_survive_the_trampoline() {
+        for residue in [0usize, 16, 32, 48] {
+            // SAFETY: the shim saves and restores every register it uses and calls the real trampoline.
+            let result = unsafe { pn_test_check_callee_saved(pn_test_sum3 as *const () as usize, 1, 2, 3, residue) };
+            assert_eq!(result, 6, "x19-x28 and d8-d15 must be unchanged (residue {residue})");
+        }
+    }
+
+    #[test]
+    fn the_encoder_pins_are_16_byte_aligned_residues() {
+        for residue in [super::WRITE_SP_RESIDUE, super::DISPOSE_SP_RESIDUE] {
+            assert!(residue < 64 && residue % 16 == 0);
         }
     }
 }

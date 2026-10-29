@@ -25,6 +25,8 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 EXCLUDED = {".git", "target", "local-artifacts", "__pycache__", ".pytest_cache", ".DS_Store"}
 RESULT = re.compile(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; \d+ measured; 0 filtered out;", re.MULTILINE)
+# The library-gated lane runs selected suites with --ignored, so other tests are filtered out.
+GATED_RESULT = re.compile(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; \d+ measured; \d+ filtered out;", re.MULTILINE)
 REMOTE_BASE = "/home/mooki/platinum-linux-build/"
 REMOTE_SHM_BASE = "/dev/shm/platinum-linux-build-"
 
@@ -140,10 +142,10 @@ def run(args: list[str], *, cwd: Path | None = None, check: bool = True) -> subp
     return result
 
 
-def counts(path: Path) -> dict[str, int]:
+def counts(path: Path, pattern: re.Pattern[str] = RESULT) -> dict[str, int]:
     if not path.is_file():
         return {"suites": 0, "passed": 0, "failed": 0, "ignored": 0}
-    rows = [tuple(map(int, match)) for match in RESULT.findall(path.read_text(errors="replace"))]
+    rows = [tuple(map(int, match)) for match in pattern.findall(path.read_text(errors="replace"))]
     return {"suites": len(rows), "passed": sum(row[0] for row in rows),
             "failed": sum(row[1] for row in rows), "ignored": sum(row[2] for row in rows)}
 
@@ -155,8 +157,8 @@ def status(path: Path) -> int | None:
 
 
 def log_hashes(directory: Path) -> dict[str, str]:
-    return {name: digest_file(directory / name) for name in ("build.stdout", "build.stderr", "test.stdout", "test.stderr")
-            if (directory / name).is_file()}
+    names = ("build.stdout", "build.stderr", "test.stdout", "test.stderr", "ignored.stdout", "ignored.stderr")
+    return {name: digest_file(directory / name) for name in names if (directory / name).is_file()}
 
 
 def checked_remote_path(value: str) -> str:
@@ -270,7 +272,8 @@ def main() -> int:
         (output / "x86-container.stderr").write_text(x86.stderr)
         x86_logs = output / "x86_64"
         x86_logs.mkdir()
-        for name in ("build.stdout", "build.stderr", "build.status", "test.stdout", "test.stderr", "test.status"):
+        for name in ("build.stdout", "build.stderr", "build.status", "test.stdout", "test.stderr", "test.status",
+                     "ignored.stdout", "ignored.stderr", "ignored.status"):
             run(["rsync", "-a", "--", f"{args.ssh_host}:{remote}/x86_64/{name}", str(x86_logs / name)], check=False)
         arm_binary = arm_dir / "target/release/platinum"
         x86_hash = run(["ssh", "-o", "BatchMode=yes", args.ssh_host, "sha256sum",
@@ -284,10 +287,14 @@ def main() -> int:
                 raise RuntimeError("copied x86 binary does not match the remote build")
         receipt["arm64"] = {"container_exit": arm.returncode, "build_exit": status(arm_dir / "build.status"),
                             "test_exit": status(arm_dir / "test.status"), "counts": counts(arm_dir / "test.stdout"),
+                            "ignored_lane_exit": status(arm_dir / "ignored.status"),
+                            "ignored_lane_counts": counts(arm_dir / "ignored.stdout", GATED_RESULT),
                             "binary_sha256": digest_file(arm_binary) if arm_binary.is_file() else None,
                             "log_sha256": log_hashes(arm_dir)}
         receipt["x86_64"] = {"container_exit": x86.returncode, "build_exit": status(x86_logs / "build.status"),
                              "test_exit": status(x86_logs / "test.status"), "counts": counts(x86_logs / "test.stdout"),
+                             "ignored_lane_exit": status(x86_logs / "ignored.status"),
+                             "ignored_lane_counts": counts(x86_logs / "ignored.stdout", GATED_RESULT),
                              "binary_sha256": x86_words[0] if x86_hash.returncode == 0 and x86_words else None,
                              "log_sha256": log_hashes(x86_logs)}
         verify_snapshot(snapshot, manifest)
@@ -301,7 +308,7 @@ def main() -> int:
         receipt["source_unchanged_through_build"] = inventory(REPO, True) == original
         receipt["status"] = "pass" if receipt["source_unchanged_through_build"] and all(
             receipt[arch][key] == 0 for arch in ("arm64", "x86_64")
-            for key in ("container_exit", "build_exit", "test_exit")) else "fail"
+            for key in ("container_exit", "build_exit", "test_exit", "ignored_lane_exit")) else "fail"
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         receipt["error"] = str(error)
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")

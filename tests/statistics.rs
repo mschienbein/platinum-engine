@@ -40,6 +40,7 @@ fn report(input_volume: f32, output_volume: f32, clip_count: u64) -> ProcessRepo
         input_volume, healed_volume: input_volume, output_volume, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
         tempo_factor: 1.0, clip_count, applied_stages: Vec::new(),
         processing_marker_status: "present", input_marker_override: None, source_tags_unavailable: None, controlled_mp4_time_1904: None,
+        non_identical_paths: Vec::new(),
     }
 }
 

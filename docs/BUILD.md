@@ -81,6 +81,8 @@ The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073
 
 The bridge ABI must be 5; the v07 source adds source-container status and read-failure handling. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge. The earlier v07 macOS bridge SHA-256 was `7e2f65614f2ad87322e030213b3b2fb2914a3e69635b434fd96cf6b1da38d585`; the v0.1.0 package uses the same bridge with a neutral install name and an ad-hoc signature, SHA-256 `14ca6f03b65a2cb0c4bc8bd06df540ae1707796f59f2d4f117a5d33447dfd79e`. A locally rebuilt file can differ. The older `ab36bcd5…` bridge was an earlier build. The loader checks the ABI and pins the opened file, not its provenance. A dynamic library is executable code, so configure only a library you trust. A writer able to modify that same file's inode during loading can defeat the integrity check before its post-load verification; prevent concurrent modification.
 
+The Linux/portable bridge of v0.2.0 additionally exports three **optional** ABI-5 symbols, `pn_tag_bridge_features`, `pn_tag_copy_direct_ex` and `pn_tag_copy_generic_ex`, used only when `parity.allow_non_identical` is enabled to copy embedded artwork unchanged. The six original exports (`pn_tag_read_marker`, `pn_tag_inspect`, `pn_tag_bridge_abi`, `pn_tag_copy_direct`, `pn_tag_copy_generic`, `pn_tag_save_marker`) behave exactly as before, the ABI number stays 5, and a bridge without the extension (including the macOS bridge) still loads. With the opt-in on in a build that has the non-identical paths (Linux, or `--features portable`), a bridge without the extension makes every `process` item fail before any write with `artwork_conversion_unavailable`, because the requested behavior cannot be honored. A macOS default build never uses the extension.
+
 Configure its path as a JSON string. The helper handles spaces and other characters that need JSON escaping:
 
 ```sh
@@ -210,35 +212,48 @@ The v0.1.0 macOS battery executable SHA-256 was
 The earlier source-path-remapped battery executable was
 `82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`;
 the release rebuild adds home, Cargo and Rustup path remaps and has its own
-identity-gated battery.
+identity-gated battery. The v0.2.0 macOS executable is built the same way from
+the frozen source; its SHA-256 is recorded in the release evidence
+(`local-artifacts/release-v0.2.0/REPORT.json`), not here, because it describes
+the tree this file belongs to.
 
 For Linux, run on the target's native Docker host with a prepared offline
-registry cache (`index/` and `cache/`), a new output directory and the
-appropriate v07 image identity:
+registry cache (`index/` and `cache/`), a new output directory and the v0.2.0
+native-library image (built by `tools/linux/build-image.sh`; check that the
+bridge, libFLAC and LAME it contains have the digests in
+[LINUX.md](LINUX.md#linux-native-libraries)):
 
 ```sh
 PN_LINUX_REGISTRY_DIR="$REGISTRY" PN_LINUX_RUN_TESTS=1 PN_LINUX_TMP_TARGET=1 \
   sh tools/linux/build-cli.sh "$IMAGE" "$NEW_OUTPUT"
-# Compare NEW_OUTPUT/target/release/platinum with the target's digest below.
+# Compare NEW_OUTPUT/target/release/platinum with the target's recorded digest.
 ```
 
-The recorded image IDs were arm64
-`sha256:3ecf1b2c409ce190661f3bc31dd349a6fc2b2c1560c890048bfabb43160cde0c`
+`PN_LINUX_RUN_TESTS=1` runs the regular all-target suite and then a
+library-gated lane: the `error_codes`, `linux_opt_in` and `portable_art_copy`
+suites with `--ignored`. Those tests need the approved bridge, libFLAC and LAME
+in the image, so the regular suite ignores them and never counts them as passes.
+
+The v0.2.0 image IDs of the recorded build were arm64
+`sha256:352618c7e4e953d2883f3de95c3cb222dbe5fc55e81bc9426738e75ed988b070`
 and amd64
-`sha256:e3dfe3526511ab1b640178a65a1fe6a0f11dde0bb4f41c8fabd0585bed9cf8d3`.
-The frozen Linux binary hashes were arm64
+`sha256:fbdc651c2f6843657e7a0daa5021ccf7b04782071fa4161088a2dd79bf628624`
+(the v0.1.0 images were `3ecf1b2c409ce190661f3bc31dd349a6fc2b2c1560c890048bfabb43160cde0c`
+and `e3dfe3526511ab1b640178a65a1fe6a0f11dde0bb4f41c8fabd0585bed9cf8d3`, with the
+v0.1.0 bridge, which this release refuses). The v0.1.0 frozen Linux binary
+hashes were arm64
 `6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
 and amd64
-`1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`.
-The helper runs the regular all-target tests, too. Its output hashes and logs
-are evidence for that build, not proof of universal audio-file parity.
+`1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`; the v0.2.0
+hashes are in the release evidence. The helper's output hashes and logs are
+evidence for that build, not proof of universal audio-file parity.
 
 ## Linux and release packages
 
 See [LINUX.md](LINUX.md) for the pinned multi-architecture native image,
 architecture-specific library allowlist, source builds and runtime image. From
 an appropriate native host, `sh tools/linux/package-release.sh PLATFORM
-v0.1.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
+v0.2.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
 without publishing. The available platform values are `macos-arm64`,
 `linux-arm64` and `linux-amd64`. The Linux allowlist means a locally rebuilt
 library is refused unless its digest matches an approved entry; matching a

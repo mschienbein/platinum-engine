@@ -469,3 +469,59 @@ fn invalid_persisted_state_is_not_replaced_with_defaults() {
     fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     assert!(matches!(store.load(), Err(SettingsError::Corrupt(_))));
 }
+
+#[test]
+fn parity_opt_in_defaults_off_persists_validates_resets_and_keeps_old_state_files_valid() {
+    use platinum_engine::settings::NON_IDENTICAL_PATHS_AVAILABLE;
+    let f = Fixture::new();
+    let store = f.store(4);
+    let mut loaded = store.load().unwrap();
+    assert!(!loaded.settings.parity.allow_non_identical);
+    assert!(!loaded.settings.non_identical_enabled());
+    assert_eq!(loaded.settings.config_get("parity").unwrap(), json!({"allow_non_identical": false}));
+    assert_eq!(loaded.settings.config_get("parity.allow_non_identical").unwrap(), json!(false));
+    // While the default holds, the state file has no parity member and is exactly what v0.1.0 wrote and read.
+    store.save(&mut loaded).unwrap();
+    let document: Value = serde_json::from_slice(&fs::read(store.settings_path()).unwrap()).unwrap();
+    assert!(document["settings"].get("parity").is_none());
+    let view = loaded.settings.config_show().unwrap();
+    assert_eq!(view["parity"], json!({"allow_non_identical": false}));
+    assert_eq!(view["parity_effect"]["effective"], false);
+    assert!(view["parity_effect"]["note"].as_str().unwrap().starts_with("disabled") || !NON_IDENTICAL_PATHS_AVAILABLE);
+
+    loaded.settings.config_set("parity.allow_non_identical", json!(true), 4).unwrap();
+    store.save(&mut loaded).unwrap();
+    let document: Value = serde_json::from_slice(&fs::read(store.settings_path()).unwrap()).unwrap();
+    assert_eq!(document["settings"]["parity"], json!({"allow_non_identical": true}));
+    let reloaded = store.load().unwrap();
+    assert!(reloaded.settings.parity.allow_non_identical);
+    assert_eq!(reloaded.settings.non_identical_enabled(), NON_IDENTICAL_PATHS_AVAILABLE);
+    let view = reloaded.settings.config_show().unwrap();
+    assert_eq!(view["parity"], json!({"allow_non_identical": true}));
+    assert_eq!(view["parity_effect"]["effective"], NON_IDENTICAL_PATHS_AVAILABLE);
+    let note = view["parity_effect"]["note"].as_str().unwrap();
+    if NON_IDENTICAL_PATHS_AVAILABLE {
+        assert!(note.starts_with("enabled") && note.contains("non_identical_paths"), "{note}");
+    } else {
+        assert!(note.starts_with("no effect in this macOS default build"), "{note}");
+    }
+
+    let mut settings = reloaded.settings;
+    settings.config_set("parity", json!({"allow_non_identical": false}), 4).unwrap();
+    assert!(!settings.parity.allow_non_identical);
+    for rejected in [json!("yes"), json!(1), Value::Null] {
+        assert!(matches!(settings.config_set("parity.allow_non_identical", rejected, 4), Err(SettingsError::InvalidField { .. })));
+    }
+    for rejected in [json!({"allow_non_identical": true, "extra": 1}), json!(true), json!({})] {
+        let before = settings.clone();
+        assert!(matches!(settings.config_set("parity", rejected, 4), Err(SettingsError::InvalidField { .. })));
+        assert_eq!(settings, before);
+    }
+    assert!(matches!(settings.config_set("parity.other", json!(true), 4), Err(SettingsError::InvalidField { .. })));
+    settings.config_set("parity.allow_non_identical", json!(true), 4).unwrap();
+    settings.config_reset(Some("parity.allow_non_identical"), &f.0, 4).unwrap();
+    assert!(!settings.parity.allow_non_identical);
+    settings.config_set("parity.allow_non_identical", json!(true), 4).unwrap();
+    settings.config_reset(None, &f.0, 4).unwrap();
+    assert!(!settings.parity.allow_non_identical);
+}

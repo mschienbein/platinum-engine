@@ -18,6 +18,7 @@ pub mod controller;
 pub mod distortion;
 pub mod dynamics;
 pub mod engine;
+pub mod error_code;
 pub mod file_workflow;
 pub mod flac;
 pub mod fp_mode;

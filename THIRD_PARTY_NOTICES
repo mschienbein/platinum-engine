@@ -1,4 +1,4 @@
-Platinum Engine v0.1.0 — third-party notices
+Platinum Engine v0.2.0 — third-party notices
 ===========================================
 
 Project-owned contributions are under LICENSE (MIT), subject to third-party
@@ -52,6 +52,21 @@ no Apple source was pasted. Apple reference source: Copyright (c) 2011 Apple
 Inc. All rights reserved. Its Apache-2.0 license text is reproduced in NOTICE.
 Derivative status and any applicable attribution requirements need maintainer
 review. Source: https://github.com/macosforge/alac/tree/c38887c5c5e64a4b31108733bd79ca9b2496d987
+
+Open-source MP3 decoder (opt-in, Linux and portable builds)
+-----------------------------------------------------------
+With `parity.allow_non_identical` enabled, Linux and `--features portable`
+builds decode MP3 input with src/portable/audio/mp3*.rs, a project-owned
+Layer III decoder written in safe Rust from ISO/IEC 11172-3 and 13818-3. It
+links no decoder library and contains no code from LAME, mpglib, mpg123,
+libmad, minimp3 or FFmpeg. Its Huffman code and length tables and its synthesis
+window are standard data (ISO/IEC 11172-3 Annex B); the generator
+tools/portable/mp3dec/gen_tables.py transcribes those numbers, not code, from
+the LAME 3.100 source archive listed above (libmp3lame/tables.c and
+mpglib/tabinit.c, LGPL-2.0-or-later) and checks each Huffman table as a prefix
+code. Whether numeric standard data taken from that source needs attribution
+beyond this notice needs maintainer review. The macOS default build does not
+use this decoder.
 
 Rust dependencies and standard library
 --------------------------------------

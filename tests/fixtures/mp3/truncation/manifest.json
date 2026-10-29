@@ -1,0 +1,42 @@
+[
+ {
+  "name": "lame_cbr128_44100_js",
+  "last_frame_bytes": 418,
+  "cuts": 418,
+  "apple_length_property": 13230,
+  "apple_bitrate": 128000,
+  "apple_frames_delivered": 13230,
+  "samples_file": "lame_cbr128_44100_js.apple.s16",
+  "channels": 2
+ },
+ {
+  "name": "tagless_cbr128_44100",
+  "last_frame_bytes": 418,
+  "cuts": 418,
+  "apple_length_property": 13824,
+  "apple_bitrate": 128000,
+  "apple_frames_delivered": 13824,
+  "samples_file": "tagless_cbr128_44100.apple.s16",
+  "channels": 2
+ },
+ {
+  "name": "lame_cbr32_11025_mono",
+  "last_frame_bytes": 209,
+  "cuts": 209,
+  "apple_length_property": 3308,
+  "apple_bitrate": 32000,
+  "apple_frames_delivered": 3308,
+  "samples_file": "lame_cbr32_11025_mono.apple.s16",
+  "channels": 1
+ },
+ {
+  "name": "lame_vbrV2_22050_js",
+  "last_frame_bytes": 26,
+  "cuts": 26,
+  "apple_length_property": 6615,
+  "apple_bitrate": 145578,
+  "apple_frames_delivered": 6615,
+  "samples_file": "lame_vbrV2_22050_js.apple.s16",
+  "channels": 2
+ }
+]

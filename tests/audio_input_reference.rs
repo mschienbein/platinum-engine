@@ -10,9 +10,9 @@ use std::path::PathBuf;
 fn suffix_dispatch_requires_an_explicit_library_and_pin() {
     for path in ["missing.flac", "missing.FLAC", "anythingfLaC"] {
         assert!(matches!(AudioReader::open(path, None, &InputLibraries::default()), Err(AudioInputError::MissingFlacLibrary)));
-        let libraries = InputLibraries { flac: Some(PathBuf::from("not-loaded.dylib")), flac_sha256: None };
+        let libraries = InputLibraries { flac: Some(PathBuf::from("not-loaded.dylib")), flac_sha256: None, ..Default::default() };
         assert!(matches!(AudioReader::open(path, None, &libraries), Err(AudioInputError::MissingFlacDigest)));
-        let libraries = InputLibraries { flac: Some(PathBuf::from("not-loaded.dylib")), flac_sha256: Some("not-a-hash".into()) };
+        let libraries = InputLibraries { flac: Some(PathBuf::from("not-loaded.dylib")), flac_sha256: Some("not-a-hash".into()), ..Default::default() };
         assert!(matches!(AudioReader::open(path, None, &libraries), Err(AudioInputError::InvalidInput(_))));
     }
 }
@@ -179,7 +179,7 @@ mod oracle {
     fn portable_flac_planes_match_generated_integer_samples() {
         let library = env_path("PN_FLAC_LIBRARY");
         let libraries = InputLibraries { flac: Some(library.clone()),
-            flac_sha256: Some(std::env::var("PN_FLAC_LIBRARY_SHA256").unwrap()) };
+            flac_sha256: Some(std::env::var("PN_FLAC_LIBRARY_SHA256").unwrap()), ..Default::default() };
         let dir = TestDir::new();
         for bits in [8u32, 16, 24, 32] {
             for channels in [1u32, 2, 6] {
@@ -210,7 +210,7 @@ mod oracle {
         let digest = std::env::var("PN_FLAC_LIBRARY_SHA256").expect("set PN_FLAC_LIBRARY_SHA256");
         let oracle = env_path("PN_FLAC_INPUT_ORACLE");
         let image = env_path("PN_MIKAUDIO_REFERENCE");
-        let libraries = InputLibraries { flac: Some(library.clone()), flac_sha256: Some(digest) };
+        let libraries = InputLibraries { flac: Some(library.clone()), flac_sha256: Some(digest), ..Default::default() };
         let dir = TestDir::new();
         // Frame counts straddle libFLAC's normal 4096-frame block, include an
         // empty stream and short tails; rates exercise the original no-op setter.
@@ -297,7 +297,7 @@ mod oracle {
         let digest = std::env::var("PN_FLAC_LIBRARY_SHA256").expect("set PN_FLAC_LIBRARY_SHA256");
         let oracle = env_path("PN_FLAC_INPUT_ORACLE");
         let image = env_path("PN_MIKAUDIO_REFERENCE");
-        let libraries = InputLibraries { flac: Some(library.clone()), flac_sha256: Some(digest) };
+        let libraries = InputLibraries { flac: Some(library.clone()), flac_sha256: Some(digest), ..Default::default() };
         let dir = TestDir::new();
         let cases = [
             (8, 1, 1, 48_000), (16, 1, 15, 22_050), (24, 1, 0, 48_000),

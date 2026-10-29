@@ -20,6 +20,158 @@ reference-platform comparisons run on the M4 Mac in the release battery.
 The portable math and vector implementations model the recorded M4 reference;
 finite test coverage does not establish universal cross-platform parity.
 
+## v0.2.0 changes and evidence
+
+v0.2.0 adds one explicit opt-in and one reporting contract and pins one native
+call context; it changes no processing numerics.
+
+- **Opt-in non-identical paths.** `parity.allow_non_identical` (default off)
+  enables, on Linux and `portable` builds only, an open-source deterministic
+  MP3 decoder and the byte-for-byte copy of embedded cover art. These two paths
+  are **not** claimed to match the macOS reference: the decoder equals
+  AudioToolbox on 95.08 % of 46.1 million samples of a 389-file generated corpus
+  with a 4-LSB maximum difference (identical on macOS arm64, Linux aarch64 and
+  Linux x86_64), and a copied picture is not what the macOS bridge writes. Each
+  affected item lists the path in `report.non_identical_paths`. With the setting
+  off, Linux behavior is the v0.1.0 identical-or-refuse behavior; on a macOS
+  default build it has no effect.
+- **Error codes.** Every failed item, batch error and top-level error carries a
+  stable `code`; the table is in the [CLI contract](../research/CLI_CONTRACT.md#error-codes).
+- **Unchanged.** Exit statuses, the command line, no-clobber and atomic
+  publication, ALAC, and AAC refusal on Linux (now with a code).
+- **macOS AAC call context.** AudioToolbox's AAC encoder runs its 512-point DFTs
+  with one of two kernels (SME or NEON) that it selects from the stack-pointer
+  residue (`sp` modulo 64) at the call: `ExtAudioFileWrite` takes the SME kernel
+  when the residue is 48, and the final drain inside `ExtAudioFileDispose` when
+  it is 32. An intermediate v0.2.0 build whose engine frames had merely changed
+  size produced different final AAC packets from v0.1.0 for 6 of 13 synthetic
+  inputs (a control build of the v0.1.0 source with an unrelated 48-byte local
+  reproduced the same bytes). Those two calls now go through a small aarch64
+  trampoline (`call_with_sp_residue`) that fixes the residue at 0, so both run
+  the NEON kernel, the one used by the v0.1.0 executable and by the four native
+  AAC-to-AAC references (the controlled-clock exports described under "AAC
+  decoder stack-context regression" below). The interleaved read list is a
+  separate, 64-byte-aligned wrapper (`#[repr(align(64))]`) and does not use the
+  trampoline. In scratch builds the 13 AAC outputs and the AAC waveform stayed
+  equal to v0.1.0's under six frame-size perturbations and eight
+  process-environment sizes, and the four native references still match. This is
+  an observation of the tested macOS arm64 AudioToolbox, not a cross-version
+  guarantee; the evidence is in `local-artifacts/release-v0.2.0/aac-layout-control-01/`.
+
+The evidence for this release is kept separate by claim, and ignored tests are
+never counted as passes:
+
+1. *Default-off equivalence on macOS.* A generated input set (16/24-bit WAV at
+   44.1 and 48 kHz, mono, clipped, noisy and silent material, AIFF, and FLAC,
+   ALAC, AAC and MP3 inputs) was processed with the v0.1.0 macOS executable and
+   the v0.2.0 executable using the same libraries, every output format, the
+   Official template and a fixed MP4 header second. Output files and the JSON
+   outcomes were compared after removing only the members v0.2.0 adds.
+2. *Default-off equivalence on Linux.* The same refusals, with the same messages
+   and now with codes, for MP3 and AAC input, AAC output, unreproduced
+   sample-rate conversion and artwork that needs Apple image transcoding.
+3. *Opt-in end to end on Linux.* Generated MP3 inputs and cover-art sources
+   processed with the setting on; the reported `non_identical_paths`, the
+   byte-for-byte picture comparison and the decoder's own tests.
+4. *Error codes.* Unit tests for every typed mapping and stage label, CLI
+   scenarios per reachable code, and a test that keeps the documented table,
+   `ErrorCode::ALL` and the scenario ledger identical.
+5. *Release builds and test counts* per platform, recorded at the source freeze
+   and listed in the next section.
+
+## v0.2.0 release evidence
+
+Source freeze `freeze-02` has source-manifest SHA-256
+`f6ff459965e75967095c9ccd9bfa05f8e73f0e8fdcbd6ed176d8731e1fdf3483`. Its
+executables, all built from that source, are:
+
+| Platform | Executable SHA-256 |
+| --- | --- |
+| macOS arm64 (privacy-remapped release build) | `75c2ac875f39bacac357544a704b821a489bc306935da85c0c5feff478d39260` |
+| Linux aarch64 | `7f2fea4fd1fee5ee265fc63f809c868cea6179f3293ace4faaa1ac69b1e4a56d` |
+| Linux x86_64 | `eb62ec42c73f233c94dd1e855655c1cc4548756acab743fe3b37abecf02275d0` |
+
+The macOS executable was rebuilt independently from the exported public tree with
+the recipe in [BUILD.md](BUILD.md) and matched byte for byte; both Linux
+executables were likewise rebuilt from the public export in the native-library
+images and matched. These are the executables in the release archives.
+
+**Source-freeze tests** (offline, locked, all targets; ignored tests are never
+counted as passes):
+
+- macOS default build: **512** passed, **0** failed, **190** ignored across 49
+  suites (516 passed if every `test result` line is counted). The opt-in lanes
+  passed 38/38 public-dependency tests, 1/1 waveform native replay, 1/1 Xing
+  unknown-byte oracle and 8/8 `error_codes` tests that need the macOS bridge.
+- Linux aarch64: **469** passed, **0** failed, **126** ignored (49 suites), plus
+  the library-gated lane (`error_codes`, `linux_opt_in`, `portable_art_copy`
+  with `--ignored`) **28** passed, 0 failed (3 suites).
+- Linux x86_64: **467** passed, **0** failed, **124** ignored (49 suites), plus
+  the library-gated lane **28** passed, 0 failed (3 suites).
+
+**macOS battery for `75c2ac87…`** (receipt `release-final-75c2ac87.json`, overall
+status bounded-complete-file-match-with-documented-context-limits, 0 failures):
+71/71 retained replay cases; 8/8 dynamics and pitch cases; 10/10 MP4 exports
+including the four native AAC-to-AAC references; the Xing E05 case; 5/5
+boundary cases; 11/11 strict family cases (byte-identical in a
+relocation-aware review: the native and candidate output folders differ and
+only that setting is substituted); 6/6 coverage extensions; 5/5 misnamed-Ogg
+cases (u02; the FLAC case is a documented native failure with no output on both
+sides); 4/4 failure inputs (f01; two matching native failures with no output);
+the W04 exact-path workflow, the CLI workflow smoke, gauge and waveform
+checks. The 13 synthetic AAC outputs equal v0.1.0's, and 120/120 output
+digests and 131/131 statuses are identical to v0.1.0. Default-off comparisons
+against the v0.1.0 macOS executable: 212 records, 0 stable differences.
+
+**Linux battery** (receipt `battery-linux/receipt.json`; per architecture;
+native libraries hashed before and after every run and matched by device and
+inode in `/proc/<pid>/maps`: of 10,606 observed child processes, 8,488 mapped a
+native library, every mapped file matched its pinned digest and none mapped an
+unexpected one). With the setting **off**:
+
+| Corpus | aarch64 | x86_64 |
+| --- | --- | --- |
+| Native references (132 cases) | 104 exact, 25 typed refusals, 3 matching native errors | 104 exact, 25 typed refusals, 3 matching native errors |
+| Workflows | 16 matching | 16 matching |
+| Differential stress (575 cases) | 535 exact, 40 sample-rate refusals | 535 exact, 40 sample-rate refusals |
+| Pitch | 30/30 exact | 30/30 exact |
+| Docker Desktop bind-mount subset (separate from the tmpfs main run) | 44 exact, 2 refusals, 1 native match, plus 16 workflows | not part of the x86_64 battery |
+
+Every output hash is identical to the v0.1.0 receipts (0 differences in each
+corpus). Default-off comparisons against the v0.1.0 Linux executables: 188
+records on each architecture, 0 stable differences. With the setting **on**,
+aarch64 and x86_64 agree on every scenario: MP3 160/160, cover art 157/157
+(854 cells), error codes 165/165 covering 37/37 codes (31 observed through the
+CLI, five not reachable from it, and cancellation exercised with SIGINT).
+
+**Known differences and limits** (none changes a default-path result):
+
+- A RIFF/WAVE file named `.mp3` is processed by content on Linux, with the
+  setting on or off; the macOS default build refuses it with
+  `invalid_input_file` because the Apple stack chooses by extension. This
+  predates v0.2.0.
+- `inspect` on a symlink returns `invalid_input_path` as the contract says on
+  Linux; the macOS builds return `io_error`.
+- W03 early cancellation depends on signal timing; when the first attempt does
+  not land in the analysis stage it is reconciled with the separate one-signal
+  probe, as in v0.1.0 (the original attempt is retained).
+- With the setting off, an MP3 with junk bytes before its first frame and no
+  ID3 tag is classified `unsupported_input_format` on Linux, while macOS decodes
+  it. The open-source decoder claims only confirmed MP3 streams.
+- The direct M4A-to-MP3 picture path is the reference path (not the opt-in
+  copy); its ID3 picture has type 0, no description, and `image/png` for GIF,
+  BMP and WebP bytes, as on macOS.
+- AAC input and output stay refused on Linux; WAV to WAV drops the last-saved
+  tag chunk, as the native application does; the x86_64 floating-point
+  residual classes described in [LINUX.md](LINUX.md) are unchanged.
+- Follow-ups for v0.3.0 include a stricter preflight for very large pictures
+  converted to ID3 (about sixteen 16 MiB FLAC pictures can pass the current
+  check and still exceed the ID3 size limit; the likely effect is a failed item,
+  not a corrupt publication) and hardening flags for the bridge build.
+
+All counts describe the recorded synthetic corpora and environments and are not
+a universal parity proof.
+
 ## v0.1.0 source freeze
 
 The regression-fixed source freeze has source-manifest SHA-256
@@ -229,7 +381,7 @@ specified FZ modes and the aligned-0 FFT profile.
 | GSM | The three-host optimized snapshot matched 117 packet cases, 42,258 blocks and 13,522,560 samples; its 12,288-mask reader corpus had zero mismatches and 179 reserved-mask cases were typed refusals. Later audio source replay coverage differs by platform as recorded in its inventory; the accepted mask subset is not universal. |
 | FLAC/LAME | Per Linux architecture, codec-03 matched 540 FLAC and 320 MP3 retained cases, 7,488 FLAC and 2,880 MP3 expanded cases, plus a 2,988,408-record one-frame FLAC rate/channel/depth sweep. Codec-04 additionally matched 5,244 FLAC stress/recovered-PCM cases per architecture. These are codec-only results, not all possible streams or full pipeline outputs. |
 | Bridge v07 | Each Linux architecture matched 604 transfers, 86 inspections and 232 source-status cases; 37 fault runs and nine WAV permission/umask cases had no reported failures. The macOS native-versus-portable matrix covered 690 cases, including 112 expected artwork refusals. Status/refusal evidence is not the same as a file-byte match for an accepted output. |
-| MP3 postflight | The final-source gate matched ten stream-description/length fields for 17,120 unique files, including selected final-battery outputs, with zero mismatches. This tests postflight fields, not complete-file encoding equivalence. |
+| MP3 postflight | The final-source gate matched ten stream-description/length fields for 17,120 unique files, including selected final-battery outputs, with zero mismatches. For v0.2.0 the `Info`-tag estimate was corrected for variable-bitrate output (`src/mp3.rs` SHA-256 `7eda250126953070837eca28fabb8fd1659078e4c5947b1f8cdd997b3fc05a7b`): the 17,120 prior rows were reconciled by SHA (17,080 files run) and 1,166 new Info-VBR, Xing and erased-identifier engine outputs were compared, all with zero mismatches (506 of those 1,166 mismatched before the fix; `local-artifacts/release-v0.2.0/mp3-info-vbr-01/REPORT.json`). This tests postflight fields, not complete-file encoding equivalence. |
 
 The component reports retain their source pins, commands, historical failures
 and exact scope in the private evidence inventory. The published source includes

@@ -23,6 +23,7 @@ use crate::multipass_graph::{GraphContext, MultipassGraph};
 use crate::phase::PhaseCorrection;
 use crate::pitch::{PitchMode, PitchProcessor};
 use crate::pitch_detect::PitchDetector;
+use crate::error_code::{self, ErrorCode};
 use crate::settings::Settings;
 use crate::tags::{self, TagBridge};
 use crate::templates::Template;
@@ -39,9 +40,12 @@ const VERSION: &str = "10.5.0.1256";
 /// An error is never a successful or partially successful processing report.
 /// `partial_publication` means the destination was published before an error;
 /// `retained_backup` and `recovery_path` identify files that must not be discarded.
+/// `code` is the stable machine-readable reason (see `error_code`); `stage` and
+/// `message` are diagnostic text.
 #[derive(Debug, Serialize)]
 pub struct EngineError {
     pub stage: &'static str,
+    pub code: ErrorCode,
     pub message: String,
     pub cancelled: bool,
     pub retained_backup: Option<PathBuf>,
@@ -49,11 +53,26 @@ pub struct EngineError {
     pub partial_publication: bool,
 }
 impl EngineError {
-    fn new(stage: &'static str, error: impl fmt::Display) -> Self {
-        Self { stage, message: error.to_string(), cancelled: false, retained_backup: None, recovery_path: None, partial_publication: false }
+    /// The code comes from the error's type when its variant has one meaning,
+    /// otherwise from the stage label.
+    fn new(stage: &'static str, error: impl fmt::Display + 'static) -> Self {
+        let code = error_code::classify(stage, &error);
+        Self { stage, code, message: error.to_string(), cancelled: false, retained_backup: None, recovery_path: None, partial_publication: false }
+    }
+    /// A failure whose code is fixed by the call site rather than its stage.
+    fn coded(stage: &'static str, code: ErrorCode, error: impl fmt::Display) -> Self {
+        Self { stage, code, message: error.to_string(), cancelled: false, retained_backup: None, recovery_path: None, partial_publication: false }
+    }
+    /// A native library that could not be loaded. A missing path, a directory, a dynamic-loader failure and an I/O
+    /// error while resolving or hashing the file are all `library_load_failed`; only a more specific typed answer
+    /// (an unapproved or mismatching digest) keeps its own code.
+    fn library_load(stage: &'static str, error: impl fmt::Display + 'static) -> Self {
+        let mut error = Self::new(stage, error);
+        if error.code == ErrorCode::IoError { error.code = ErrorCode::LibraryLoadFailed; }
+        error
     }
     fn cancelled(stage: &'static str) -> Self {
-        Self { stage, message: "processing cancelled".into(), cancelled: true, retained_backup: None, recovery_path: None, partial_publication: false }
+        Self { stage, code: ErrorCode::Cancelled, message: "processing cancelled".into(), cancelled: true, retained_backup: None, recovery_path: None, partial_publication: false }
     }
     fn workflow(stage: &'static str, error: WorkflowError) -> Self {
         let (backup, recovery, published) = match &error {
@@ -61,7 +80,13 @@ impl EngineError {
             _ => (None, None, false),
         };
         let cancelled = error.is_cancelled();
-        Self { stage, message: error.to_string(), cancelled, retained_backup: backup, recovery_path: recovery, partial_publication: published }
+        Self { stage, code: error.code(), message: error.to_string(), cancelled, retained_backup: backup, recovery_path: recovery, partial_publication: published }
+    }
+    /// A cancellation that a failed cleanup, abort or rollback turned into a failure is no
+    /// longer a clean cancel: `cancelled` and `code` must agree, so it reports `io_error`.
+    fn no_longer_a_clean_cancel(&mut self) {
+        self.cancelled = false;
+        if self.code == ErrorCode::Cancelled { self.code = ErrorCode::IoError; }
     }
 }
 impl fmt::Display for EngineError {
@@ -121,6 +146,11 @@ pub struct ProcessReport {
     /// Diagnostic only: the supplied second (since 1904) written to every MP4
     /// creation/modification header field instead of the AudioToolbox clock.
     pub controlled_mp4_time_1904: Option<u32>,
+    /// Paths used for this item that are not proven byte-identical to the macOS
+    /// reference: `mp3_decode` (open-source MP3 decoder) and `artwork_copy`
+    /// (embedded cover art copied unchanged). Always present; empty when every
+    /// path used is an identical one (always the case on macOS default builds).
+    pub non_identical_paths: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +178,9 @@ pub struct AnalysisReport {
     /// Present when the current file's marker names a readable original.
     pub original_waveform: Option<Waveform>,
     pub original_waveform_unavailable: Option<String>,
+    /// Non-identical paths whose output feeds these measurements (`mp3_decode`);
+    /// always present, empty when none was used.
+    pub non_identical_paths: Vec<&'static str>,
 }
 #[derive(Debug, Serialize)]
 pub struct ReportedDynamics {
@@ -199,20 +232,35 @@ pub struct InspectionReport {
     pub backup_exists: Option<bool>,
     pub backup_error: Option<String>,
     pub marker_json: Option<serde_json::Value>,
+    /// Non-identical paths that produced these decoder-derived properties
+    /// (`mp3_decode`); always present, empty when none was used.
+    pub non_identical_paths: Vec<&'static str>,
     #[serde(skip)]
     pub marker: Option<Marker>,
     #[serde(skip)]
     pub source_codec: SourceCodec,
 }
 
+/// Names listed in `non_identical_paths`.
+pub const NON_IDENTICAL_MP3_DECODE: &str = "mp3_decode";
+pub const NON_IDENTICAL_ARTWORK_COPY: &str = "artwork_copy";
+
+fn non_identical_paths(mp3_decode: bool, artwork_copy: bool) -> Vec<&'static str> {
+    let mut paths = Vec::new();
+    if mp3_decode { paths.push(NON_IDENTICAL_MP3_DECODE); }
+    if artwork_copy { paths.push(NON_IDENTICAL_ARTWORK_COPY); }
+    paths
+}
+
 fn input_libraries(settings: &Settings) -> InputLibraries {
-    InputLibraries { flac: settings.libraries.flac.clone(), flac_sha256: settings.libraries.flac_sha256.clone() }
+    InputLibraries { flac: settings.libraries.flac.clone(), flac_sha256: settings.libraries.flac_sha256.clone(),
+        allow_non_identical: settings.non_identical_enabled() }
 }
 fn bridge(settings: &Settings) -> Result<TagBridge, EngineError> {
-    let path = settings.libraries.tag_bridge.as_ref().ok_or_else(|| EngineError::new("tags", "a trusted TagLib bridge path is required"))?;
+    let path = settings.libraries.tag_bridge.as_ref().ok_or_else(|| EngineError::coded("tags", ErrorCode::LibraryNotConfigured, "a trusted TagLib bridge path is required"))?;
     // Settings selects the native executable. As with the codec dylibs the
     // caller is responsible for its provenance and executable initializers.
-    unsafe { TagBridge::load(path) }.map_err(|e| EngineError::new("tags", e))
+    unsafe { TagBridge::load(path) }.map_err(|e| EngineError::library_load("tags", e))
 }
 fn source_tag_format(path: &Path) -> Result<tags::Format, EngineError> {
     match file_workflow::source_type(path) {
@@ -221,7 +269,7 @@ fn source_tag_format(path: &Path) -> Result<tags::Format, EngineError> {
         Some(SourceType::Wav) => Ok(tags::Format::Wav),
         Some(SourceType::Aiff) => Ok(tags::Format::Aiff),
         Some(SourceType::Flac) => Ok(tags::Format::Flac),
-        Some(SourceType::ProtectedM4p | SourceType::ProtectedWlMp3) => Err(EngineError::new("input", "protected source is not admitted")),
+        Some(SourceType::ProtectedM4p | SourceType::ProtectedWlMp3) => Err(EngineError::coded("input", ErrorCode::ProtectedSource, "protected source is not admitted")),
         _ => Err(EngineError::new("input", format!("unsupported source {}", path.display()))),
     }
 }
@@ -598,7 +646,7 @@ fn decode_process_marker(payload: Option<&[u8]>, format: tags::Format, allow: bo
         Err((error, ambiguous)) => {
             match ambiguous {
                 Some(kind) if allow => Ok(InspectedMarker::AuthorizedAmbiguous(kind)),
-                Some(kind) => Err(EngineError::new("decode marker", format!(
+                Some(kind) => Err(EngineError::coded("decode marker", ErrorCode::MarkerAmbiguous, format!(
                     "{error}; ambiguous WAV marker ({kind}) requires --allow-ambiguous-marker for processing, subject to other safeguards; this may reprocess an already processed file"
                 ))),
                 None => Err(EngineError::new("decode marker", error)),
@@ -703,6 +751,7 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
     let reader = AudioReader::open(path, None, &input_libraries(settings)).map_err(|e| EngineError::new("open input", e))?;
     let source = reader.source_format();
     let codec = source_codec(path, source);
+    let non_identical = reader.non_identical();
     let frames = reader.file_length_frames().map_err(|e| EngineError::new("inspect length", e))?;
     if frames < 0 { return Err(EngineError::new("inspect length", "decoder returned a negative frame count")); }
     let (bitrate, bitrate_error) = match reader.bitrate() { Ok(b) => (Some(b), None), Err(e) => (None, Some(e.to_string())) };
@@ -716,7 +765,7 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
             let processed = Some(state != ProcessingState::Unprocessed);
             Ok(InspectionOutcome::Known(InspectionReport { path: path.to_owned(), input_format, sample_rate: source.sample_rate,
                 channels: source.channels_per_frame, bit_depth: source.bits_per_channel, frames: frames as u64,
-                bitrate, bitrate_error, processed,
+                bitrate, bitrate_error, processed, non_identical_paths: non_identical_paths(non_identical, false),
                 processing_state: processing_state.expect("known marker has a processing state"),
                 backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, tags_unavailable, marker, source_codec: codec }))
         }
@@ -731,7 +780,7 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
 pub fn inspect_file(path: &Path, settings: &Settings) -> Result<InspectionReport, EngineError> {
     match inspect_file_with_policy(path, settings, None)? {
         InspectionOutcome::Known(report) => Ok(report),
-        InspectionOutcome::AuthorizedAmbiguous { .. } => Err(EngineError::new("inspect marker", "ambiguous marker cannot be inspected")),
+        InspectionOutcome::AuthorizedAmbiguous { .. } => Err(EngineError::coded("inspect marker", ErrorCode::MarkerAmbiguous, "ambiguous marker cannot be inspected")),
     }
 }
 
@@ -795,6 +844,8 @@ struct Measured {
     processing_rate: f64,
     source: StreamDescription,
     codec: SourceCodec,
+    /// The open-source MP3 decoder produced the samples.
+    non_identical: bool,
     waveform: Option<Waveform>,
     waveform_unavailable: Option<String>,
 }
@@ -848,10 +899,10 @@ fn analyze_waveform(path: &Path, settings: &Settings, cancel: &Cancellation) -> 
     let client = reader.client_format();
     let channels = client.channels_per_frame as usize;
     if channels == 0 {
-        return Err(EngineError::new("waveform", "decoder has no channels"));
+        return Err(EngineError::coded("waveform", ErrorCode::InvalidInputFile, "decoder has no channels"));
     }
     if source_codec(path, source) == SourceCodec::Flac && channels > 2 {
-        return Err(EngineError::new("waveform", "native multichannel FLAC waveform reads an unwritten buffer suffix; no deterministic sample values are established"));
+        return Err(EngineError::coded("waveform", ErrorCode::UnsupportedInputFormat, "native multichannel FLAC waveform reads an unwritten buffer suffix; no deterministic sample values are established"));
     }
     let mut waveform = WaveformBuilder::new(path, client.sample_rate, channels);
     let mut samples = vec![0.0; BLOCK.checked_mul(channels)
@@ -875,6 +926,7 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     let original = AudioReader::open(path, None, &libraries).map_err(|e| EngineError::new("open analysis input", e))?;
     let source = original.source_format();
     let codec = source_codec(path, source);
+    let non_identical = original.non_identical();
     let rate = controller::processing_sample_rate(source.sample_rate, codec == SourceCodec::Mp3);
     original.close().map_err(|e| EngineError::new("close analysis input", e))?;
     #[cfg(any(target_os = "linux", feature = "portable"))]
@@ -885,7 +937,7 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     let mut reader = AudioReader::open(path, Some(rate), &libraries).map_err(|e| EngineError::new("open analysis input", e))?;
     reader.set_stereo_planar(rate).map_err(|e| EngineError::new("configure analysis input", e))?;
     let channels = source.channels_per_frame as usize;
-    if channels == 0 { return Err(EngineError::new("analysis", "decoder has no channels")); }
+    if channels == 0 { return Err(EngineError::coded("analysis", ErrorCode::InvalidInputFile, "decoder has no channels")); }
     let mut meter = LoudnessMeter::new(rate, channels).map_err(|e| EngineError::new("analysis meter", e))?;
     let mut detector = PitchDetector::new(rate as f32, channels).map_err(|e| EngineError::new("analysis pitch detector", e))?;
     let mut accounting = FrameAccounting::new(RenderPass::Analysis, None);
@@ -914,7 +966,7 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
         Some(analyze_waveform(path, settings, cancel)?)
     } else { None };
     Ok(Measured { values: AnalysisValues::from_measurements(meter.integrated_loudness(), detector.tuning_hz()),
-        frames: accounting.actual_input_frames, processing_rate: rate, source, codec, waveform, waveform_unavailable })
+        frames: accounting.actual_input_frames, processing_rate: rate, source, codec, non_identical, waveform, waveform_unavailable })
 }
 
 pub fn analyze_file(path: &Path, settings: &Settings, cancel: &Cancellation) -> Result<AnalysisReport, EngineError> {
@@ -934,7 +986,7 @@ fn analyze_file_with(
         expansion_applied: m.applied_expansion, compression_applied: m.applied_compression });
     let mut measured = analyze(path, settings, cancel, true)?;
     identity.verify(path).map_err(|e| EngineError::workflow("analyze source identity", e))?;
-    let (original_waveform, original_waveform_unavailable) = match state {
+    let (original_waveform, original_waveform_unavailable, original_non_identical) = match state {
         ProcessingState::Marked { backup: Some(path) } => match require_reportable_path(&path, "analyze original")
             .and_then(|()| {
                 let identity = file_workflow::FileIdentity::capture(&path).map_err(|e| EngineError::workflow("inspect original identity", e))?;
@@ -942,13 +994,15 @@ fn analyze_file_with(
                 identity.verify(&path).map_err(|e| EngineError::workflow("analyze original identity", e))?;
                 Ok(original)
             }) {
-                Ok(original) => (original.waveform, original.waveform_unavailable),
+                // Only the backup's waveform reaches the report: an unavailable waveform means its decode produced nothing.
+                Ok(original) => { let produced = original.non_identical && original.waveform.is_some();
+                                  (original.waveform, original.waveform_unavailable, produced) }
                 Err(error) if error.cancelled => return Err(error),
-                Err(error) => (None, Some(error.to_string())),
+                Err(error) => (None, Some(error.to_string()), false),
             },
-        ProcessingState::Marked { backup: None } => (None, Some("processing marker does not record a backup path".to_owned())),
-        ProcessingState::Suffixed => (None, Some("suffix-only processed state does not identify an original".to_owned())),
-        ProcessingState::Unprocessed => (None, None),
+        ProcessingState::Marked { backup: None } => (None, Some("processing marker does not record a backup path".to_owned()), false),
+        ProcessingState::Suffixed => (None, Some("suffix-only processed state does not identify an original".to_owned()), false),
+        ProcessingState::Unprocessed => (None, None, false),
     };
     let unavailable = if marked.is_some() { vec!["new clip and dynamics measurements require the healing pass".to_owned()] }
         else { vec!["clip-repair count and dynamics adjustments require the healing pass".to_owned()] };
@@ -959,7 +1013,8 @@ fn analyze_file_with(
         processing_marker: inspection.marker_json, dynamics,
         unavailable,
         waveform: measured.waveform.take(), waveform_unavailable: measured.waveform_unavailable.take(),
-        original_waveform, original_waveform_unavailable })
+        original_waveform, original_waveform_unavailable,
+        non_identical_paths: non_identical_paths(measured.non_identical || original_non_identical, false) })
 }
 
 /// One wrapper: model writes precede the first callback. The native 50 ms
@@ -1247,7 +1302,7 @@ fn healing_pass(path: &Path, temp: &TempCaf, measured: &Measured, plan: &Healing
     let rate = measured.processing_rate;
     let channels = measured.source.channels_per_frame as usize;
     if !(1..=64).contains(&channels) {
-        return Err(EngineError::new("healing channel layout", format!("unsupported channel count {channels}")));
+        return Err(EngineError::coded("healing channel layout", ErrorCode::UnsupportedInputFormat, format!("unsupported channel count {channels}")));
     }
     // The effect graph negotiates stereo planar on every effect even when the
     // final GenericOutput and source container are mono or multichannel.
@@ -1355,14 +1410,14 @@ impl EncodingLibraries {
     fn load(format: AudioFormat, settings: &Settings) -> Result<Self, EngineError> {
         let mut result = Self { flac: None, lame: None };
         if format == AudioFormat::Flac {
-            let path = settings.libraries.flac.as_ref().ok_or_else(|| EngineError::new("load FLAC encoder", "trusted libFLAC path is required"))?;
-            let expected = settings.libraries.flac_sha256.as_ref().ok_or_else(|| EngineError::new("load FLAC encoder", "libFLAC SHA-256 pin is required"))?;
-            result.flac = Some(crate::flac::FlacLibrary::load(path, expected).map_err(|e| EngineError::new("load FLAC encoder", e))?);
+            let path = settings.libraries.flac.as_ref().ok_or_else(|| EngineError::coded("load FLAC encoder", ErrorCode::LibraryNotConfigured, "trusted libFLAC path is required"))?;
+            let expected = settings.libraries.flac_sha256.as_ref().ok_or_else(|| EngineError::coded("load FLAC encoder", ErrorCode::LibraryNotConfigured, "libFLAC SHA-256 pin is required"))?;
+            result.flac = Some(crate::flac::FlacLibrary::load(path, expected).map_err(|e| EngineError::library_load("load FLAC encoder", e))?);
         }
         if format == AudioFormat::Mp3 {
-            let path = settings.libraries.lame.as_ref().ok_or_else(|| EngineError::new("load MP3 encoder", "trusted LAME path is required"))?;
-            let digest = settings.libraries.lame_sha256.as_deref().ok_or_else(|| EngineError::new("load MP3 encoder", "LAME SHA-256 pin is required"))?;
-            result.lame = Some(crate::mp3::LameLibrary::load(path, digest).map_err(|e| EngineError::new("load MP3 encoder", e))?);
+            let path = settings.libraries.lame.as_ref().ok_or_else(|| EngineError::coded("load MP3 encoder", ErrorCode::LibraryNotConfigured, "trusted LAME path is required"))?;
+            let digest = settings.libraries.lame_sha256.as_deref().ok_or_else(|| EngineError::coded("load MP3 encoder", ErrorCode::LibraryNotConfigured, "LAME SHA-256 pin is required"))?;
+            result.lame = Some(crate::mp3::LameLibrary::load(path, digest).map_err(|e| EngineError::library_load("load MP3 encoder", e))?);
         }
         Ok(result)
     }
@@ -1678,7 +1733,7 @@ fn abort_with(mut error: EngineError, staged: file_workflow::StagedOutput) -> En
     match staged.abort() {
         Ok(report) => error.retained_backup = report.retained_backup.or(backup),
         Err(cleanup) => {
-            error.cancelled = false;
+            error.no_longer_a_clean_cancel();
             error.message.push_str(&format!("; abort failed: {cleanup}"));
             if let WorkflowError::Transaction { backup: b, recovery, published, .. } = &cleanup {
                 error.retained_backup = b.clone().or(backup);
@@ -1692,7 +1747,7 @@ fn abort_with(mut error: EngineError, staged: file_workflow::StagedOutput) -> En
 
 fn merge_writer_abort(mut primary: EngineError, cleanup: Result<(), EngineError>) -> EngineError {
     if let Err(error) = cleanup {
-        primary.cancelled = false;
+        primary.no_longer_a_clean_cancel();
         primary.message.push_str(&format!("; writer abort failed: {error}"));
     }
     primary
@@ -1720,11 +1775,11 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         AudioFormat::Aac | AudioFormat::Alac => prepared.controlled_mp4_time_1904,
         _ => None,
     };
-    let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str), EngineError> {
+    let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str, bool), EngineError> {
         let measured = analyze(input, settings, cancel, false)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after analysis", e))?;
         if measured.codec != prepared.source_codec {
-            return Err(EngineError::new("analysis input", "source codec changed since inspection"));
+            return Err(EngineError::coded("analysis input", ErrorCode::SourceChanged, "source codec changed since inspection"));
         }
         let plan_healing = HealingPlan::from_analysis(template, measured.values);
         let healed = healing_pass(input, &temp, &measured, &plan_healing, plan.is_replacement(), settings, cancel)?;
@@ -1757,8 +1812,11 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         let bridge = bridge(settings)?;
         let tag_source = staged.backup_path().unwrap_or(input);
         staged.remember_staging_file().map_err(|e| EngineError::workflow("verify output stage", e))?;
-        let report = bridge.transfer(tag_source, staged.staging_path(), source_tag_format(input)?,
-            output_tag_format(plan.format()), choice, &marker).map_err(|e| EngineError::new("copy source tags", e))?;
+        // Embedded artwork is copied unchanged only under the explicit opt-in; otherwise the reference policy applies.
+        let options = tags::TransferOptions { copy_artwork: settings.non_identical_enabled() };
+        let report = bridge.transfer_with_options(tag_source, staged.staging_path(), source_tag_format(input)?,
+            output_tag_format(plan.format()), choice, &marker, options).map_err(|e| EngineError::new("copy source tags", e))?;
+        let artwork_copied = report.artwork_copied;
         if !report.is_success() {
             return Err(EngineError::new("copy source tags", format!("copy error: {:?}; marker error: {:?}", report.copy_error, report.marker_error)));
         }
@@ -1782,13 +1840,13 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         };
         let encoded = inspect_encoded(staged.staging_path(), plan.format(), settings)?;
         check_cancel(cancel, "publication")?;
-        Ok((measured, healed, final_result, encoded, marker_status))
+        Ok((measured, healed, final_result, encoded, marker_status, artwork_copied))
     })();
     let cleanup = temp.cleanup();
-    let (measured, healed, output, encoded, marker_status) = match (run, cleanup) {
+    let (measured, healed, output, encoded, marker_status, artwork_copied) = match (run, cleanup) {
         (Ok(result), Ok(())) => result,
         (Err(mut error), Err(cleanup)) => {
-            error.cancelled = false;
+            error.no_longer_a_clean_cancel();
             error.message.push_str(&format!("; intermediate cleanup failed: {cleanup}"));
             return Err(abort_with(error, staged));
         }
@@ -1809,7 +1867,8 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         output_volume: output.output_volume, input_pitch_hz: measured.values.input_tuning_hz, output_pitch_hz: output_pitch,
         tempo_factor: healed.tempo_factor, clip_count: healed.clip_count, applied_stages: stages, processing_marker_status: marker_status,
         input_marker_override: prepared.input_marker_override, source_tags_unavailable: prepared.source_tags_unavailable.clone(),
-        controlled_mp4_time_1904: controlled_mp4_time })
+        controlled_mp4_time_1904: controlled_mp4_time,
+        non_identical_paths: non_identical_paths(measured.non_identical, artwork_copied) })
 }
 
 #[cfg(test)]
@@ -1849,8 +1908,50 @@ mod tests {
         let primary = EngineError::cancelled("final render");
         let combined = merge_writer_abort(primary, Err(EngineError::new("close intermediate", "OSStatus -1")));
         assert!(!combined.cancelled);
+        assert_eq!(combined.code, ErrorCode::IoError, "a failed abort is not a clean cancellation");
         assert_eq!(combined.stage, "final render");
         assert!(combined.message.contains("writer abort failed: close intermediate: OSStatus -1"));
+    }
+
+    #[test]
+    fn a_cleared_cancellation_never_keeps_the_cancelled_code() {
+        let mut cancelled = EngineError::cancelled("healing");
+        assert_eq!(cancelled.code, ErrorCode::Cancelled);
+        cancelled.no_longer_a_clean_cancel();
+        assert!(!cancelled.cancelled);
+        assert_eq!(cancelled.code, ErrorCode::IoError);
+        let mut other = EngineError::coded("analysis", ErrorCode::ProcessingFailed, "x");
+        other.no_longer_a_clean_cancel();
+        assert_eq!(other.code, ErrorCode::ProcessingFailed);
+    }
+
+    #[test]
+    fn libraries_that_cannot_be_loaded_report_library_load_failed() {
+        let root = TempCaf::new().unwrap();
+        let mut settings = Settings::defaults(&root.directory, 1);
+        let digest = "0".repeat(64);
+        let missing = root.directory.join("no/such/library");
+        let directory = root.directory.join("a-directory");
+        fs::create_dir(&directory).unwrap();
+        for path in [&missing, &directory] {
+            settings.libraries.tag_bridge = Some(path.clone());
+            settings.libraries.flac = Some(path.clone());
+            settings.libraries.flac_sha256 = Some(digest.clone());
+            settings.libraries.lame = Some(path.clone());
+            settings.libraries.lame_sha256 = Some(digest.clone());
+            let error = bridge(&settings).err().expect("a missing path or a directory is not a bridge");
+            assert_eq!((error.stage, error.code), ("tags", ErrorCode::LibraryLoadFailed), "{}", error.message);
+            for (format, stage) in [(AudioFormat::Flac, "load FLAC encoder"), (AudioFormat::Mp3, "load MP3 encoder")] {
+                let error = EncodingLibraries::load(format, &settings).err().expect("a missing path or a directory is not a library");
+                assert_eq!((error.stage, error.code), (stage, ErrorCode::LibraryLoadFailed), "{}", error.message);
+            }
+        }
+        // An I/O error stays `io_error` elsewhere, and a typed identity answer keeps its own code.
+        let io = || crate::mp3::Mp3Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(EngineError::new("encode MP3 output", io()).code, ErrorCode::IoError);
+        assert_eq!(EngineError::library_load("load MP3 encoder", io()).code, ErrorCode::LibraryLoadFailed);
+        let mismatch = crate::mp3::Mp3Error::DigestMismatch { expected: "a".into(), actual: "b".into() };
+        assert_eq!(EngineError::library_load("load MP3 encoder", mismatch).code, ErrorCode::LibraryUnapproved);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::metadata::{self, Marker, MarkerError};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -161,10 +161,32 @@ pub struct TransferReport {
     pub mode: TransferMode,
     pub copy_error: Option<String>,
     pub marker_error: Option<String>,
+    /// True when, under `TransferOptions::copy_artwork`, the bridge stored at
+    /// least one embedded picture byte-for-byte where the reference bridge
+    /// would have transcoded it to PNG (generic copies) or dropped it (FLAC
+    /// direct copies). Such an output is not byte-identical to macOS. Only set when
+    /// the whole transfer succeeded (`is_success`).
+    pub artwork_copied: bool,
 }
 impl TransferReport {
     pub fn is_success(&self) -> bool { self.copy_error.is_none() && self.marker_error.is_none() }
 }
+
+/// Opt-in, non-identical transfer behaviour. The default is the reference
+/// policy: the portable bridge refuses artwork that would need Apple image
+/// transcoding (status 2). Only meaningful with a portable bridge exporting
+/// the artwork extension; `copy_artwork` with any other bridge is refused with
+/// `TagError::ArtworkTranscodeUnavailable` before anything is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransferOptions {
+    /// Copy embedded pictures (FLAC PICTURE, ID3 APIC, MP4 covr) unchanged
+    /// instead of transcoding or refusing them. Refuses malformed pictures and
+    /// pictures the destination cannot store as-is.
+    pub copy_artwork: bool,
+}
+const COPY_ARTWORK_BYTES: c_uint = 1;
+const RESULT_ARTWORK_COPIED: c_uint = 1;
+const FEATURE_ARTWORK_COPY: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -183,6 +205,13 @@ type SerializeMarker = unsafe extern "C" fn(*mut c_void, *mut Payload) -> c_int;
 type RewriteWav = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 type CopyGeneric = unsafe extern "C" fn(c_int, c_int, *const c_char, *const c_char, SerializeMarker, RewriteWav, *mut c_void, *mut c_char, usize) -> c_int;
 type SaveMarker = unsafe extern "C" fn(c_int, *const c_char, SerializeMarker, RewriteWav, *mut c_void, *mut c_char, usize) -> c_int;
+type Features = unsafe extern "C" fn() -> u32;
+type CopyDirectEx = unsafe extern "C" fn(c_uint, c_int, *const c_char, *const c_char, *mut c_uint, *mut c_char, usize) -> c_int;
+type CopyGenericEx = unsafe extern "C" fn(c_uint, c_int, c_int, *const c_char, *const c_char, SerializeMarker, RewriteWav, *mut c_void, *mut c_uint, *mut c_char, usize) -> c_int;
+/// Optional ABI-5 extension: absent from the macOS bridge and from bridges
+/// built before artwork copying existed.
+#[derive(Clone, Copy)]
+struct ArtworkExtension { direct: CopyDirectEx, generic: CopyGenericEx }
 type ReceiveMarker = unsafe extern "C" fn(*mut c_void, *const u8, usize, c_int) -> c_int;
 type ReadMarker = unsafe extern "C" fn(c_int, *const c_char, ReceiveMarker, *mut c_void, *mut c_char, usize) -> c_int;
 type ReceiveInspection = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> c_int;
@@ -308,6 +337,7 @@ pub struct TagBridge {
     marker: SaveMarker,
     read_marker: ReadMarker,
     inspect: Inspect,
+    artwork: Option<ArtworkExtension>,
 }
 impl TagBridge {
     /// # Safety
@@ -345,7 +375,17 @@ impl TagBridge {
             let inspect: Inspect = *lib.get(b"pn_tag_inspect\0").map_err(|e| TagError::Library(e.to_string()))?;
             (direct, generic, marker, read_marker, inspect)
         };
-        Ok(Self { _library: lib, _pinned: pinned, path, direct, generic, marker, read_marker, inspect })
+        // SAFETY: same trust contract; the extension is used only when all
+        // three symbols exist and the bridge reports the artwork-copy feature.
+        let artwork = unsafe {
+            match (lib.get::<Features>(b"pn_tag_bridge_features\0"), lib.get::<CopyDirectEx>(b"pn_tag_copy_direct_ex\0"),
+                   lib.get::<CopyGenericEx>(b"pn_tag_copy_generic_ex\0")) {
+                (Ok(features), Ok(direct), Ok(generic)) if (*features)() & FEATURE_ARTWORK_COPY != 0 =>
+                    Some(ArtworkExtension { direct: *direct, generic: *generic }),
+                _ => None,
+            }
+        };
+        Ok(Self { _library: lib, _pinned: pinned, path, direct, generic, marker, read_marker, inspect, artwork })
     }
     pub fn bridge_path(&self) -> &Path { &self.path }
     /// SHA-256 of the retained, descriptor-bound bridge image.
@@ -396,26 +436,46 @@ impl TagBridge {
         context.result.ok_or_else(|| TagError::Library("marker reader returned no callback".into()))
     }
 
+    /// Whether the loaded bridge can copy artwork byte-for-byte.
+    pub fn supports_artwork_copy(&self) -> bool { self.artwork.is_some() }
+
     /// Transfers into a separate, pre-existing destination staging file.
     /// `marker` is constructed by the caller from the actual processing result.
     /// Generic copying and marker insertion share one native save; direct copy
     /// commits before reopening the destination for marker insertion.
     pub fn transfer(&self, source: impl AsRef<Path>, destination: impl AsRef<Path>, source_format: Format,
                     destination_format: Format, choice: OutputChoice, marker: &Marker) -> Result<TransferReport, TagError> {
+        self.transfer_with_options(source, destination, source_format, destination_format, choice, marker, TransferOptions::default())
+    }
+
+    /// `transfer` with explicit options; see `TransferOptions`.
+    pub fn transfer_with_options(&self, source: impl AsRef<Path>, destination: impl AsRef<Path>, source_format: Format,
+                                 destination_format: Format, choice: OutputChoice, marker: &Marker,
+                                 options: TransferOptions) -> Result<TransferReport, TagError> {
         let source = source.as_ref(); let destination = destination.as_ref();
+        let artwork = if options.copy_artwork {
+            Some(self.artwork.ok_or_else(|| TagError::ArtworkTranscodeUnavailable(
+                "the loaded tag bridge cannot copy artwork byte-for-byte".into()))?)
+        } else { None };
         let mode = transfer_mode(source_format, destination_format, choice)?;
         let src_meta = fs::metadata(source).map_err(|e| io_error("inspect source tag file", e))?;
         let dst_meta = fs::metadata(destination).map_err(|e| io_error("inspect staging tag file", e))?;
         if src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino() { return Err(TagError::SourceIsDestination); }
         let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
         let dst = CString::new(destination.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
-        let mut report = TransferReport { mode, copy_error: None, marker_error: None };
+        let mut report = TransferReport { mode, copy_error: None, marker_error: None, artwork_copied: false };
+        let mut result: c_uint = 0;
         match mode {
             TransferMode::Direct(op) => {
                 let error = native_call(|out, len| {
                     // SAFETY: function came from a caller-trusted bridge, paths
                     // and writable output buffer live through this call.
-                    unsafe { (self.direct)(op as c_int, src.as_ptr(), dst.as_ptr(), out, len) }
+                    unsafe {
+                        match artwork {
+                            Some(extension) => (extension.direct)(COPY_ARTWORK_BYTES, op as c_int, src.as_ptr(), dst.as_ptr(), &mut result, out, len),
+                            None => (self.direct)(op as c_int, src.as_ptr(), dst.as_ptr(), out, len),
+                        }
+                    }
                 });
                 report.copy_error = match error {
                     Some(error) if error.status == 3 => None,
@@ -430,7 +490,13 @@ impl TagBridge {
                 report.copy_error = match native_with_marker(marker, |callback, rewrite, context, out, len| {
                     // SAFETY: the bridge is trusted, all borrowed pointers
                     // remain live during this synchronous callback-based call.
-                    unsafe { (self.generic)(source_format as c_int, destination_format as c_int, src.as_ptr(), dst.as_ptr(), callback, rewrite, context, out, len) }
+                    unsafe {
+                        match artwork {
+                            Some(extension) => (extension.generic)(COPY_ARTWORK_BYTES, source_format as c_int, destination_format as c_int,
+                                src.as_ptr(), dst.as_ptr(), callback, rewrite, context, &mut result, out, len),
+                            None => (self.generic)(source_format as c_int, destination_format as c_int, src.as_ptr(), dst.as_ptr(), callback, rewrite, context, out, len),
+                        }
+                    }
                 }) {
                     Ok(error) => error,
                     Err(TagError::SourceContainerUnavailable(_)) => {
@@ -444,6 +510,9 @@ impl TagBridge {
                 }
             }
         }
+        // Only a transfer that fully succeeded reports its pictures as copied: a copy or marker
+        // failure after the bridge copied them leaves no usable file, and the item then fails.
+        report.artwork_copied = report.is_success() && result & RESULT_ARTWORK_COPIED != 0;
         Ok(report)
     }
     fn save_marker(&self, c_path: &CStr, format: Format, marker: &Marker) -> Result<Option<String>, TagError> {

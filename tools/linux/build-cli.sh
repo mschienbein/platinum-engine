@@ -66,11 +66,19 @@ exec "$@" "$image" sh -c '
   build=$?
   cargo test "$@" --locked --all-targets > /out/test.stdout 2> /out/test.stderr
   test=$?
+  # Library-gated lane: scenario tests that need the native libraries of this image.
+  lib=/opt/platinum-native/lib
+  PLATINUM_TEST_TAG_BRIDGE=$lib/libpn-tag-bridge.so PN_TAG_BRIDGE=$lib/libpn-tag-bridge.so \
+    PN_FLAC_LIB=$lib/libFLAC.so PN_FLAC_SHA256=$(sha256sum $lib/libFLAC.so | cut -d" " -f1) \
+    PN_LAME_LIB=$lib/libmp3lame.so PN_LAME_SHA256=$(sha256sum $lib/libmp3lame.so | cut -d" " -f1) \
+    cargo test "$@" --locked --test error_codes --test linux_opt_in --test portable_art_copy -- --ignored > /out/ignored.stdout 2> /out/ignored.stderr
+  gated=$?
   printf "%s\n" "$build" > /out/build.status
   printf "%s\n" "$test" > /out/test.status
+  printf "%s\n" "$gated" > /out/ignored.status
   artifact=0
   if [ "$PN_LINUX_TMP_TARGET" = 1 ] && [ "$build" -eq 0 ]; then
     mkdir -p /out/target/release && cp /tmp/target/release/platinum /out/target/release/platinum || artifact=$?
   fi
-  [ "$build" -eq 0 ] && [ "$test" -eq 0 ] && [ "$artifact" -eq 0 ]
+  [ "$build" -eq 0 ] && [ "$test" -eq 0 ] && [ "$gated" -eq 0 ] && [ "$artifact" -eq 0 ]
 '

@@ -64,6 +64,15 @@ struct SourceContainerUnavailable : std::runtime_error {
     explicit SourceContainerUnavailable(const char *message) : std::runtime_error(message) {}
 };
 
+// Status 2: artwork the reference would transcode with Apple's image stack
+// (default message), or, under PN_TAG_COPY_ARTWORK_BYTES, a picture that is
+// malformed or that the destination cannot store as-is.
+struct ArtworkTranscode : std::runtime_error {
+    ArtworkTranscode() : std::runtime_error(
+        "portable tag bridge refuses artwork requiring Apple NSImage/ImageIO transcoding") {}
+    explicit ArtworkTranscode(const std::string &message) : std::runtime_error(message) {}
+};
+
 
 // Record I/O failures even when TagLib can continue parsing the source.
 class CheckedInputStream : public FileStream {
@@ -405,6 +414,452 @@ struct State {
         return file->save();
     }
 };
+
+// ---------------------------------------------------------------------------
+// Opt-in artwork byte copy (PN_TAG_COPY_ARTWORK_BYTES).
+//
+// The reference decodes each picture with NSImage and stores a PNG; pictures
+// it cannot decode are silently dropped. Linux has no equivalent decoder, so
+// under the flag the encoded bytes are carried over unchanged after a
+// structural check. The check walks each format's own framing without decoding
+// pixels and tolerates metadata and trailing data, but rejects truncated or
+// unrecognizable data so that only a complete image is stored under an image
+// MIME type. Recognized formats: JPEG, PNG, GIF, BMP, WebP.
+
+enum class ImageKind { JPEG, PNG, GIF, BMP, WebP };
+struct ImageInfo {
+    ImageKind kind = ImageKind::PNG;
+    uint32_t width = 0, height = 0, depth = 0, colors = 0;
+};
+
+uint32_t rd_be16(const uint8_t *p) { return (uint32_t(p[0]) << 8) | p[1]; }
+uint32_t rd_be32(const uint8_t *p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+uint32_t rd_le16(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8); }
+uint32_t rd_le32(const uint8_t *p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+bool parse_png(const uint8_t *p, size_t n, ImageInfo &info, std::string &why) {
+    static const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    if (n < 8 || std::memcmp(p, signature, 8) != 0) { why = "bad PNG signature"; return false; }
+    size_t pos = 8;
+    bool header = false, data = false, palette = false;
+    unsigned color_type = 0, bit_depth = 0;
+    uint32_t colors = 0;
+    for (;;) {
+        if (n - pos < 12) { why = "truncated PNG (no IEND chunk)"; return false; }
+        const uint32_t length = rd_be32(p + pos);
+        const uint8_t *type = p + pos + 4, *body = p + pos + 8;
+        if (length > n - pos - 12) { why = "truncated PNG chunk"; return false; }
+        for (int i = 0; i < 4; ++i)
+            if (((type[i] | 0x20) < 'a') || ((type[i] | 0x20) > 'z')) { why = "invalid PNG chunk type"; return false; }
+        if (!header) {
+            if (std::memcmp(type, "IHDR", 4) != 0 || length != 13) { why = "PNG does not start with IHDR"; return false; }
+            const uint32_t width = rd_be32(body), height = rd_be32(body + 4);
+            bit_depth = body[8]; color_type = body[9];
+            const bool combination =
+                (color_type == 0 && (bit_depth == 1 || bit_depth == 2 || bit_depth == 4 || bit_depth == 8 || bit_depth == 16)) ||
+                (color_type == 2 && (bit_depth == 8 || bit_depth == 16)) ||
+                (color_type == 3 && (bit_depth == 1 || bit_depth == 2 || bit_depth == 4 || bit_depth == 8)) ||
+                (color_type == 4 && (bit_depth == 8 || bit_depth == 16)) ||
+                (color_type == 6 && (bit_depth == 8 || bit_depth == 16));
+            if (!combination || body[10] != 0 || body[11] != 0 || body[12] > 1) { why = "invalid PNG header"; return false; }
+            if (width == 0 || height == 0 || width > 0x7fffffffu || height > 0x7fffffffu) {
+                why = "PNG has zero or oversized dimensions"; return false;
+            }
+            info.width = width; info.height = height; header = true;
+        } else if (std::memcmp(type, "PLTE", 4) == 0) {
+            if (length == 0 || length % 3 != 0 || length / 3 > 256) { why = "invalid PNG palette"; return false; }
+            palette = true; colors = length / 3;
+        } else if (std::memcmp(type, "IDAT", 4) == 0) {
+            data = true;
+        } else if (std::memcmp(type, "IEND", 4) == 0) {
+            if (length != 0) { why = "invalid PNG IEND chunk"; return false; }
+            if (!data || (color_type == 3 && !palette)) { why = "PNG has no image data"; return false; }
+            const unsigned channels = color_type == 2 ? 3 : color_type == 4 ? 2 : color_type == 6 ? 4 : 1;
+            info.depth = bit_depth * channels;
+            info.colors = color_type == 3 ? colors : 0;
+            return true;
+        }
+        pos += 12 + static_cast<size_t>(length);
+    }
+}
+
+bool parse_jpeg(const uint8_t *p, size_t n, ImageInfo &info, std::string &why) {
+    if (n < 4 || p[0] != 0xff || p[1] != 0xd8) { why = "bad JPEG signature"; return false; }
+    size_t pos = 2;
+    bool frame = false, scan = false;
+    while (pos < n) {
+        if (p[pos] != 0xff) { why = "JPEG marker expected"; return false; }
+        while (pos < n && p[pos] == 0xff) ++pos;
+        if (pos >= n) break;
+        const uint8_t marker = p[pos++];
+        if (marker == 0x00 || marker == 0xd8) { why = "invalid JPEG marker"; return false; }
+        if (marker == 0xd9) {
+            if (!frame) { why = "JPEG ends before a frame header"; return false; }
+            if (!scan) { why = "JPEG has no scan data"; return false; }
+            return true;
+        }
+        if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+        if (n - pos < 2) break;
+        const size_t length = rd_be16(p + pos);
+        if (length < 2 || length > n - pos) { why = "truncated JPEG segment"; return false; }
+        const uint8_t *segment = p + pos + 2;
+        const size_t body = length - 2;
+        const bool start_of_frame = marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+        if (start_of_frame && !frame) {
+            if (body < 6) { why = "invalid JPEG frame header"; return false; }
+            const unsigned precision = segment[0], components = segment[5];
+            const uint32_t height = rd_be16(segment + 1), width = rd_be16(segment + 3);
+            if (precision == 0 || precision > 16 || width == 0 || height == 0 || components == 0 ||
+                components > 4 || body < 6 + 3 * static_cast<size_t>(components)) {
+                why = "invalid JPEG frame header"; return false;
+            }
+            info.width = width; info.height = height; info.depth = precision * components; info.colors = 0;
+            frame = true;
+        }
+        pos += length;
+        if (marker == 0xda) {
+            if (!frame) { why = "JPEG scan before its frame header"; return false; }
+            scan = true;
+            while (pos < n) {
+                if (p[pos] != 0xff) { ++pos; continue; }
+                if (pos + 1 >= n) { pos = n; break; }
+                const uint8_t next = p[pos + 1];
+                if (next == 0x00 || (next >= 0xd0 && next <= 0xd7)) { pos += 2; continue; }
+                if (next == 0xff) { ++pos; continue; }
+                break;
+            }
+        }
+    }
+    why = "truncated JPEG (no EOI marker)";
+    return false;
+}
+
+bool skip_gif_sub_blocks(const uint8_t *p, size_t n, size_t &pos) {
+    while (pos < n) {
+        const size_t size = p[pos++];
+        if (size == 0) return true;
+        if (n - pos < size) return false;
+        pos += size;
+    }
+    return false;
+}
+
+bool parse_gif(const uint8_t *p, size_t n, ImageInfo &info, std::string &why) {
+    if (n < 13 || (std::memcmp(p, "GIF87a", 6) != 0 && std::memcmp(p, "GIF89a", 6) != 0)) {
+        why = "bad GIF signature"; return false;
+    }
+    const uint32_t width = rd_le16(p + 6), height = rd_le16(p + 8);
+    const unsigned packed = p[10];
+    if (width == 0 || height == 0) { why = "GIF has zero dimensions"; return false; }
+    size_t pos = 13;
+    uint32_t colors = 0, bits = 0;
+    if (packed & 0x80) {
+        bits = (packed & 7) + 1; colors = 1u << bits;
+        if (n - pos < 3u * colors) { why = "truncated GIF color table"; return false; }
+        pos += 3u * colors;
+    }
+    bool image = false;
+    while (pos < n) {
+        const uint8_t block = p[pos++];
+        if (block == 0x3b) {
+            if (!image) { why = "GIF has no image data"; return false; }
+            info.width = width; info.height = height; info.depth = bits ? bits : 8; info.colors = colors;
+            return true;
+        }
+        if (block == 0x2c) {
+            if (n - pos < 9) { why = "truncated GIF image descriptor"; return false; }
+            const unsigned local = p[pos + 8];
+            pos += 9;
+            if (local & 0x80) {
+                const uint32_t entries = 2u << (local & 7);
+                if (n - pos < 3u * entries) { why = "truncated GIF color table"; return false; }
+                if (!colors) { colors = entries; bits = (local & 7) + 1; }
+                pos += 3u * entries;
+            }
+            if (pos >= n) { why = "truncated GIF image data"; return false; }
+            ++pos;
+            if (!skip_gif_sub_blocks(p, n, pos)) { why = "truncated GIF image data"; return false; }
+            image = true;
+        } else if (block == 0x21) {
+            if (pos >= n) { why = "truncated GIF extension"; return false; }
+            ++pos;
+            if (!skip_gif_sub_blocks(p, n, pos)) { why = "truncated GIF extension"; return false; }
+        } else {
+            why = "invalid GIF block"; return false;
+        }
+    }
+    why = "truncated GIF (no trailer)";
+    return false;
+}
+
+bool parse_bmp(const uint8_t *p, size_t n, ImageInfo &info, std::string &why) {
+    if (n < 26 || p[0] != 'B' || p[1] != 'M') { why = "bad BMP signature"; return false; }
+    const uint64_t offset = rd_le32(p + 10);
+    const uint32_t dib = rd_le32(p + 14);
+    uint32_t bpp, used = 0, compression = 0;
+    uint64_t width, height;
+    if (dib == 12) {
+        width = rd_le16(p + 18); height = rd_le16(p + 20);
+        if (rd_le16(p + 22) != 1) { why = "invalid BMP header"; return false; }
+        bpp = rd_le16(p + 24);
+        if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24) { why = "invalid BMP bit depth"; return false; }
+    } else if (dib == 40 || dib == 52 || dib == 56 || dib == 64 || dib == 108 || dib == 124) {
+        if (n < 14u + 40u) { why = "truncated BMP header"; return false; }
+        const int32_t w = static_cast<int32_t>(rd_le32(p + 18)), h = static_cast<int32_t>(rd_le32(p + 22));
+        if (w <= 0 || h == 0 || h == INT32_MIN) { why = "BMP has invalid dimensions"; return false; }
+        width = static_cast<uint32_t>(w); height = static_cast<uint32_t>(h < 0 ? -static_cast<int64_t>(h) : h);
+        if (rd_le16(p + 26) != 1) { why = "invalid BMP header"; return false; }
+        bpp = rd_le16(p + 28);
+        if (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) {
+            why = "invalid BMP bit depth"; return false;
+        }
+        compression = rd_le32(p + 30); used = rd_le32(p + 46);
+        if (compression > 6) { why = "unsupported BMP compression"; return false; }
+    } else { why = "unsupported BMP header size"; return false; }
+    if (width == 0 || height == 0) { why = "BMP has zero dimensions"; return false; }
+    if (n < 14u + dib) { why = "truncated BMP header"; return false; }
+    if (offset < 14u + dib || offset >= n) { why = "BMP pixel data offset is outside the file"; return false; }
+    if (compression == 0 || compression == 3 || compression == 6) {
+        // Some encoders omit the padding after the last row; require only its pixels.
+        const uint64_t stride = ((width * bpp + 31) / 32) * 4, last_row = (width * bpp + 7) / 8;
+        if (stride * (height - 1) + last_row > n - offset) { why = "truncated BMP pixel data"; return false; }
+    }
+    info.width = static_cast<uint32_t>(width); info.height = static_cast<uint32_t>(height);
+    info.depth = bpp; info.colors = bpp <= 8 ? (used ? used : 1u << bpp) : 0;
+    return true;
+}
+
+bool parse_webp(const uint8_t *p, size_t n, ImageInfo &info, std::string &why) {
+    if (n < 20 || std::memcmp(p, "RIFF", 4) != 0 || std::memcmp(p + 8, "WEBP", 4) != 0) {
+        why = "bad WebP signature"; return false;
+    }
+    const uint64_t riff = rd_le32(p + 4);
+    if (riff < 12 || riff + 8 > n) { why = "truncated WebP (RIFF size exceeds the data)"; return false; }
+    const size_t end = static_cast<size_t>(riff) + 8;
+    size_t pos = 12;
+    bool first = true, image = false, alpha = false;
+    uint32_t width = 0, height = 0;
+    while (pos < end) {
+        if (end - pos < 8) { why = "truncated WebP chunk header"; return false; }
+        const uint8_t *tag = p + pos;
+        const size_t size = rd_le32(p + pos + 4);
+        pos += 8;
+        if (size > end - pos) { why = "truncated WebP chunk"; return false; }
+        const uint8_t *body = p + pos;
+        const bool vp8x = std::memcmp(tag, "VP8X", 4) == 0, lossy = std::memcmp(tag, "VP8 ", 4) == 0,
+                   lossless = std::memcmp(tag, "VP8L", 4) == 0;
+        if (first && !vp8x && !lossy && !lossless) { why = "WebP does not start with an image chunk"; return false; }
+        first = false;
+        if (vp8x) {
+            if (size < 10 || width != 0) { why = "invalid WebP VP8X chunk"; return false; }
+            alpha = (body[0] & 0x10) != 0;
+            width = 1 + (uint32_t(body[4]) | (uint32_t(body[5]) << 8) | (uint32_t(body[6]) << 16));
+            height = 1 + (uint32_t(body[7]) | (uint32_t(body[8]) << 8) | (uint32_t(body[9]) << 16));
+        } else if (lossy) {
+            if (size < 10) { why = "truncated WebP VP8 chunk"; return false; }
+            const uint32_t tag3 = uint32_t(body[0]) | (uint32_t(body[1]) << 8) | (uint32_t(body[2]) << 16);
+            const uint32_t vw = rd_le16(body + 6) & 0x3fff, vh = rd_le16(body + 8) & 0x3fff;
+            if ((tag3 & 1) != 0 || ((tag3 >> 1) & 7) > 3 || body[3] != 0x9d || body[4] != 0x01 || body[5] != 0x2a ||
+                vw == 0 || vh == 0 || (tag3 >> 5) > size - 10) {
+                why = "invalid WebP VP8 frame header"; return false;
+            }
+            if (width == 0) { width = vw; height = vh; }
+            image = true;
+        } else if (lossless) {
+            if (size < 5 || body[0] != 0x2f) { why = "invalid WebP VP8L header"; return false; }
+            const uint32_t bits = rd_le32(body + 1);
+            if (((bits >> 29) & 7) != 0) { why = "unsupported WebP VP8L version"; return false; }
+            if (width == 0) { width = (bits & 0x3fff) + 1; height = ((bits >> 14) & 0x3fff) + 1; }
+            alpha = alpha || ((bits >> 28) & 1) != 0;
+            image = true;
+        } else if (std::memcmp(tag, "ANMF", 4) == 0) {
+            image = true;
+        }
+        pos += size + (size & 1);
+    }
+    if (!image || width == 0) { why = "WebP has no image data"; return false; }
+    info.width = width; info.height = height; info.depth = alpha ? 32 : 24; info.colors = 0;
+    return true;
+}
+
+bool classify_image(const ByteVector &bytes, ImageInfo &info, std::string &why) {
+    const auto *p = reinterpret_cast<const uint8_t *>(bytes.data());
+    const size_t n = bytes.size();
+    if (n >= 8 && p[0] == 0x89 && p[1] == 'P') { info.kind = ImageKind::PNG; return parse_png(p, n, info, why); }
+    if (n >= 2 && p[0] == 0xff && p[1] == 0xd8) { info.kind = ImageKind::JPEG; return parse_jpeg(p, n, info, why); }
+    if (n >= 6 && std::memcmp(p, "GIF8", 4) == 0) { info.kind = ImageKind::GIF; return parse_gif(p, n, info, why); }
+    if (n >= 2 && p[0] == 'B' && p[1] == 'M') { info.kind = ImageKind::BMP; return parse_bmp(p, n, info, why); }
+    if (n >= 12 && std::memcmp(p, "RIFF", 4) == 0 && std::memcmp(p + 8, "WEBP", 4) == 0) {
+        info.kind = ImageKind::WebP; return parse_webp(p, n, info, why);
+    }
+    why = "unrecognized image format";
+    return false;
+}
+
+const char *image_mime(ImageKind kind) {
+    switch (kind) {
+    case ImageKind::JPEG: return "image/jpeg";
+    case ImageKind::PNG: return "image/png";
+    case ImageKind::GIF: return "image/gif";
+    case ImageKind::BMP: return "image/bmp";
+    case ImageKind::WebP: return "image/webp";
+    }
+    return "";
+}
+
+struct ArtPicture {
+    size_t ordinal = 0;           // 1-based position among the source's pictures, for diagnostics
+    ByteVector data;
+    ImageInfo info;
+    String mime;                  // always the canonical type of the validated bytes; a source label that disagrees is corrected
+    int type = 3;                 // ID3/FLAC picture type; MP4 has none, so front cover
+    String description;
+    bool id3_encoding = false;    // ID3 source: keep its text encoding for ID3 destinations
+    String::Type encoding = String::Latin1;
+    bool geometry = false;        // FLAC source: carry its width/height/depth/colors verbatim
+    int width = 0, height = 0, depth = 0, colors = 0;
+};
+using ArtList = std::vector<ArtPicture>;
+
+void admit_picture(ArtList &out, ArtPicture &&picture) {
+    if (picture.data.isEmpty()) return; // the reference skips pictures it cannot decode, including empty ones
+    std::string why;
+    if (!classify_image(picture.data, picture.info, why))
+        throw ArtworkTranscode("artwork copy refused: picture " + std::to_string(picture.ordinal) +
+                               " is not a complete JPEG, PNG, GIF, BMP or WebP image (" + why + ")");
+    picture.mime = image_mime(picture.info.kind);
+    out.push_back(std::move(picture));
+}
+
+ArtList artwork_from_flac(const List<FLAC::Picture *> &pictures) {
+    ArtList out;
+    size_t ordinal = 0;
+    for (auto i = pictures.begin(); i != pictures.end(); ++i) {
+        const FLAC::Picture *p = *i;
+        ArtPicture picture;
+        picture.ordinal = ++ordinal;
+        picture.data = p->data(); picture.description = p->description();
+        picture.type = static_cast<int>(p->type());
+        picture.geometry = true;
+        picture.width = p->width(); picture.height = p->height();
+        picture.depth = p->colorDepth(); picture.colors = p->numColors();
+        admit_picture(out, std::move(picture));
+    }
+    return out;
+}
+
+ArtList artwork_from_id3(ID3 *tag) {
+    ArtList out;
+    if (!tag) return out;
+    size_t ordinal = 0;
+    const auto &frames = tag->frameList("APIC");
+    for (auto i = frames.begin(); i != frames.end(); ++i) {
+        const Picture *frame = dynamic_cast<const Picture *>(*i);
+        if (!frame) continue;
+        ArtPicture picture;
+        picture.ordinal = ++ordinal;
+        picture.data = frame->picture(); picture.description = frame->description();
+        picture.type = static_cast<int>(frame->type());
+        picture.id3_encoding = true; picture.encoding = frame->textEncoding();
+        admit_picture(out, std::move(picture));
+    }
+    return out;
+}
+
+ArtList artwork_from_mp4(MP4::Tag *tag) {
+    ArtList out;
+    if (!tag) return out;
+    auto &items = tag->itemListMap();
+    if (!items.contains("covr")) return out;
+    size_t ordinal = 0;
+    auto covers = items["covr"].toCoverArtList();
+    for (auto i = covers.begin(); i != covers.end(); ++i) {
+        ArtPicture picture;
+        picture.ordinal = ++ordinal;
+        picture.data = i->data();
+        admit_picture(out, std::move(picture));
+    }
+    return out;
+}
+
+ArtList source_artwork(State &s) {
+    if (s.m4) return artwork_from_mp4(s.m4);
+    if (s.flac) return artwork_from_flac(s.flac->pictureList());
+    if (s.v2 && !s.wav) return artwork_from_id3(s.v2);
+    return {};
+}
+
+// Refuse before any destination change when the destination cannot hold a
+// picture as-is.
+void preflight_artwork(int format, const ArtList &pictures) {
+    uint64_t id3_total = 0;
+    for (const ArtPicture &p : pictures) {
+        const std::string number = std::to_string(p.ordinal);
+        if (format == PN_TAG_MP4 && p.info.kind == ImageKind::WebP)
+            throw ArtworkTranscode("artwork copy refused: picture " + number + " is WebP, which an MP4 covr atom cannot store");
+        if (format == PN_TAG_FLAC) {
+            const uint64_t block = 32ull + p.mime.data(String::UTF8).size() +
+                                   p.description.data(String::UTF8).size() + p.data.size();
+            if (block > 0xffffffull)
+                throw ArtworkTranscode("artwork copy refused: picture " + number +
+                                       " exceeds the 16777215-byte FLAC metadata block limit");
+        }
+        if (format == PN_TAG_MP3 || format == PN_TAG_AIFF) id3_total += 64ull + p.data.size();
+    }
+    if (id3_total >= 0x0fffffffull)
+        throw ArtworkTranscode("artwork copy refused: pictures exceed the ID3v2 tag size limit");
+}
+
+void add_flac_pictures(FLAC::File &file, const ArtList &pictures) {
+    for (const ArtPicture &p : pictures) {
+        auto *picture = new FLAC::Picture;
+        picture->setType(static_cast<FLAC::Picture::Type>(p.type));
+        picture->setMimeType(p.mime);
+        picture->setDescription(p.description);
+        picture->setWidth(p.geometry ? p.width : static_cast<int>(p.info.width));
+        picture->setHeight(p.geometry ? p.height : static_cast<int>(p.info.height));
+        picture->setColorDepth(p.geometry ? p.depth : static_cast<int>(p.info.depth));
+        picture->setNumColors(p.geometry ? p.colors : static_cast<int>(p.info.colors));
+        picture->setData(p.data);
+        file.addPicture(picture);
+    }
+}
+void add_id3_pictures(ID3 *tag, const ArtList &pictures) {
+    for (const ArtPicture &p : pictures) {
+        auto *frame = new Picture;
+        frame->setType(static_cast<Picture::Type>(p.type));
+        frame->setMimeType(p.mime);
+        frame->setDescription(p.description);
+        if (p.id3_encoding) frame->setTextEncoding(p.encoding);
+        frame->setPicture(p.data);
+        tag->addFrame(frame);
+    }
+}
+void set_mp4_covers(MP4::Tag *tag, const ArtList &pictures) {
+    MP4::CoverArtList covers;
+    for (const ArtPicture &p : pictures) {
+        MP4::CoverArt::Format format = MP4::CoverArt::JPEG;
+        switch (p.info.kind) {
+        case ImageKind::JPEG: format = MP4::CoverArt::JPEG; break;
+        case ImageKind::PNG: format = MP4::CoverArt::PNG; break;
+        case ImageKind::GIF: format = MP4::CoverArt::GIF; break;
+        case ImageKind::BMP: format = MP4::CoverArt::BMP; break;
+        case ImageKind::WebP: throw ArtworkTranscode("artwork copy refused: WebP cannot be stored in MP4 covr");
+        }
+        covers.append(MP4::CoverArt(format, p.data));
+    }
+    tag->itemListMap().insert("covr", MP4::Item(covers));
+}
+// Same destination placement as the reference's set_images, after clear_images.
+void place_artwork(State &s, const ArtList &pictures) {
+    if (s.m4) set_mp4_covers(s.m4, pictures);
+    else if (s.flac) add_flac_pictures(*s.flac, pictures);
+    else if (s.v2) add_id3_pictures(s.v2, pictures);
+}
 
 pn_tag_payload marker_data(pn_tag_serialize_marker serialize, void *context) {
     pn_tag_payload value{};
@@ -1209,7 +1664,7 @@ void copy_mp4_to_id3(MP4::Tag *source, ID3 *destination) {
     if (items.contains("cpil") && items["cpil"].toInt()) set_text(destination, "TCMP", "1");
 }
 
-void direct_copy(int operation, const char *src, const char *dst) {
+void direct_copy(int operation, const char *src, const char *dst, uint32_t flags, uint32_t &result) {
     CheckedInputStream source_stream(src);
     FileStream destination_stream(dst, false);
     require(source_stream.isOpen() && destination_stream.isOpen(), "cannot open source or destination tag file");
@@ -1299,6 +1754,18 @@ void direct_copy(int operation, const char *src, const char *dst) {
             if (d) move_frames(v2, d); else rejected += " [ID3v2 creation failed]";
         }
         check_source(source_stream);
+        if (flags & PN_TAG_COPY_ARTWORK_BYTES) {
+            // FLAC picture blocks are not part of the Xiph/ID3 fields copied
+            // above, so the reference drops them; under the flag they travel
+            // with the tags, preflighted before any destination change.
+            ArtList artwork = artwork_from_flac(source.pictureList());
+            if (!artwork.empty()) {
+                preflight_artwork(PN_TAG_FLAC, artwork);
+                destination.removePictures();
+                add_flac_pictures(destination, artwork);
+                result |= PN_TAG_RESULT_ARTWORK_COPIED;
+            }
+        }
         require(destination.save(), "FLAC direct save failed");
         if (!rejected.empty()) throw std::runtime_error("FLAC fields or tags not copied: " + rejected);
         break;
@@ -1322,10 +1789,6 @@ void direct_copy(int operation, const char *src, const char *dst) {
 } // namespace
 
 namespace {
-struct ArtworkTranscode : std::runtime_error {
-    ArtworkTranscode() : std::runtime_error(
-        "portable tag bridge refuses artwork requiring Apple NSImage/ImageIO transcoding") {}
-};
 
 template<class F> int guarded(char *error, size_t cap, F &&fn) noexcept {
     if (error && cap) error[0] = '\0';
@@ -1361,53 +1824,97 @@ extern "C" PN_TAG_EXPORT int pn_tag_read_marker(int format, const char *path, pn
                                                    void *context, char *error, size_t cap) {
     return guarded(error, cap, [&] { read_marker(format, path, receive, context); });
 }
+// Seven-key generic copy. `flags`/`result` carry the opt-in artwork extension;
+// with flags == 0 this is exactly the original ABI-5 behaviour.
+static void copy_generic(uint32_t flags, uint32_t &result, int sf, int df, const char *src, const char *dst,
+                         pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context) {
+    require(src && dst, "null source or destination path");
+    std::optional<State> source_storage;
+    try { source_storage.emplace(sf, src, false); }
+    catch (const SourceContainerUnavailable &) {
+        State destination(df, dst, true);
+        require(!destination.stream->readOnly(), "cannot write destination tag file");
+        if (destination.mp3) require(valid_mpeg_destination(*destination.mp3), "invalid or truncated MPEG destination");
+        if (destination.wav) (void)wav_marker(*destination.wav, false);
+        if (destination.aiff) validate_aiff(*destination.aiff, false);
+        if (destination.flac) (void)flac_marker(destination);
+        throw;
+    }
+    State &source = *source_storage;
+    State destination(df, dst, true);
+    bool copy_images = destination.supports_images() && source.has_images();
+    ArtList artwork;
+    if (copy_images && !source.images_are_empty()) {
+        source.check_source();
+        if (!(flags & PN_TAG_COPY_ARTWORK_BYTES)) throw ArtworkTranscode();
+        artwork = source_artwork(source);
+        preflight_artwork(destination.format, artwork);
+    }
+    // dictionaryWithValuesForKeys: obtains all values before any setter.
+    String artist = foundation_copy_string(source.get_string(0));
+    String album = foundation_copy_string(source.get_string(1));
+    long long year = source.year();
+    String title = foundation_copy_string(source.get_string(2));
+    String comment = foundation_copy_string(source.get_string(3));
+    long long tempo = source.tempo();
+    String key = foundation_copy_string(source.key());
+    source.check_source();
+    // Observed enumeration order for this exact seven-key dictionary.
+    destination.put_string(0, artist);
+    destination.put_string(2, title);
+    destination.set_key(key);
+    destination.set_tempo(tempo);
+    destination.put_string(1, album);
+    destination.set_year(year);
+    destination.put_string(3, comment);
+    if (copy_images) {
+        destination.clear_images();
+        if (!artwork.empty()) {
+            place_artwork(destination, artwork);
+            result |= PN_TAG_RESULT_ARTWORK_COPIED;
+        }
+    }
+    set_marker(destination, serialize, context);
+    require(destination.save(), "generic metadata save failed");
+    if (destination.wav) require(rewrite_wav && rewrite_wav(context, dst) == 0, "WAV marker rewrite failed");
+}
+
+extern "C" PN_TAG_EXPORT uint32_t pn_tag_bridge_features(void) { return PN_TAG_FEATURE_ARTWORK_COPY; }
 extern "C" PN_TAG_EXPORT int pn_tag_copy_direct(int operation, const char *src, const char *dst,
                                                   char *error, size_t cap) {
-    return guarded(error, cap, [&] { require(src && dst, "null source or destination path"); direct_copy(operation, src, dst); });
+    return guarded(error, cap, [&] {
+        require(src && dst, "null source or destination path");
+        uint32_t ignored = 0;
+        direct_copy(operation, src, dst, 0, ignored);
+    });
+}
+extern "C" PN_TAG_EXPORT int pn_tag_copy_direct_ex(unsigned flags, int operation, const char *src, const char *dst,
+                                                     unsigned *result_flags, char *error, size_t cap) {
+    if (result_flags) *result_flags = 0;
+    return guarded(error, cap, [&] {
+        require((flags & ~static_cast<unsigned>(PN_TAG_COPY_ARTWORK_BYTES)) == 0, "unsupported tag copy flags");
+        require(src && dst, "null source or destination path");
+        uint32_t result = 0;
+        direct_copy(operation, src, dst, flags, result);
+        if (result_flags) *result_flags = result;
+    });
 }
 extern "C" PN_TAG_EXPORT int pn_tag_copy_generic(int sf, int df, const char *src, const char *dst,
         pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context, char *error, size_t cap) {
     return guarded(error, cap, [&] {
-        require(src && dst, "null source or destination path");
-        std::optional<State> source_storage;
-        try { source_storage.emplace(sf, src, false); }
-        catch (const SourceContainerUnavailable &) {
-            State destination(df, dst, true);
-            require(!destination.stream->readOnly(), "cannot write destination tag file");
-            if (destination.mp3) require(valid_mpeg_destination(*destination.mp3), "invalid or truncated MPEG destination");
-            if (destination.wav) (void)wav_marker(*destination.wav, false);
-            if (destination.aiff) validate_aiff(*destination.aiff, false);
-            if (destination.flac) (void)flac_marker(destination);
-            throw;
-        }
-        State &source = *source_storage;
-        State destination(df, dst, true);
-        bool copy_images = destination.supports_images() && source.has_images();
-        if (copy_images && !source.images_are_empty()) {
-            source.check_source();
-            throw ArtworkTranscode();
-        }
-        // dictionaryWithValuesForKeys: obtains all values before any setter.
-        String artist = foundation_copy_string(source.get_string(0));
-        String album = foundation_copy_string(source.get_string(1));
-        long long year = source.year();
-        String title = foundation_copy_string(source.get_string(2));
-        String comment = foundation_copy_string(source.get_string(3));
-        long long tempo = source.tempo();
-        String key = foundation_copy_string(source.key());
-        source.check_source();
-        // Observed enumeration order for this exact seven-key dictionary.
-        destination.put_string(0, artist);
-        destination.put_string(2, title);
-        destination.set_key(key);
-        destination.set_tempo(tempo);
-        destination.put_string(1, album);
-        destination.set_year(year);
-        destination.put_string(3, comment);
-        if (copy_images) destination.clear_images();
-        set_marker(destination, serialize, context);
-        require(destination.save(), "generic metadata save failed");
-        if (destination.wav) require(rewrite_wav && rewrite_wav(context, dst) == 0, "WAV marker rewrite failed");
+        uint32_t ignored = 0;
+        copy_generic(0, ignored, sf, df, src, dst, serialize, rewrite_wav, context);
+    });
+}
+extern "C" PN_TAG_EXPORT int pn_tag_copy_generic_ex(unsigned flags, int sf, int df, const char *src, const char *dst,
+        pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context,
+        unsigned *result_flags, char *error, size_t cap) {
+    if (result_flags) *result_flags = 0;
+    return guarded(error, cap, [&] {
+        require((flags & ~static_cast<unsigned>(PN_TAG_COPY_ARTWORK_BYTES)) == 0, "unsupported tag copy flags");
+        uint32_t result = 0;
+        copy_generic(flags, result, sf, df, src, dst, serialize, rewrite_wav, context);
+        if (result_flags) *result_flags = result;
     });
 }
 extern "C" PN_TAG_EXPORT int pn_tag_save_marker(int df, const char *dst, pn_tag_serialize_marker serialize,

@@ -10,15 +10,20 @@ Production processing uses Rust DSP and explicitly configured public native libr
 
 ### Linux capability and error boundary
 
-Linux refuses MP3 and AAC decoding, AAC encoding, unequal-rate sample-rate
-conversion, artwork conversion that requires Apple's transcoder, unverified
-codec and container variants (including unverified GSM masks), and ALAC packet
-conditions known to lose native audio. Portable ALAC output admits only finite
-22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit depths in its supported
-layout. Processing that requires an unavailable conversion is refused before
-publication; analysis of non-MP3 inputs at or below 22,050 Hz is refused. A
-non-44.1 kHz waveform is unavailable rather than approximated; an otherwise
-supported analysis can still succeed.
+By default Linux refuses MP3 and AAC decoding, AAC encoding, unequal-rate
+sample-rate conversion, artwork conversion that requires Apple's transcoder,
+unverified codec and container variants (including unverified GSM masks), and
+ALAC packet conditions known to lose native audio. Portable ALAC output admits
+only finite 22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit depths in
+its supported layout. Processing that requires an unavailable conversion is
+refused before publication; analysis of non-MP3 inputs at or below 22,050 Hz is
+refused. A non-44.1 kHz waveform is unavailable rather than approximated; an
+otherwise supported analysis can still succeed.
+
+One opt-in, `parity.allow_non_identical` (below), relaxes exactly two of those
+refusals on Linux and `portable` builds: MP3 input decoding and the unchanged
+copy of embedded cover art. AAC stays refused. Without the opt-in Linux
+behaves exactly as v0.1.0 did.
 
 The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
 `UnsupportedSampleRateConversion` variants; artwork uses
@@ -26,10 +31,11 @@ The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
 architecture-specific `LibraryPolicyError::Unapproved` digest in
 `src/linux_libraries.rs`, plus user-configured FLAC/LAME hashes. Configuring
 the digest of an unapproved library does not bypass that policy. CLI per-item
-errors serialize `stage`, a human-readable `message`, `cancelled`, recovery
-paths and `partial_publication`; the underlying Rust enum is not exposed as a
-stable machine-readable error code. See [LINUX.md](../docs/LINUX.md) for
-approved identities and residual x86 floating-point differences.
+errors serialize a stable machine-readable `code` (see
+[Error codes](#error-codes)) with `stage`, a human-readable `message`,
+`cancelled`, recovery paths and `partial_publication`; the underlying Rust enum
+is not itself exposed. See [LINUX.md](../docs/LINUX.md) for approved identities
+and residual x86 floating-point differences.
 
 The loader retains a descriptor and handle for each library identity, checks
 the digest after loading and verifies a mapped entry point. Failed post-load
@@ -40,6 +46,174 @@ being loaded; an initializer may already have run before the post-load check.
 Use libraries on trusted storage not writable by concurrent adversaries.
 Docker Desktop has reported identity mismatches for a bind-mounted bridge;
 use in-image libraries and container-volume/tmpfs state.
+
+## Opt-in non-identical paths
+
+The identical-or-refuse rule has one deliberate, explicit exception. The
+boolean state-directory setting `parity.allow_non_identical` (default `false`)
+is set once, for example `platinum --state-dir DIR config set
+parity.allow_non_identical true`; the `process` command line is unchanged.
+`config get parity`, `config get parity.allow_non_identical` and
+`config set parity '{"allow_non_identical":true}'` address the same value, and
+`config reset parity.allow_non_identical` restores the default.
+
+What it enables, on Linux and on `--features portable` builds only:
+
+- **MP3 input** is decoded by an open-source, deterministic decoder (a
+  from-scratch ISO 11172-3/13818-3 Layer III implementation in safe Rust with
+  binary64 arithmetic and no libm) instead of being refused. It emits the same
+  16-bit sample grid as AudioToolbox but is **not byte-exact**: in the
+  maintainer's 389-file generated corpus 95.08 % of 46.1 million samples equal
+  AudioToolbox's and none differs by more than 4 least-significant bits, so
+  results are not guaranteed byte-identical to macOS. Its output is
+  bit-identical across macOS arm64, Linux aarch64 and Linux x86_64. MP3 *output*
+  always used the pinned LAME build and is unaffected. Xing, Info and VBRI
+  headers are read as AudioToolbox reads them, and a truncated final frame is
+  accepted. Streams it does not reproduce are refused with
+  `unsupported_input_codec` (MPEG Layer I/II, free-format, mixed blocks, MPEG-2
+  intensity stereo, Xing/Info headers without a usable frame count, a VBRI frame
+  shorter than its fields, ambiguous data before the first or after the last
+  frame, audio after a gap, an encoder delay past the stream); damaged streams
+  (a damaged granule, any frame CRC mismatch, a missing bit reservoir after the
+  first good frame) fail with `invalid_input_file`, possibly only when the audio
+  is read; MPEG rates other than 22,050, 32,000, 44,100 and 48,000 Hz need
+  sample-rate conversion for processing and are refused with
+  `unsupported_sample_rate_conversion` (`inspect` still reports them). The
+  decoder only claims a confirmed MP3 stream (consecutive consistent frame
+  headers): any other input, such as FLAC or Ogg data under another name, keeps
+  the classification and code it has without the setting.
+- **Embedded cover art** (FLAC `PICTURE`, ID3 `APIC`, MP4 `covr`) is stored in
+  the output byte for byte where the macOS bridge would re-encode it as PNG
+  through Apple's image stack (generic cross-format copies, which the default
+  Linux bridge refuses) or silently drop it (FLAC-to-FLAC direct copies).
+  Same-family ID3, MP4 and AIFF direct copies already moved the picture
+  unchanged and are untouched. WAV destinations are untouched too: as on
+  macOS, a picture reaches a WAV only inside an ID3 chunk that survives the
+  marker rewrite (see the WAV tag-chunk paragraph in the processed-marker
+  section). Stored MIME is the canonical type of the
+  validated bytes; MP4 `covr` has no type or description. On this generic path,
+  pictures read from MP4 become front covers in ID3 and FLAC. The direct
+  M4A-to-MP3 path keeps the reference behaviour instead and is not reported as
+  `artwork_copy`: its ID3 picture has type 0 and no description, and GIF, BMP
+  and WebP bytes are labelled `image/png`, exactly as on macOS. The item is refused with
+  `artwork_conversion_unavailable`, before anything is written, when a picture
+  is not a structurally complete JPEG, PNG, GIF, BMP or WebP, when MP4 `covr`
+  would have to hold WebP, or when a FLAC metadata block would exceed
+  16 MiB − 1.
+
+It never enables AAC decoding or encoding, sample-rate conversion, or any other
+refused path; those keep their codes. On a macOS default build the setting is
+stored and shown but has **no effect**: Apple's decoder and image stack are
+always used and every path is the reference path. `config show` states this
+per build, next to the stored value:
+
+```json
+"parity": {"allow_non_identical": true},
+"parity_effect": {"effective": false, "note": "no effect in this macOS default build: …"}
+```
+
+`parity_effect.effective` is true only when the setting is on and the build
+has the paths (Linux, or `portable`). The same `parity` and `parity_effect`
+objects appear in `details.effective_config` of process results. A state file
+that never enabled the setting is written without a `parity` member and stays
+readable by v0.1.0; v0.1.0 cannot read a file that stores the setting.
+
+`parity.*` is reserved for opt-ins of this kind: paths that exist but cannot
+be proven identical to the macOS reference. Future settings that enable
+formats the original application does not accept belong to a separate
+namespace and never to `parity.*`.
+
+### `non_identical_paths`
+
+Every `process`, `analyze` and `inspect` report carries
+`non_identical_paths`, an array of strings naming each non-identical path that
+actually produced something in that item's result. It is **always present** on
+successful reports on every platform and is `[]` whenever every path used is an
+identical one, which is always the case on macOS default builds and on Linux
+without the opt-in. Failed items have no report and therefore no list. The
+defined members, in this order when both apply, are:
+
+| Member | Meaning |
+| --- | --- |
+| `mp3_decode` | The input MP3 was decoded by the open-source decoder and the result depends on it: for `process` and `analyze` the measurements and audio derive from it, and `analyze` also lists it when the waveform of the recorded original backup (an MP3) is reported, but not when that waveform is unavailable; for `inspect` the open-source MP3 model supplied the reported length and bitrate. |
+| `artwork_copy` | At least one embedded picture was stored byte for byte where the macOS bridge would have transcoded or dropped it (only `process`). It is absent when the source had no artwork or every picture moved through a path identical to macOS. |
+
+New members may be added in later releases; consumers must treat an unknown
+member as non-identical and must not require an exact array.
+
+## Error codes
+
+Every failure in a JSON outcome carries a stable `code` beside its `message`:
+
+- per-item errors: `results[].error.code` for statuses `failed`,
+  `cancelled` and `not_started` (together with the existing `stage`,
+  `message`, `cancelled`, `retained_backup`, `recovery_path` and
+  `partial_publication` fields where those apply);
+- `batch_error.code` when the batch refused to start;
+- `error.code` in a top-level `{"status":"error"}` or usage outcome, beside
+  `kind` and `message`;
+- the failure-shaped objects inside an outcome:
+  - `results[].statistics.code` when the statistics accounting is `failed`
+    (`statistics_error`) or `not_recorded` (`cancelled`); the audio is already
+    published and the item `status` stays `ok`;
+  - `code` (`io_error`) in `results[].statistics.cleanup` and in the top-level
+    `error.cleanup` of a statistics failure;
+  - `code` (`io_error`) in each `results[].error.cleanup_errors[]` entry;
+  - `results[].error.rollback_error_code` beside `rollback_error`, which stays a
+    string for compatibility; both are `null` when no rollback failed, and the
+    code is never `cancelled`;
+  - `code` (`io_error`) in `backup_removal_error` of a restore report.
+
+`code` is lowercase snake case and is a public contract: codes are never
+renamed or reused, and new causes add new codes, so a consumer must treat an
+unknown code as a generic failure. `stage` and `message` stay diagnostic text
+and can change. A code is chosen from the error's type when one variant has a
+single meaning and otherwise from the stage that failed; a stage label with no
+code would be a test failure and the final fallback is `internal_error`.
+
+| Code | Meaning | Reachable |
+| --- | --- | --- |
+| `unsupported_input_codec` | The input's audio codec cannot be decoded here: AAC/MP4A on Linux; MP3 on Linux without `parity.allow_non_identical` (or an MP3 stream the open-source decoder does not support); `match-input` of an unrecognized source codec. | Linux/portable; unrecognized codec on all |
+| `unsupported_input_format` | The input's container, sample format, bit depth, channel layout or file extension is not admitted (for example OGG, an unverified WAV subtype, multichannel FLAC waveform). | all |
+| `unsupported_output_codec` | The requested output encoding is unavailable: AAC output on Linux. | Linux/portable |
+| `unsupported_output_format` | The requested output encoder cannot write this audio's format although the input is fine: ALAC output above 96,000 Hz or with more than 8 channels on Linux. A format refusal raised in an encoder stage always has this side. | Linux/portable; macOS when an Apple encoder refuses the format |
+| `unsupported_sample_rate_conversion` | Processing or analysis needs sample-rate conversion that Linux does not reproduce. | Linux/portable |
+| `artwork_conversion_unavailable` | Embedded artwork would need Apple image transcoding on Linux, or (opt-in on) the destination cannot store the picture unchanged. | Linux/portable |
+| `protected_source` | The input is a protected `m4p` or `wl.mp3` source. | all |
+| `invalid_input_file` | The input is malformed, truncated, empty of audio or otherwise not decodable, or its tag container cannot be read. | all |
+| `invalid_input_path` | The input path is a symlink, neither file nor directory, cannot be represented in JSON, or cannot be passed to the tag bridge. | all |
+| `no_input_files` | A selected input held no admitted audio files. | all |
+| `already_processed` | A processed marker or `_PN` suffix says the file was already processed. | all |
+| `marker_ambiguous` | A WAV marker is empty or incomplete and needs `--allow-ambiguous-marker`. | all |
+| `marker_unverifiable` | The absence of a processed marker cannot be established (unknown container, duplicate marker chunks, hidden-marker risk, unreadable marker). | all |
+| `marker_invalid` | A processing marker is malformed, cannot be serialized, or the written marker does not verify. | all |
+| `tag_copy_failed` | Copying source tags or writing the marker failed. | all |
+| `library_not_configured` | A required library path or SHA-256 pin (tag bridge, libFLAC, LAME) is not configured. | all |
+| `library_unapproved` | A library's SHA-256 does not match the configured pin or the compiled Linux allowlist. | all |
+| `library_load_failed` | A configured library could not be loaded, whatever the reason: the path does not exist or is a directory, the file is no loadable library, it has the wrong ABI or version, or its identity check failed. Every load stage (tag bridge, libFLAC for decoding and encoding, LAME) maps a failing path or loader the same way; a digest that does not match is `library_unapproved`. | all |
+| `decode_failed` | The decoder failed while reading audio. | all |
+| `encode_failed` | The encoder or its postflight check failed. | all |
+| `processing_failed` | A processing stage rejected the audio parameters (for example an unusable sample rate) or failed internally. | all |
+| `io_error` | A filesystem operation failed. Also the code of a failed cleanup, rollback or backup removal, and of a cancellation that left such a failure, a recovery file or a publication behind. | all |
+| `atomic_rename_unsupported` | The filesystem or kernel does not support the atomic rename the transaction requires. | all |
+| `output_exists` | The destination or its reservation already exists and `--overwrite` was not given. | all |
+| `output_conflict` | Two outputs collide, or the destination changed after preflight. | all |
+| `source_changed` | The source changed while it was being processed. | all |
+| `backup_missing` | No backup is recorded, the recorded backup does not exist, or the `--backup` path supplied to `restore` does not exist. | all |
+| `backup_invalid` | The backup is not the verified copy, differs from the recorded one, or its recorded path is invalid. | all |
+| `restore_not_applicable` | The file is not processed, needs no restore, or is active. | all |
+| `batch_preflight_failed` | The batch was refused before work started; also the status reason of `not_started` items. | all |
+| `report_serialization_failed` | The result could not be serialized; audio may already be published (`partial_publication`). | all |
+| `cancelled` | The operation was cancelled before or during work and ended cleanly: no recovery file, rollback or cleanup failure, and no publication. Any other outcome of a cancellation keeps its failure code (`io_error` for cleanup and rollback failures) and `cancelled: false`. A statistics accounting that was cancelled after publication reports `cancelled` in `results[].statistics.code`. | all |
+| `usage` | The command line or a request is invalid. | all |
+| `settings_error` | A settings or template operation failed. | all |
+| `statistics_error` | The statistics store failed (also `results[].statistics.code` when the accounting `failed`). | all |
+| `signal_handler_failed` | The Ctrl-C handler could not be installed. | all |
+| `internal_error` | An unclassified failure; also the fallback for an unknown stage. | all |
+
+The table, `ErrorCode::ALL` in `src/error_code.rs` and the unit and CLI tests
+are kept consistent by a test that fails when a code is added to one and not
+the others.
 
 ## Commands and capability mapping
 
@@ -104,8 +278,9 @@ the serialized view. `edit` accepts all fields and value types listed below, e.g
 `platinum templates edit --index 3 'expansion.bands[1].threshold' -12.5`.
 JSON strings need shell quoting, e.g. `platinum config set output.format '"wav"'`;
 booleans, numbers, `null`, arrays and objects are also JSON values.
-The output settings, codec library locations and digests, and selected
-template are configurable using the field paths below. Import and export
+The output settings, the `parity.allow_non_identical` opt-in, codec library
+locations and digests, and selected template are configurable using the field
+paths below. Import and export
 report ignored fields and losses; export never replaces an existing file.
 Template exports stage in a private descriptor-pinned workspace in the destination
 directory, publish without replacement, and sync that directory. A failure after
@@ -293,6 +468,18 @@ a restrictive umask cannot silently change the final mode. On failure, cleanup
 unlinks only a dev/inode-verified sibling in a non-shared, ACL-checked parent.
 Otherwise it does not unlink and reports the cleanup failure and sibling path.
 
+A WAV source's own tag chunks mostly do not survive WAV output, as in the reference.
+The marker pass rewrites the WAV while TagLib's stream is still open, so the RIFF
+size TagLib wrote last is not yet on disk and the rewrite discards the chunk
+TagLib saved last. A source `ID3 `/`id3 ` chunk (text and artwork) is therefore
+absent from WAV-to-WAV output unless the source also has an INFO `LIST`; then the
+ID3 chunk is kept and the `LIST` is lost. Platinum Notes 10.5.0.1256 produced
+identical bytes for generated ID3-only WAV inputs (explicit WAV output;
+`match-input` takes the same direct-copy path). Cross-format copies to WAV follow
+the same rule: ID3 is kept when an INFO tag is also written, and lost for a
+source whose only copied fields are tempo and key. This is parity behavior, not a
+defect.
+
 For a first run, use a disposable copy of an input and an existing separate
 output directory. After following the build guide, set `INPUT` and `OUTPUT_DIR`
 to your chosen paths; `PN` and `PN_STATE` are the variables from that guide:
@@ -353,11 +540,16 @@ backup's waveform or error, and the latter may be null. The diagnostic-only
 claim the original clock's sampling phase.
 
 On the portable path, MP3 postflight inspects the encoded output without
-enabling MP3 input decoding. For a CBR `Info` header, its frame estimate uses
-the observed AudioToolbox binary64 operation order and rounds the estimated
-packet count upward before accounting for encoder delay and padding; a `Xing`
-header uses its validated declared packet count. Thus encoded length is not
-necessarily the recorder's submitted-frame count.
+enabling MP3 input decoding. For an `Info` tag with a LAME or erased identifier
+the packet estimate is `ceil((declared_bytes - tag_frame_size) * 8 /
+bitrate_of_the_first_frame_after_the_tag * rate / samples_per_packet)` in the
+observed AudioToolbox binary64 operation order: it uses the declared byte
+count, not the counted bytes, so variable-bitrate output that keeps an `Info`
+tag follows only that one frame's bitrate. A `Xing` tag, and an `Info` tag with
+a Lavf or Lavc identifier, use the validated declared packet count. Encoder
+delay and padding apply for a LAME identifier or when the tag's CRC-16/ARC
+verifies. Thus encoded length is not necessarily the recorder's
+submitted-frame count.
 
 Jobs default to `processor_max`, clamped to available cores; `--jobs` is also
 clamped to that maximum. Ctrl-C stops starting queued work and signals active
@@ -468,6 +660,8 @@ deliberate Engine safety choice.
 | `libraries` | Object with `flac`, `flac_sha256`, `lame`, `lame_sha256`, `tag_bridge`; each is a string or `null`. Individual paths such as `libraries.flac_sha256` are also writable. A non-null digest is 64 hex digits; FLAC input/output and LAME output loading require caller-pinned digests. The ABI-5 tag bridge is required for processing, analysis, inspection and marker-only restore. Paths and digests are caller-supplied; settings alone does not load the libraries or establish their provenance. |
 | `selected_template` | `null`, `{"builtin":{"id":"..."}}`, or `{"custom":{"index":0,"id":"..."}}`; custom IDs can be `null` and must match the indexed object. Prefer `select_template` for validated selection. |
 | `effective_selected_template` | Read-only resolved selection; even when `selected_template` is `null`, this shows the first built-in's identity. |
+| `parity` | `{"allow_non_identical":false}`; the opt-in group described under "Opt-in non-identical paths". It is omitted from the state file while default. |
+| `parity.allow_non_identical` | Boolean, default `false`. Writable individually; `config reset parity.allow_non_identical` restores the default. |
 
 On Linux, the FLAC, LAME and TagLib bridge libraries must additionally match
 the exact architecture-specific SHA-256 identities in `src/linux_libraries.rs`.
@@ -564,8 +758,10 @@ On Linux and in the macOS `portable` feature, a non-MP3 source at or below
 22,050 Hz is refused because the reference processing-rate conversion has not
 been reproduced. For other non-44.1 kHz sources, analysis can proceed but the
 primary waveform is `null` with `waveform_unavailable` explaining the missing
-conversion. MP3/AAC decoding, AAC encoding and output sample-rate conversion
-fail before publication. Portable FLAC and MP3 output can use caller-pinned
+conversion. By default MP3 and AAC decoding fail before publication on Linux
+and in the `portable` feature; with `parity.allow_non_identical` on, MP3 input
+decodes through the open-source decoder (AAC stays refused). AAC encoding and
+output sample-rate conversion fail before publication. Portable FLAC and MP3 output can use caller-pinned
 encoders; sampled patched Linux builds are documented separately and are not
 a proof of whole-pipeline parity. MP3 output is inspected without enabling MP3
 input decoding; the postflight validates MPEG frame structure and computes the

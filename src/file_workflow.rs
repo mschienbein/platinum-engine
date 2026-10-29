@@ -140,6 +140,8 @@ pub enum WorkflowError {
     InvalidMarkerBackup,
     BackupNotRecorded(PathBuf),
     BackupNotFound(PathBuf),
+    /// The `--backup` path supplied for a restore does not exist.
+    SuppliedBackupNotFound(PathBuf),
     BackupMismatch { recorded: PathBuf, supplied: PathBuf },
     RestoreNotNeeded(PathBuf),
     NotProcessed(PathBuf),
@@ -173,6 +175,7 @@ impl fmt::Display for WorkflowError {
             Self::InvalidMarkerBackup => f.write_str("marker contains an invalid backup path"),
             Self::BackupNotRecorded(p) => write!(f, "no backup recorded for {}", p.display()),
             Self::BackupNotFound(p) => write!(f, "recorded backup not found: {}", p.display()),
+            Self::SuppliedBackupNotFound(p) => write!(f, "supplied backup not found: {}", p.display()),
             Self::BackupMismatch { recorded, supplied } => write!(f, "supplied backup {} differs from recorded {}", supplied.display(), recorded.display()),
             Self::RestoreNotNeeded(p) => write!(f, "restore not needed for suffix-only processed file {}", p.display()),
             Self::NotProcessed(p) => write!(f, "file is not marked processed: {}", p.display()),
@@ -894,7 +897,10 @@ impl RestoreBatchSnapshot {
         for (index, (target, backup)) in targets.iter().zip(backups).enumerate() {
             if !backup.is_absolute() { return Err(WorkflowError::InvalidMarkerBackup); }
             target_ids.push(FileIdentity::capture(target)?);
-            let frozen = FrozenBackup::capture(backup)?;
+            let frozen = FrozenBackup::capture(backup).map_err(|error| match error {
+                WorkflowError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => WorkflowError::SuppliedBackupNotFound(backup.to_owned()),
+                other => other,
+            })?;
             if let Some(&previous) = by_path.get(&frozen.identity.path) {
                 let prior = &backup_ids[previous];
                 if frozen.identity.stamp != prior.identity.stamp || frozen.digest != prior.digest {

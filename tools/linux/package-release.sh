@@ -129,13 +129,16 @@ PY
 mkdir -p "$payload/bin" "$payload/lib" "$payload/licenses/taglib" "$payload/licenses/flac" \
   "$payload/licenses/lame" "$payload/licenses/apple-alac" "$payload/licenses/rust" \
   "$payload/corresponding-source/archives" "$payload/corresponding-source/relink" \
-  "$payload/corresponding-source/receipt" "$payload/corresponding-source/src/portable/audio"
+  "$payload/corresponding-source/receipt" "$payload/corresponding-source/src/portable/audio" \
+  "$payload/corresponding-source/tools/portable/mp3dec"
 cp "$out/cli/target/release/platinum" "$payload/bin/platinum"
 cp -R "$native/lib/." "$payload/lib/"
 cp "$root/LICENSE" "$payload/LICENSE"
 cp -R "$native/rust-license" "$payload/licenses/rust-standard-library"
 cp "$root/Cargo.toml" "$root/Cargo.lock" "$root/rust-toolchain.toml" "$payload/corresponding-source/"
 cp "$root/src/portable/audio/alac.rs" "$payload/corresponding-source/src/portable/audio/"
+cp "$root/src/portable/audio/mp3_tables.rs" "$payload/corresponding-source/src/portable/audio/"
+cp "$root/tools/portable/mp3dec/gen_tables.py" "$payload/corresponding-source/tools/portable/mp3dec/"
 cp -R "$native/source/." "$payload/corresponding-source/"
 cp -R "$native/archives/." "$payload/corresponding-source/archives/"
 cp -R "$native/relink/." "$payload/corresponding-source/relink/"
@@ -303,6 +306,17 @@ reference license is Apache-2.0, included in licenses/apple-alac/LICENSE. The
 upstream tree at that revision contains no NOTICE file. Derivative status and any applicable
 attribution requirements require maintainer/license review; this notice is not
 a clearance conclusion.
+
+The opt-in MP3 decoder (Linux and portable builds) in src/portable/audio/mp3*.rs
+is project-owned Layer III code written from ISO/IEC 11172-3 and 13818-3; it
+links no decoder library and contains no code from LAME, mpglib, mpg123, libmad,
+minimp3 or FFmpeg. Its Huffman and synthesis-window tables are standard data;
+corresponding-source/tools/portable/mp3dec/gen_tables.py transcribes those
+numbers, not code, from the LAME 3.100 archive included in
+corresponding-source/archives (LGPL-2.0-or-later) into
+corresponding-source/src/portable/audio/mp3_tables.rs. Whether numeric standard
+data taken from that source needs attribution beyond this notice requires
+maintainer/license review; this notice is not a clearance conclusion.
 
 Rust dependency license texts, notices, authors and declarations are in
 licenses/rust. Rust standard-library notices and referenced license texts are

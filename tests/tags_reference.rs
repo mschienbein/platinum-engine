@@ -270,6 +270,45 @@ mod candidate_bridge {
         assert!(!has_id(&f, b"TCON")); assert!(!has_id(&f, b"XABC"));
     }
 
+    // A WAV source's own ID3 chunk is lost on WAV output because TagLib 1.11.1 appends the chunk it
+    // saves last and leaves its RIFF-size write buffered until the stream closes, while PN's PLTN
+    // rewrite runs first and discards bytes after that stale declared size. Platinum Notes 10.5.0.1256
+    // does the same: its GUI outputs for generated ID3-only WAV inputs carry no ID3 chunk (original
+    // A/B identical to the Rust output, local-artifacts/hash-parity/metadata-wav-batch-01). With a source
+    // INFO LIST the ID3 chunk survives and the LIST is lost, as in the original-framework captures
+    // local-artifacts/tag-transfer/reference-51820-40 and -57. Do not flush before the rewrite to "fix" it.
+    #[test]
+    #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
+    fn wav_direct_copy_loses_the_chunk_taglib_saves_last_as_the_original_does() {
+        let bridge = library(); let marker = marker();
+        let id3 = tag(&[text(b"TIT2", "Title"), text(b"TPE1", "Artist")]);
+        let info = { let mut v = b"INFO".to_vec(); v.extend(riff_chunk(b"INAM", b"Info title\0")); v };
+        let plain: [&[u8; 4]; 3] = [b"fmt ", b"data", b"PLTN"];
+        let kept: [&[u8; 4]; 4] = [b"fmt ", b"data", b"ID3 ", b"PLTN"];
+        let cases: [(&str, Vec<Vec<u8>>, &[&[u8; 4]]); 5] = [
+            ("ID3 chunk only", vec![riff_chunk(b"ID3 ", &id3)], &plain),
+            ("lowercase id3 chunk only", vec![riff_chunk(b"id3 ", &id3)], &plain),
+            ("INFO LIST only", vec![riff_chunk(b"LIST", &info)], &plain),
+            ("no tag chunks", Vec::new(), &plain),
+            ("ID3 chunk and INFO LIST", vec![riff_chunk(b"ID3 ", &id3), riff_chunk(b"LIST", &info)], &kept),
+        ];
+        for (label, extra, expected) in cases {
+            for choice in [OutputChoice::Explicit, OutputChoice::MatchInput] {
+                let original = base_wav(&extra);
+                let src = Temp::new("wav", &original); let dst = Temp::new("wav", &base_wav(&[]));
+                let report = bridge.transfer(src.path(), dst.path(), Format::Wav, Format::Wav, choice, &marker).unwrap();
+                assert!(report.is_success(), "{label} {choice:?}: {report:?}"); assert_eq!(src.bytes(), original);
+                let output = chunks(&dst.bytes());
+                let ids: Vec<[u8; 4]> = output.iter().map(|(id, _)| *id).collect();
+                assert_eq!(ids, expected.iter().map(|id| **id).collect::<Vec<_>>(), "{label} {choice:?}");
+                if let Some((_, body)) = output.iter().find(|(id, _)| id == b"ID3 ") {
+                    let f = frames(body);
+                    assert!(has_id(&f, b"TIT2") && has_id(&f, b"TPE1"), "{label} {choice:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
     fn nil_marker_removes_existing_first_geob_and_same_file_is_rejected() {

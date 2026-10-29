@@ -77,6 +77,49 @@ int pn_tag_save_marker(int destination_format, const char *destination,
                        pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context,
                        char *error, size_t error_capacity);
 
+/* ABI-5 optional extension: opt-in byte-for-byte artwork copy (portable
+ * bridge only; the macOS bridge never exports these symbols). The six
+ * functions above are unchanged and behave exactly as before; a caller that
+ * wants the extension looks the symbols up optionally and treats a missing
+ * pn_tag_bridge_features as "no extension".
+ *
+ * PN_TAG_COPY_ARTWORK_BYTES makes the bridge store each embedded picture's
+ * encoded bytes unchanged (FLAC PICTURE, ID3 APIC, MP4 covr, in source order)
+ * where the reference bridge would re-encode them as PNG through
+ * NSImage/ImageIO (generic copies) or, for FLAC direct copies, drop them.
+ * Type, description and, for FLAC sources, the picture geometry are carried
+ * over where the destination has a place for them (MP4 has neither; its
+ * pictures count as front covers elsewhere). The MIME type is always the
+ * canonical type of the validated bytes: a source label that disagrees, such
+ * as "image/jpg", is corrected. Pictures with zero bytes are skipped, as in
+ * the reference. The result is therefore NOT byte-identical to the macOS
+ * reference for any file whose pictures were copied;
+ * PN_TAG_RESULT_ARTWORK_COPIED reports exactly that case. Direct copies that
+ * already move pictures unchanged in the reference (ID3, MP4, AIFF,
+ * MP4 -> ID3) are untouched by the flag.
+ *
+ * Status 2 under the flag means: a picture is not a structurally valid
+ * JPEG/PNG/GIF/BMP/WebP image, or the destination cannot store it as-is
+ * (MP4 covr holds only JPEG/PNG/GIF/BMP; a FLAC metadata block holds at most
+ * 16 MiB - 1). The refusal happens before any destination write or callback.
+ * WAV destinations are unchanged and behave as in the reference: a picture
+ * reaches a WAV only inside an ID3 chunk that the marker rewrite does not
+ * discard (the chunk TagLib saved last is lost when the file is rewritten
+ * while the stream is still open).
+ * flags with unknown bits fail with status 1. result_flags may be NULL; it is
+ * set to 0 on entry and to the OR of PN_TAG_RESULT_* only when the call
+ * returns 0. */
+enum { PN_TAG_FEATURE_ARTWORK_COPY = 1 };
+enum { PN_TAG_COPY_ARTWORK_BYTES = 1 };
+enum { PN_TAG_RESULT_ARTWORK_COPIED = 1 };
+uint32_t pn_tag_bridge_features(void);
+int pn_tag_copy_direct_ex(unsigned flags, int operation, const char *source, const char *destination,
+                          unsigned *result_flags, char *error, size_t error_capacity);
+int pn_tag_copy_generic_ex(unsigned flags, int source_format, int destination_format,
+                           const char *source, const char *destination,
+                           pn_tag_serialize_marker serialize, pn_tag_rewrite_wav rewrite_wav, void *context,
+                           unsigned *result_flags, char *error, size_t error_capacity);
+
 #ifdef __cplusplus
 }
 #endif

@@ -108,6 +108,37 @@ pub struct LibraryPaths {
     pub tag_bridge: Option<PathBuf>,
 }
 
+/// Opt-ins for paths that are not proven byte-identical to the macOS arm64
+/// reference. Everything under `parity.*` defaults to off; the default
+/// behaviour of every build is exactly the identical-or-refuse behaviour.
+/// Settings that enable formats the original application does not accept live
+/// in a separate namespace, never here.
+///
+/// `allow_non_identical` enables, on Linux and `portable` builds only, the
+/// open-source MP3 decoder and the byte-for-byte copy of embedded cover art.
+/// macOS default builds always use Apple's decoder and image pipeline, so the
+/// setting is stored but has no effect there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParitySettings {
+    pub allow_non_identical: bool,
+}
+impl ParitySettings {
+    fn is_default(&self) -> bool { *self == Self::default() }
+}
+
+/// Whether this build can take a non-identical path at all.
+pub const NON_IDENTICAL_PATHS_AVAILABLE: bool = cfg!(any(target_os = "linux", feature = "portable"));
+
+/// Read-only statement of what `parity.allow_non_identical` does in this build,
+/// shown by `config show` so that a stored but inert opt-in is never mistaken
+/// for an active one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ParityEffect {
+    pub effective: bool,
+    pub note: &'static str,
+}
+
 /// Custom indices are zero-based within `custom_templates`, and carry the
 /// imported ID (including null/empty) as a guard against a stale index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +160,10 @@ pub struct Settings {
     pub processor_max: usize,
     pub mp3_mode: Mp3Mode,
     pub libraries: LibraryPaths,
+    /// Omitted from the state file while default so a settings file that never
+    /// used the opt-in stays readable by earlier releases.
+    #[serde(default, skip_serializing_if = "ParitySettings::is_default")]
+    pub parity: ParitySettings,
     pub selected_template: Option<SelectedTemplate>,
     pub custom_templates: Vec<Template>,
 }
@@ -139,6 +174,8 @@ struct ConfigView<'a> {
     processor_max: usize,
     mp3_mode: Mp3Mode,
     libraries: &'a LibraryPaths,
+    parity: ParitySettings,
+    parity_effect: ParityEffect,
     selected_template: &'a Option<SelectedTemplate>,
     effective_selected_template: SelectedTemplate,
 }
@@ -164,8 +201,25 @@ impl Settings {
             processor_max: cores(available_cores),
             mp3_mode: Mp3Mode::Cbr320,
             libraries: LibraryPaths::default(),
+            parity: ParitySettings::default(),
             selected_template: None,
             custom_templates: Vec::new(),
+        }
+    }
+
+    /// Whether non-identical paths (open-source MP3 decoding, unchanged
+    /// cover-art copy) are active: the opt-in is set and this build has them.
+    pub fn non_identical_enabled(&self) -> bool {
+        NON_IDENTICAL_PATHS_AVAILABLE && self.parity.allow_non_identical
+    }
+    pub fn parity_effect(&self) -> ParityEffect {
+        match (NON_IDENTICAL_PATHS_AVAILABLE, self.parity.allow_non_identical) {
+            (false, _) => ParityEffect { effective: false,
+                note: "no effect in this macOS default build: Apple's decoder and image pipeline are always used, so this setting is stored but ignored" },
+            (true, false) => ParityEffect { effective: false,
+                note: "disabled: identical-or-refuse behaviour; MP3 input is refused and artwork that would need Apple image conversion is refused, each with a typed error code" },
+            (true, true) => ParityEffect { effective: true,
+                note: "enabled: MP3 input is decoded with the open-source decoder and embedded cover art is copied unchanged; items using these paths list them in report.non_identical_paths and are not guaranteed byte-identical to macOS" },
         }
     }
 
@@ -201,7 +255,8 @@ impl Settings {
     pub fn config_show(&self) -> Result<Value, SettingsError> {
         Ok(serde_json::to_value(ConfigView {
             output: &self.output, processor_max: self.processor_max, mp3_mode: self.mp3_mode,
-            libraries: &self.libraries, selected_template: &self.selected_template,
+            libraries: &self.libraries, parity: self.parity, parity_effect: self.parity_effect(),
+            selected_template: &self.selected_template,
             effective_selected_template: self.effective_selection()?,
         })?)
     }
@@ -213,6 +268,8 @@ impl Settings {
             "processor_max" => serde_json::to_value(self.processor_max)?,
             "mp3_mode" => serde_json::to_value(self.mp3_mode)?,
             "libraries" => serde_json::to_value(&self.libraries)?,
+            "parity" => serde_json::to_value(self.parity)?,
+            "parity.allow_non_identical" => serde_json::to_value(self.parity.allow_non_identical)?,
             "libraries.flac" => serde_json::to_value(&self.libraries.flac)?,
             "libraries.flac_sha256" => serde_json::to_value(&self.libraries.flac_sha256)?,
             "libraries.lame" => serde_json::to_value(&self.libraries.lame)?,
@@ -246,6 +303,8 @@ impl Settings {
             }
             "mp3_mode" => next.mp3_mode = decode(field, value)?,
             "libraries" => next.libraries = decode(field, value)?,
+            "parity" => next.parity = decode(field, value)?,
+            "parity.allow_non_identical" => next.parity.allow_non_identical = decode(field, value)?,
             "libraries.flac" => next.libraries.flac = decode(field, value)?,
             "libraries.flac_sha256" => next.libraries.flac_sha256 = decode(field, value)?,
             "libraries.lame" => next.libraries.lame = decode(field, value)?,
