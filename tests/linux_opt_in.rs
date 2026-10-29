@@ -1,10 +1,14 @@
-//! End-to-end CLI tests of the v0.2.0 opt-in `parity.allow_non_identical` and of
+//! End-to-end CLI tests of the v0.2.0 opt-in `parity.allow_non_identical` (embedded artwork copy) and of
 //! the Linux-only failure codes (`unsupported_input_codec`,
 //! `unsupported_output_codec`, `unsupported_sample_rate_conversion`,
 //! `artwork_conversion_unavailable`; see `tests/error_codes.rs`, whose coverage
 //! ledger points here). Every test runs the real `platinum` binary against
 //! generated audio and generated images in an isolated HOME and state
 //! directory, and parses the JSON outcome.
+//!
+//! MP3 input is not gated by the opt-in: the portable MP3 reader is bit-exact with AudioToolbox (see
+//! `tests/portable_mp3.rs`), so the MP3 scenarios below run with the setting off and on and expect the same
+//! results and an empty `non_identical_paths`.
 //!
 //! Every test is `#[ignore]`d: it needs the libraries of the image under test,
 //! passed as `PLATINUM_TEST_TAG_BRIDGE`, `PN_FLAC_LIB`/`PN_FLAC_SHA256` and
@@ -14,25 +18,25 @@
 //! # PN_LINUX_OPT_IN_NOTES
 //!
 //! Which scenario depends on which piece of v0.2.0 work (a failure of a scenario
-//! points at that owner first). "Decoder" is the portable MP3 decoder behind
-//! `Reader::open_with(.., ReaderOptions { non_identical_mp3 })`; "art bridge" is
+//! points at that owner first). "Decoder" is the portable MP3 reader behind
+//! `Reader::open` (`src/portable/audio/mp3/`); "art bridge" is
 //! the portable tag bridge exporting the ABI-5 artwork extension
 //! (`pn_tag_bridge_features`, `pn_tag_copy_{direct,generic}_ex`).
 //!
 //! | Scenario | Depends on |
 //! |---|---|
-//! | A `mp3_is_refused_without_the_opt_in_with_the_v0_1_0_message` | engine/settings wiring only (the refusal exists without the decoder); the fixture MP3 comes from the LAME encoder |
-//! | B `mp3_with_opt_in` | decoder, engine `non_identical_paths` reporting, LAME |
+//! | A `mp3_input_needs_no_opt_in_and_the_setting_changes_nothing` | decoder, engine reporting (`non_identical_paths` stays empty), LAME; the fixture MP3 comes from the LAME encoder |
 //! | C `identical_paths_stay_identical_with_the_opt_in_on` | engine/settings wiring, libFLAC |
 //! | D1 `unsupported_sample_rate_conversion_for_a_22_05_khz_wav` | engine analysis pre-check (the portable reader refuses sample-rate conversion) |
 //! | D2 `unsupported_sample_rate_conversion_for_a_24_khz_mp3` | decoder: opens at the native rate, refuses a 44.1 kHz client rate |
 //! | D3 `unsupported_output_format_for_alac_beyond_96_khz` | portable ALAC writer limits (22,050–96,000 Hz, 1–8 channels); output-side code override in `error_code::classify` |
-//! | E `corrupt_mp3_with_the_opt_in_is_an_invalid_input_file` | decoder: header scan at open, `InvalidInput` at the first read of damaged frame data |
+//! | D4 `a_48_khz_mp3_is_analyzed_without_a_waveform_and_processes` | decoder at a kept processing rate; engine waveform guard (waveform stays unavailable off 44.1 kHz) |
+//! | E `an_undecodable_mp3_fails_at_the_first_read_with_apples_status` | decoder: container check at open, Apple's `'bada'` at the first `ExtAudioFileRead` |
 //! | E2 `a_truncated_mp3_is_refused_by_the_container_check_before_any_decoder_runs` | art bridge / tag bridge refusing "invalid or truncated MPEG audio" (status 3), engine container sniffing |
 //! | F `aac_is_always_refused` | portable codec layer keeping AAC (decode and encode) unsupported in v0.2.0; tag bridge parsing the hand-built `.m4a` |
 //! | G1, G2 `artwork_flac_png_to_*` | art bridge, engine `TransferOptions`, libFLAC (and LAME for G2) |
 //! | G3 `artwork_flac_webp_to_alac_is_refused_but_png_is_copied` | art bridge (MP4 `covr` rules), libFLAC |
-//! | G4 `artwork_mp3_apic_is_moved_unchanged_and_reports_only_mp3_decode` | decoder, the bridge's ID3 direct copy, LAME |
+//! | G4 `artwork_mp3_apic_is_moved_unchanged_and_reports_no_non_identical_path` | decoder, the bridge's ID3 direct copy, LAME |
 //! | G5 `sources_without_artwork_report_no_artwork_copy` | engine reporting, art bridge accepting pictureless sources |
 //! | G6 `wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without` | `src/wav_preserve.rs` (Rust marker rewrite), engine `TransferOptions` and `non_identical_paths`; works with any bridge |
 //! | G7 `cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote` | the same rewrite for generic copies into a WAV (tempo and key are always written) |
@@ -52,8 +56,6 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 const RATE: u32 = 44_100;
 /// Generated audio is short: processing is the cost of every scenario.
 const SECONDS: u32 = 1;
-/// The message every release before the MP3 opt-in gave; it stays the default.
-const MP3_REFUSAL: &str = "MP3 decoding is unavailable: Apple's decoder output is not reproducible";
 
 struct Sandbox { root: PathBuf, home: PathBuf, state: PathBuf }
 impl Sandbox {
@@ -134,6 +136,14 @@ impl Sandbox {
     /// A plain MP3 with no ID3 tag and no processed marker: LAME output with its tags stripped.
     fn plain_mp3(&self, name: &str) -> PathBuf {
         let produced = fs::read(self.engine_output(name, "mp3")).unwrap();
+        self.file(&format!("inputs/{name}.mp3"), &strip_id3(&produced))
+    }
+    /// The same at another sample rate: the engine encodes MP3 at the input's rate, so this is a native 48 kHz stream.
+    fn plain_mp3_at(&self, name: &str, rate: u32) -> PathBuf {
+        let wav = self.file(&format!("fixtures/{name}.wav"), &generated_wav(rate, SECONDS, false));
+        let out = self.dir(&format!("fixtures/{name}-mp3"));
+        let outcome = self.ok(&["process", text(&wav), "--format", "mp3", "--output-dir", text(&out)]);
+        let produced = fs::read(report(&outcome, 0)["output_path"].as_str().unwrap()).unwrap();
         self.file(&format!("inputs/{name}.mp3"), &strip_id3(&produced))
     }
     /// A FLAC with only STREAMINFO (so no marker and no tags) and, optionally, one picture.
@@ -245,11 +255,17 @@ fn mpeg2_24khz_silence() -> Vec<u8> {
     mpeg_frames([0xff, 0xf3, 0x84, 0x00], 192, 24, |_, _| {})
 }
 
-/// Eight complete MPEG-1 Layer III 44.1 kHz 128 kbit/s frames (417 bytes each) whose
-/// first granule claims 4095 bits of part 2/3 data while the frame holds only 3048:
-/// the header scan at open succeeds and the first read finds damaged frame data.
-fn damaged_mp3() -> Vec<u8> {
-    mpeg_frames([0xff, 0xfb, 0x90, 0x00], 417, 8, |_, body| body[..4].copy_from_slice(&[0x00, 0x00, 0x0f, 0xff]))
+/// Eight complete MPEG-1 Layer III 44.1 kHz 128 kbit/s frames (417 bytes each) whose side information and
+/// main data are pseudo-random: the container scan at open succeeds, and the decoder fails every frame, which
+/// AudioToolbox reports as `'bada'` at the first `ExtAudioFileRead` (the corpus family `bad_frames`).
+fn undecodable_mp3() -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    mpeg_frames([0xff, 0xfb, 0x90, 0x00], 417, 8, |_, body| {
+        for byte in body {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            *byte = (state >> 24) as u8;
+        }
+    })
 }
 
 /// A valid MPEG-1 Layer III 44.1 kHz 128 kbit/s header, then only 100 body bytes:
@@ -523,68 +539,51 @@ fn id3_pictures(data: &[u8]) -> Vec<Apic> {
     pictures
 }
 
-// --- A: the v0.1.0 refusal stays the default --------------------------------------------
+// --- A: MP3 input needs no opt-in ----------------------------------------------------------
 
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn mp3_is_refused_without_the_opt_in_with_the_v0_1_0_message() {
-    let sandbox = Sandbox::configured();
-    let mp3 = sandbox.plain_mp3("tone");
-    let before = fs::read(&mp3).unwrap();
-    // First the setting at its default, then explicitly stored as false.
-    for (round, explicit) in [None, Some(false)].into_iter().enumerate() {
-        if let Some(on) = explicit { sandbox.set_opt_in(on); }
-        let out = sandbox.dir(&format!("out-{round}"));
-        for args in [
-            vec!["process", text(&mp3), "--format", "match-input", "--output-dir", text(&out)],
-            vec!["inspect", text(&mp3)],
-            vec!["analyze", text(&mp3)],
-        ] {
-            let outcome = sandbox.fails(1, &args);
-            assert_failed_item(&outcome, 0, None, "unsupported_input_codec");
-            let message = outcome["results"][0]["error"]["message"].as_str().unwrap();
-            assert!(message.contains(MP3_REFUSAL), "{args:?}: message {message:?} must contain {MP3_REFUSAL:?}");
-        }
-        assert_no_files(&out);
-        assert_eq!(fs::read(&mp3).unwrap(), before, "the input is never modified");
-    }
-}
-
-// --- B: the opt-in decodes MP3 and says so ----------------------------------------------
-
-#[test]
-#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn mp3_with_opt_in() {
+fn mp3_input_needs_no_opt_in_and_the_setting_changes_nothing() {
     let sandbox = Sandbox::configured();
     let input = sandbox.plain_mp3("tone");
     let before = fs::read(&input).unwrap();
-    sandbox.set_opt_in(true);
+    let (mut outputs, mut wav_digests) = (Vec::new(), Vec::new());
+    // First the setting at its default, then explicitly stored as false, then on: the MP3 results never differ.
+    for (round, explicit) in [None, Some(false), Some(true)].into_iter().enumerate() {
+        if let Some(on) = explicit { sandbox.set_opt_in(on); }
+        let on = explicit == Some(true);
+        let out = sandbox.dir(&format!("out-{round}"));
+        let processed = sandbox.ok(&["process", text(&input), "--format", "match-input", "--output-dir", text(&out)]);
+        assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "round {round}: {processed}");
+        let output = report(&processed, 0)["output_path"].as_str().unwrap();
+        assert_eq!(Path::new(output).extension().and_then(|e| e.to_str()), Some("mp3"), "{processed}");
+        assert!(Path::new(output).starts_with(&out), "output {output} must be inside {}", out.display());
 
-    let out = sandbox.dir("out");
-    let processed = sandbox.ok(&["process", text(&input), "--format", "match-input", "--output-dir", text(&out)]);
-    assert_eq!(paths(report(&processed, 0)), ["mp3_decode"], "{processed}");
-    let output = report(&processed, 0)["output_path"].as_str().unwrap();
-    assert_eq!(Path::new(output).extension().and_then(|e| e.to_str()), Some("mp3"), "{processed}");
-    assert!(Path::new(output).starts_with(&out), "output {output} must be inside {}", out.display());
+        let inspected = sandbox.ok(&["inspect", output]);
+        let inspection = report(&inspected, 0);
+        assert_eq!(inspection["processed"], true, "{inspected}");
+        assert_eq!(paths(inspection), Vec::<&str>::new(), "{inspected}");
+        assert_eq!(inspection["sample_rate"], 44_100.0, "{inspected}");
+        assert_eq!(inspection["channels"], 2, "{inspected}");
 
-    let inspected = sandbox.ok(&["inspect", output]);
-    let inspection = report(&inspected, 0);
-    assert_eq!(inspection["processed"], true, "{inspected}");
-    assert_eq!(paths(inspection), ["mp3_decode"], "{inspected}");
-    assert_eq!(inspection["sample_rate"], 44_100.0, "{inspected}");
-    assert_eq!(inspection["channels"], 2, "{inspected}");
+        let analyzed = sandbox.ok(&["analyze", text(&input)]);
+        assert_eq!(paths(report(&analyzed, 0)), Vec::<&str>::new(), "{analyzed}");
+        assert!(report(&analyzed, 0)["volume"].as_f64().is_some_and(f64::is_finite), "{analyzed}");
 
-    let analyzed = sandbox.ok(&["analyze", text(&input)]);
-    assert_eq!(paths(report(&analyzed, 0)), ["mp3_decode"], "{analyzed}");
-    assert!(report(&analyzed, 0)["volume"].as_f64().is_some_and(f64::is_finite), "{analyzed}");
-
-    let wav_out = sandbox.dir("wav-out");
-    let as_wav = sandbox.ok(&["process", text(&input), "--format", "wav", "--output-dir", text(&wav_out)]);
-    // The generic copy into a WAV writes an `ID3 ` chunk (tempo and key) that the default policy drops; the opt-in keeps it.
-    assert_eq!(paths(report(&as_wav, 0)), ["mp3_decode", "wav_tag_preservation"], "{as_wav}");
-    assert_eq!(Path::new(report(&as_wav, 0)["output_path"].as_str().unwrap()).extension().and_then(|e| e.to_str()), Some("wav"));
-
-    assert_eq!(fs::read(&input).unwrap(), before, "the input is never modified");
+        let wav_out = sandbox.dir(&format!("wav-out-{round}"));
+        let as_wav = sandbox.ok(&["process", text(&input), "--format", "wav", "--output-dir", text(&wav_out)]);
+        // A generic copy into a WAV writes an `ID3 ` chunk (tempo and key) that the default policy drops and the opt-in
+        // keeps: the one non-identical member, a property of the WAV output and not of the MP3 input.
+        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
+        assert_eq!(paths(report(&as_wav, 0)), expected, "round {round}: {as_wav}");
+        let wav = report(&as_wav, 0)["output_path"].as_str().unwrap();
+        assert_eq!(Path::new(wav).extension().and_then(|e| e.to_str()), Some("wav"));
+        outputs.push((file_sha256(output).unwrap(), analyzed["results"][0]["report"]["volume"].clone()));
+        if !on { wav_digests.push(file_sha256(wav).unwrap()); }
+        assert_eq!(fs::read(&input).unwrap(), before, "the input is never modified");
+    }
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]), "the opt-in must not change the MP3 output or the analysis of MP3 input: {outputs:?}");
+    assert!(wav_digests.windows(2).all(|pair| pair[0] == pair[1]), "WAV output is identical across the default-off rounds");
 }
 
 // --- C: identical paths stay identical ------------------------------------------------------
@@ -638,21 +637,52 @@ fn unsupported_sample_rate_conversion_for_a_22_05_khz_wav() {
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
 fn unsupported_sample_rate_conversion_for_a_24_khz_mp3() {
     let sandbox = Sandbox::configured();
-    sandbox.set_opt_in(true);
     let mp3 = sandbox.file("mpeg2-24khz.mp3", &mpeg2_24khz_silence());
-    // Opening at the file's own rate works; processing opens at 44.1 kHz and the decoder does not resample.
-    let inspected = sandbox.ok(&["inspect", text(&mp3)]);
-    assert_eq!(report(&inspected, 0)["sample_rate"], 24_000.0, "{inspected}");
-    assert_eq!(paths(report(&inspected, 0)), ["mp3_decode"], "{inspected}");
-    let out = sandbox.dir("out");
-    for args in [
-        vec!["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)],
-        vec!["analyze", text(&mp3)],
-    ] {
-        let outcome = sandbox.fails(1, &args);
-        assert_failed_item(&outcome, 0, None, "unsupported_sample_rate_conversion");
+    for (round, on) in [false, true].into_iter().enumerate() {
+        sandbox.set_opt_in(on);
+        // Opening at the file's own rate works; processing opens at 44.1 kHz and the decoder does not resample.
+        let inspected = sandbox.ok(&["inspect", text(&mp3)]);
+        assert_eq!(report(&inspected, 0)["sample_rate"], 24_000.0, "opt-in {on}: {inspected}");
+        assert_eq!(paths(report(&inspected, 0)), Vec::<&str>::new(), "opt-in {on}: {inspected}");
+        let out = sandbox.dir(&format!("out-{round}"));
+        for args in [
+            vec!["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)],
+            vec!["analyze", text(&mp3)],
+        ] {
+            let outcome = sandbox.fails(1, &args);
+            assert_failed_item(&outcome, 0, None, "unsupported_sample_rate_conversion");
+        }
+        assert_no_files(&out);
     }
-    assert_no_files(&out);
+}
+
+#[test]
+#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
+fn a_48_khz_mp3_is_analyzed_without_a_waveform_and_processes() {
+    let sandbox = Sandbox::configured();
+    let mp3 = sandbox.plain_mp3_at("tone-48k", 48_000);
+    let before = fs::read(&mp3).unwrap();
+    let inspected = sandbox.ok(&["inspect", text(&mp3)]);
+    assert_eq!(report(&inspected, 0)["sample_rate"], 48_000.0, "{inspected}");
+    for (round, on) in [false, true].into_iter().enumerate() {
+        sandbox.set_opt_in(on);
+        // 48 kHz is a kept processing rate, so analysis runs; the 44.1 kHz waveform would need a conversion.
+        let analyzed = sandbox.ok(&["analyze", text(&mp3)]);
+        let analysis = report(&analyzed, 0);
+        assert_eq!(analysis["sample_rate"], 48_000.0, "{analyzed}");
+        assert!(analysis["waveform"].is_null(), "{analyzed}");
+        assert!(analysis["waveform_unavailable"].as_str().is_some_and(|reason| reason.contains("non-44.1 kHz")), "{analyzed}");
+        assert_eq!(paths(analysis), Vec::<&str>::new(), "{analyzed}");
+        assert!(analysis["volume"].as_f64().is_some_and(f64::is_finite), "{analyzed}");
+        let out = sandbox.dir(&format!("out-{round}"));
+        let processed = sandbox.ok(&["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)]);
+        assert_eq!(report(&processed, 0)["input_sample_rate"], 48_000.0, "{processed}");
+        assert_eq!(report(&processed, 0)["sample_rate"], 48_000.0, "{processed}");
+        // Only the WAV output's own tag-chunk rule appears (opt-in on); the MP3 input contributes no member.
+        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
+        assert_eq!(paths(report(&processed, 0)), expected, "{processed}");
+    }
+    assert_eq!(fs::read(&mp3).unwrap(), before);
 }
 
 // --- D3: the output side refuses what the input side accepted ------------------------------------
@@ -677,32 +707,35 @@ fn unsupported_output_format_for_alac_beyond_96_khz() {
     }
 }
 
-// --- E: a damaged MP3 is an invalid input -------------------------------------------------------
+// --- E: an undecodable MP3 fails at the first read --------------------------------------------------
 
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn corrupt_mp3_with_the_opt_in_is_an_invalid_input_file() {
+fn an_undecodable_mp3_fails_at_the_first_read_with_apples_status() {
     let sandbox = Sandbox::configured();
-    sandbox.set_opt_in(true);
-    let mp3 = sandbox.file("damaged.mp3", &damaged_mp3());
+    let mp3 = sandbox.file("undecodable.mp3", &undecodable_mp3());
     let before = fs::read(&mp3).unwrap();
-    // The decoder scans only frame headers when it opens a file, so inspection succeeds ...
-    let inspected = sandbox.ok(&["inspect", text(&mp3)]);
-    assert_eq!(report(&inspected, 0)["sample_rate"], 44_100.0, "{inspected}");
-    assert_eq!(report(&inspected, 0)["channels"], 2, "{inspected}");
-    assert_eq!(paths(report(&inspected, 0)), ["mp3_decode"], "{inspected}");
-    // ... and the damage surfaces at the first read, which processing and analysis make.
-    let out = sandbox.dir("out");
-    for args in [
-        vec!["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)],
-        vec!["analyze", text(&mp3)],
-    ] {
-        let outcome = sandbox.fails(1, &args);
-        assert_failed_item(&outcome, 0, Some("read analysis input"), "invalid_input_file");
-        let message = outcome["results"][0]["error"]["message"].as_str().unwrap();
-        assert!(message.contains("MP3"), "{args:?}: {message}");
+    for (round, on) in [false, true].into_iter().enumerate() {
+        sandbox.set_opt_in(on);
+        // The container scan at open accepts the frames, so inspection succeeds ...
+        let inspected = sandbox.ok(&["inspect", text(&mp3)]);
+        assert_eq!(report(&inspected, 0)["sample_rate"], 44_100.0, "{inspected}");
+        assert_eq!(report(&inspected, 0)["channels"], 2, "{inspected}");
+        assert_eq!(paths(report(&inspected, 0)), Vec::<&str>::new(), "{inspected}");
+        // ... and the failure surfaces at the first read, which processing and analysis make: AudioToolbox's
+        // 'bada' status (0x62616461), reported as a decode failure.
+        let out = sandbox.dir(&format!("out-{round}"));
+        for args in [
+            vec!["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)],
+            vec!["analyze", text(&mp3)],
+        ] {
+            let outcome = sandbox.fails(1, &args);
+            assert_failed_item(&outcome, 0, Some("read analysis input"), "decode_failed");
+            let message = outcome["results"][0]["error"]["message"].as_str().unwrap();
+            assert!(message.contains("ExtAudioFileRead") && message.contains("OSStatus 1650549857"), "{args:?}: {message}");
+        }
+        assert_no_files(&out);
     }
-    assert_no_files(&out);
     assert_eq!(fs::read(&mp3).unwrap(), before);
 }
 
@@ -836,7 +869,7 @@ fn artwork_flac_webp_to_alac_is_refused_but_png_is_copied() {
 
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn artwork_mp3_apic_is_moved_unchanged_and_reports_only_mp3_decode() {
+fn artwork_mp3_apic_is_moved_unchanged_and_reports_no_non_identical_path() {
     let sandbox = Sandbox::configured();
     sandbox.set_opt_in(true);
     let jpeg = generated_jpeg();
@@ -844,9 +877,9 @@ fn artwork_mp3_apic_is_moved_unchanged_and_reports_only_mp3_decode() {
     with_cover.extend(fs::read(sandbox.plain_mp3("tone")).unwrap()); // already tag-free MPEG frames
     let source = sandbox.file("inputs/cover.mp3", &with_cover);
     let out = sandbox.dir("out");
-    // ID3 to ID3 is a direct copy that already moves the frame untouched, so only the decoder is non-identical.
+    // ID3 to ID3 is a direct copy that already moves the frame untouched, so nothing is non-identical.
     let processed = sandbox.ok(&["process", text(&source), "--format", "match-input", "--output-dir", text(&out)]);
-    assert_eq!(paths(report(&processed, 0)), ["mp3_decode"], "{processed}");
+    assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "{processed}");
     let output = report(&processed, 0)["output_path"].as_str().unwrap();
     assert_eq!(Path::new(output).extension().and_then(|e| e.to_str()), Some("mp3"), "{processed}");
     let pictures = id3_pictures(&fs::read(output).unwrap());

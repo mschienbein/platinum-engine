@@ -31,5 +31,3 @@ __pycache__/
 *.sqlite-*
 *.db
 *.db-*
-# Generated MP3 test fixtures (tools/portable/mp3dec) are tracked despite the audio patterns above.
-!/tests/fixtures/mp3/**/*.mp3

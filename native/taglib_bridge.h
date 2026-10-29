@@ -101,12 +101,25 @@ int pn_tag_save_marker(int destination_format, const char *destination,
  * Status 2 under the flag means: a picture is not a structurally valid
  * JPEG/PNG/GIF/BMP/WebP image, or the destination cannot store it as-is
  * (MP4 covr holds only JPEG/PNG/GIF/BMP; a FLAC metadata block holds at most
- * 16 MiB - 1). The refusal happens before any destination write or callback.
- * WAV destinations are unchanged by the flag and behave as in the reference:
- * a picture reaches a WAV only inside an ID3 chunk that the marker rewrite
- * does not discard (the chunk TagLib saved last is lost when the file is
- * rewritten while the stream is still open). The engine's opt-in keeps that
- * chunk in its Rust marker rewrite (rewrite_wav callback); the bridge does not.
+ * 16 MiB - 1; an ID3v2 tag - MP3, AIFF or WAV - holds at most 268435455
+ * bytes of frames and padding, counted exactly as rendered: pictures, their
+ * frame headers, MIME types and descriptions in the encoding they are
+ * written in, every other frame already in the destination tag, the
+ * PlatinumNotes marker frame and TagLib's padding). The refusal happens
+ * before any destination write or, for everything but the marker frame,
+ * before any callback; only a tag that the marker frame itself pushes over
+ * the limit is refused after the serialize callback ran, still before any
+ * write.
+ * With the flag, WAV is an ID3-capable container like MP3 and AIFF in generic
+ * copies: pictures from any source are stored as APIC frames in a WAV
+ * destination's ID3v2 tag, and a WAV source's APIC frames are the pictures
+ * copied to any destination. Without the flag (flags == 0 and the five
+ * original exports) generic copies never move a picture into or out of a WAV,
+ * as in the reference; direct copies are unchanged either way. A picture
+ * reaches the finished WAV only if the caller's rewrite_wav keeps the ID3
+ * chunk TagLib saved last: the reference marker rewrite drops it when the
+ * file is rewritten while the stream is still open, the engine's opt-in keeps
+ * it in its Rust marker rewrite; the bridge itself does not rewrite.
  * flags with unknown bits fail with status 1. result_flags may be NULL; it is
  * set to 0 on entry and to the OR of PN_TAG_RESULT_* only when the call
  * returns 0. */

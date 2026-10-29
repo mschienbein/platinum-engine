@@ -191,6 +191,29 @@ fn invalid_input_path_is_reported_for_a_symlink_input() {
 }
 
 #[test]
+fn invalid_input_path_is_reported_for_a_symlink_that_inspect_pins() {
+    let sandbox = Sandbox::new();
+    let target = sandbox.file("target.wav", &generated_wav(1, false));
+    let link = sandbox.root.join("link.wav");
+    symlink(&target, &link).unwrap();
+    let outcome = sandbox.fails(1, &["inspect", text(&link)]);
+    assert_eq!(outcome["results"][0]["status"], "failed", "{outcome}");
+    assert_item_error(&outcome, 0, Some("inspect source identity"), "invalid_input_path");
+}
+
+#[test]
+fn invalid_input_path_is_reported_for_a_fifo_that_inspect_never_blocks_on() {
+    let sandbox = Sandbox::new();
+    let fifo = sandbox.root.join("pipe.wav");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `name` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    let outcome = sandbox.fails(1, &["inspect", text(&fifo)]);
+    assert_eq!(outcome["results"][0]["status"], "failed", "{outcome}");
+    assert_item_error(&outcome, 0, Some("inspect source identity"), "invalid_input_path");
+}
+
+#[test]
 fn io_error_is_reported_for_a_path_that_does_not_exist() {
     let sandbox = Sandbox::new();
     let missing = sandbox.root.join("missing.wav");
@@ -475,6 +498,9 @@ const LEDGER: &[(&str, &str)] = &[
     ("invalid_input_file", "invalid_input_file_is_reported_for_a_wav_no_decoder_accepts"),
     ("invalid_input_path", "invalid_input_path_is_reported_for_a_symlink_input"),
     ("no_input_files", "no_input_files_is_reported_for_a_directory_without_audio"),
+    // Opt-in formats.
+    ("opus_not_enabled", "tests/opus_cli.rs"),
+    ("unsupported_opus_variant", "tests/opus_cli.rs"),
     // Processed-marker safety.
     ("already_processed", "already_processed_is_reported_when_an_output_is_processed_again"),
     ("marker_ambiguous", "marker_ambiguous_is_reported_for_an_empty_wav_marker_unless_overridden"),

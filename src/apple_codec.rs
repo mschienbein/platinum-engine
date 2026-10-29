@@ -137,9 +137,9 @@ pub(crate) struct StereoBufferList {
 }
 
 // On the tested macOS arm64 runtime, AudioToolbox AAC output depends on the
-// stack alignment at ExtAudioFileRead. Aligning the live list stabilizes that
-// call boundary without changing its ABI or the caller's sample buffers.
-// This is a bounded runtime observation, not a cross-version parity guarantee.
+// stack alignment at ExtAudioFileRead (see the read pin below). Aligning the live
+// list stabilizes that call boundary without changing its ABI or the caller's
+// sample buffers. This is a bounded runtime observation, not a cross-version parity guarantee.
 #[repr(align(64))]
 struct AlignedStereoBufferList(StereoBufferList);
 /// The same 64-byte alignment for the interleaved read: without it the AAC
@@ -161,6 +161,38 @@ struct AlignedBufferList(AudioBufferList);
 // observation of the tested macOS arm64 AudioToolbox, not a cross-version guarantee.
 const WRITE_SP_RESIDUE: usize = 0;
 const DISPOSE_SP_RESIDUE: usize = 0;
+
+// AudioToolbox's AAC decoder has the same two output classes as the encoder, selected per
+// `ExtAudioFileRead` call: the SME 512-point inverse-transform kernel runs iff its stack
+// temporaries are 64-byte aligned, i.e. `sp % 64 == 16` at the read's entry (class S);
+// every other residue runs the generic NEON kernel (class G). The two round differently
+// (3.7 to 85 % of the float words differ, by at most 6e-7). The native application and the
+// engine's reads have been class G, but only through frame layout: the stack residue at the
+// call was whatever the compiler's frame for the caller produced (measured as 0 in the
+// shipped v0.2.0 binary; the AAC research recorded 32 for the interleaved read of another
+// build), so a different frame layout could have selected class S. Both reads now go through
+// `call_with_sp_residue` with residue 0, which is class G by construction (evidence:
+// local-artifacts/aac-lane-01/research/FINDINGS.md section 15, DECODER-REPORT.md; the v0.3.0
+// proof compared 43,380 engine results against the v0.2.0 binary without a difference). The pin
+// only removes the dependence on compiler frame layout. A bounded runtime observation of the
+// tested macOS arm64 AudioToolbox.
+const READ_SP_RESIDUE: usize = 0;
+
+/// `ExtAudioFileRead` entered with `sp % 64 == READ_SP_RESIDUE`.
+///
+/// # Safety
+/// The same contract as the native call: `file` is a live ExtAudioFile, `frames` and `list`
+/// point to valid, writable storage that outlives the call.
+unsafe fn read_pinned(file: *mut c_void, frames: *mut u32, list: *mut AudioBufferList) -> i32 {
+    // SAFETY: ExtAudioFileRead is a C-ABI function of three pointer arguments.
+    unsafe { read_pinned_via(ExtAudioFileRead as *const () as usize, file, frames, list) }
+}
+
+/// The read pin applied to any three-pointer C function (the unit tests pass a stack probe).
+unsafe fn read_pinned_via(function: usize, file: *mut c_void, frames: *mut u32, list: *mut AudioBufferList) -> i32 {
+    // SAFETY: the caller supplies a C-ABI function of three pointer arguments.
+    unsafe { call_with_sp_residue(function, file as usize, frames as usize, list as usize, READ_SP_RESIDUE) }
+}
 
 /// Call a C function of up to three integer arguments with `sp % 64 == residue` at its entry.
 /// The previous stack pointer is held in `x20`, which is declared clobbered (callee-saved,
@@ -443,7 +475,7 @@ impl Reader {
         });
         // AudioBufferList's variable-size ABI uses its count, not the C/Rust
         // declaration's trailing array length. Both entries are live here.
-        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, (&mut list.0 as *mut StereoBufferList).cast()) };
+        let status = unsafe { read_pinned(self.handle.ptr(), &mut frames, (&mut list.0 as *mut StereoBufferList).cast()) };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileRead(planar stereo)", status }); }
         if frames > requested || list.0.number_buffers != 2 || list.0.buffers.iter().any(|buffer| buffer.data_byte_size > bytes) {
             self.failed = true;
@@ -462,7 +494,7 @@ impl Reader {
         if frames == 0 { return Ok(0); }
         let requested = frames;
         let mut list = AlignedBufferList(audio_buffer(self.client.channels_per_frame, bytes, output.as_mut_ptr().cast()));
-        let status = unsafe { ExtAudioFileRead(self.handle.ptr(), &mut frames, &mut list.0) };
+        let status = unsafe { read_pinned(self.handle.ptr(), &mut frames, &mut list.0) };
         if status != 0 { self.failed = true; return Err(CodecError::Native { operation: "ExtAudioFileRead", status }); }
         if frames > requested || list.0.buffers[0].data_byte_size > bytes {
             self.failed = true;
@@ -1173,9 +1205,39 @@ mod sp_pin_tests {
     }
 
     #[test]
-    fn the_encoder_pins_are_16_byte_aligned_residues() {
-        for residue in [super::WRITE_SP_RESIDUE, super::DISPOSE_SP_RESIDUE] {
+    fn the_pins_are_16_byte_aligned_residues() {
+        for residue in [super::WRITE_SP_RESIDUE, super::DISPOSE_SP_RESIDUE, super::READ_SP_RESIDUE] {
             assert!(residue < 64 && residue % 16 == 0);
         }
+    }
+
+    /// The SME kernels run at `sp % 64 == 48` (encoder write), `32` (encoder drain in dispose) and
+    /// `16` (decoder read). Every pin must stay off its own class so all three calls run the NEON kernel.
+    #[test]
+    fn no_pin_selects_the_sme_class_of_its_call() {
+        assert_ne!(super::WRITE_SP_RESIDUE, 48);
+        assert_ne!(super::DISPOSE_SP_RESIDUE, 32);
+        assert_ne!(super::READ_SP_RESIDUE, 16);
+    }
+
+    /// The read wrapper is the same trampoline: the callee sees the read pin's residue whatever the
+    /// caller's alignment, and the call's three pointer arguments and its status pass through unchanged.
+    #[test]
+    fn the_read_pin_enters_its_callee_at_the_read_residue() {
+        fn check<const PAD: usize>() {
+            let mut pad = [0u8; PAD];
+            std::hint::black_box(&mut pad);
+            // SAFETY: the probe is a C-ABI function that ignores its arguments and returns its entry sp.
+            let seen = unsafe {
+                super::read_pinned_via(pn_test_probe_sp as *const () as usize, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            assert_eq!(seen as u32 as usize % 64, super::READ_SP_RESIDUE, "pad {PAD}");
+            // SAFETY: `pn_test_sum3` adds its three integer arguments; the pointers are never dereferenced.
+            let sum = unsafe {
+                super::read_pinned_via(pn_test_sum3 as *const () as usize, 7 as *mut _, 11 as *mut _, 13 as *mut _)
+            };
+            assert_eq!(sum, 31, "pad {PAD}");
+        }
+        check::<0>(); check::<16>(); check::<32>(); check::<48>(); check::<64>(); check::<112>(); check::<200>();
     }
 }

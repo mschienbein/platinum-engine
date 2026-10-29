@@ -1,6 +1,6 @@
 # Build and run on macOS arm64
 
-The production CLI is independent of the Platinum Notes installation. On macOS arm64 it uses Rust DSP, AudioToolbox and Accelerate, a separately built TagLib bridge, and separately built FLAC and LAME libraries when needed. Reference-only probes are optional. Linux aarch64 and x86_64 builds use portable implementations and the pinned native-library builds described in [LINUX.md](LINUX.md).
+The production CLI is independent of the Platinum Notes installation. On macOS arm64 it uses Rust DSP, AudioToolbox and Accelerate, a separately built TagLib bridge, and separately built FLAC and LAME libraries when needed (and libopus for the optional Opus format). Reference-only probes are optional. Linux aarch64 and x86_64 builds use portable implementations and the pinned native-library builds described in [LINUX.md](LINUX.md).
 
 ## Prerequisites and recorded setup
 
@@ -81,7 +81,9 @@ The archive is pinned to TagLib revision `e36a9cabb9882e61276161c23834d966d62073
 
 The bridge ABI must be 5; the v07 source adds source-container status and read-failure handling. `process`, `analyze`, `inspect`, and marker-authorized `restore` need a trusted bridge. The earlier v07 macOS bridge SHA-256 was `7e2f65614f2ad87322e030213b3b2fb2914a3e69635b434fd96cf6b1da38d585`; the v0.1.0 package uses the same bridge with a neutral install name and an ad-hoc signature, SHA-256 `14ca6f03b65a2cb0c4bc8bd06df540ae1707796f59f2d4f117a5d33447dfd79e`. A locally rebuilt file can differ. The older `ab36bcd5…` bridge was an earlier build. The loader checks the ABI and pins the opened file, not its provenance. A dynamic library is executable code, so configure only a library you trust. A writer able to modify that same file's inode during loading can defeat the integrity check before its post-load verification; prevent concurrent modification.
 
-The Linux/portable bridge of v0.2.0 additionally exports three **optional** ABI-5 symbols, `pn_tag_bridge_features`, `pn_tag_copy_direct_ex` and `pn_tag_copy_generic_ex`, used only when `parity.allow_non_identical` is enabled to copy embedded artwork unchanged. The six original exports (`pn_tag_read_marker`, `pn_tag_inspect`, `pn_tag_bridge_abi`, `pn_tag_copy_direct`, `pn_tag_copy_generic`, `pn_tag_save_marker`) behave exactly as before, the ABI number stays 5, and a bridge without the extension (including the macOS bridge) still loads. With the opt-in on in a build that has the non-identical paths (Linux, or `--features portable`), a bridge without the extension makes every `process` item fail before any write with `artwork_conversion_unavailable`, because the requested behavior cannot be honored. A macOS default build never uses the extension.
+The Linux/portable bridge additionally exports three **optional** ABI-5 symbols (since v0.2.0), `pn_tag_bridge_features`, `pn_tag_copy_direct_ex` and `pn_tag_copy_generic_ex`, used only when `parity.allow_non_identical` is enabled to copy embedded artwork unchanged. The six original exports (`pn_tag_read_marker`, `pn_tag_inspect`, `pn_tag_bridge_abi`, `pn_tag_copy_direct`, `pn_tag_copy_generic`, `pn_tag_save_marker`) behave exactly as before, the ABI number stays 5, and a bridge without the extension (including the macOS bridge) still loads. With the opt-in on in a build that has the non-identical paths (Linux, or `--features portable`), a bridge without the extension makes every `process` item fail before any write with `artwork_conversion_unavailable`, because the requested behavior cannot be honored. A macOS default build never uses the extension.
+
+The v0.3.0 Linux/portable bridge is v09 (v0.2.0 shipped v08). It adds no export and keeps the ABI number 5 and the feature word 1; with the opt-in on it treats a WAV as an ID3-capable container in generic artwork copies, and it refuses before any write a destination ID3v2 tag that would exceed the 268,435,455-byte limit of its 28-bit size field (v08 let such a tag through and TagLib wrote the size modulo 2^28). The Linux bridge is built by the `bridge` target of `linux/Dockerfile` with `-O2 -fPIC -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2`, linked with `-Wl,-z,relro,-z,now`, the version script and `--exclude-libs`. The macOS **comparison** dylib that `--features portable` builds load in the library-gated lanes, and that the native-versus-portable matrices compare with the production bridge, is built from the same source by `sh tools/portable/bridge/build-macos-portable.sh TAGLIB_INSTALL_DIR NEW_OUTPUT_DIR` with `-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2` against the pinned TagLib install above (the relro and now flags exist only for ELF). The production macOS bridge (`native/taglib_bridge.cpp`, built by the command above) is unchanged from v0.2.0.
 
 Configure its path as a JSON string. The helper handles spaces and other characters that need JSON escaping:
 
@@ -121,7 +123,7 @@ The recorded FLAC library hash was `d9b3a64df9eeab7556aad9877492ad07ba51e6459e37
 
 ## Optional: LAME 3.100
 
-MP3 **output**, including the default output format, needs a trusted LAME 3.100 and its SHA-256 pin. MP3 input alone uses the macOS decoder. WAV output does not require LAME unless another requested format needs it.
+MP3 **output**, including the default output format, needs a trusted LAME 3.100 and its SHA-256 pin. MP3 input needs no library: macOS uses AudioToolbox and Linux/`portable` use the in-tree exact MP3 reader. WAV output does not require LAME unless another requested format needs it.
 
 The recorded build removed only the obsolete `lame_init_old` line from `include/libmp3lame.sym`: the linker rejected that export because the legacy function is static in 3.100. This is an export-list change, not an audio-algorithm change. The archive and corrected export-list checks prevent accidentally applying the change to a different source tree.
 
@@ -160,6 +162,27 @@ LAME_SHA="$(shasum -a 256 "$LAME_LIB")"; LAME_SHA="${LAME_SHA%% *}"
 ```
 
 The earlier recorded library hash was `58d3a0dba8271d00f0a88704708a6a0caa5610d8da0b1f7dcbbad64c9a165981`; the v0.1.0 package uses a neutral install name and ad-hoc signature, SHA-256 `2986f34cca6a4fbfb05934ac33b4bb919c8c47de1594e227b2f0fa4c930b377f`. Configure the digest of your own trusted build. Homebrew LAME 4.0 is not the pinned 3.100 build.
+
+## Optional: libopus 1.6.1 (Opus input and output)
+
+Opus is **new behaviour beyond Platinum Notes**, which refuses `.opus` files, so it is off by default and has no reference to match. It needs the fixed-point libopus 1.6.1 below plus the setting `formats.opus`. Skip this section if you do not process Opus. Not Homebrew's libopus: only this exact configuration is accepted (the loader checks the version string `libopus 1.6.1-fixed`, a SHA-256 pin and, on Linux, the architecture allowlist, then runs a known-answer encode/decode test, so a float, SIMD-selecting or otherwise different build is refused rather than producing different bytes).
+
+```sh
+(
+  set -eu
+  curl -fL https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz -o "$DEPS/opus-1.6.1.tar.gz"
+  sh tools/linux/build-libopus.sh "$DEPS/opus-1.6.1.tar.gz" \
+    6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1 \
+    "$DEPS/opus-work" "$DEPS/opus-install"
+)
+OPUS_LIB="$DEPS/opus-install/lib/libopus.0.dylib"
+OPUS_SHA="$(shasum -a 256 "$OPUS_LIB")"; OPUS_SHA="${OPUS_SHA%% *}"
+"$PN" --state-dir "$PN_STATE" config set libraries.opus "$(json_string "$OPUS_LIB")"
+"$PN" --state-dir "$PN_STATE" config set libraries.opus_sha256 "$(json_string "$OPUS_SHA")"
+"$PN" --state-dir "$PN_STATE" config set formats.opus true
+```
+
+The script verifies the archive digest and builds with exactly `--enable-fixed-point --disable-float-api --disable-float-approx --disable-asm --disable-intrinsics --disable-rtcd --disable-doc --disable-extra-programs --enable-shared --disable-static` and `-O2 -ffp-contract=off`. libopus is BSD-3-Clause, but it is loaded like FLAC and LAME rather than linked in so that the SHA-256 pin identifies the exact code that produced an output and the build stays a plain `cargo build`. The same fixed-point source gave identical encoder and decoder output with Apple clang on macOS arm64 and with clang and gcc on Linux aarch64 and x86_64 (see `local-artifacts/opus-lane-01/libopus/`).
 
 ## Try the pinned synthetic fixture
 
@@ -212,15 +235,27 @@ The v0.1.0 macOS battery executable SHA-256 was
 The earlier source-path-remapped battery executable was
 `82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`;
 the release rebuild adds home, Cargo and Rustup path remaps and has its own
-identity-gated battery. The v0.2.0 macOS executable is built the same way from
+identity-gated battery. The v0.3.0 macOS executable is built the same way from
 the frozen source; its SHA-256 is recorded in the release evidence
-(`local-artifacts/release-v0.2.0/REPORT.json`), not here, because it describes
+([VERIFICATION.md](VERIFICATION.md)), not here, because it describes
 the tree this file belongs to.
 
+The macOS default build enters AudioToolbox's `ExtAudioFileWrite`,
+`ExtAudioFileDispose` and both `ExtAudioFileRead` call sites (the planar read
+and the interleaved waveform read) through one small aarch64 trampoline,
+`call_with_sp_residue` in `src/apple_codec.rs`, which fixes the stack pointer
+modulo 64 at residue 0 (`WRITE_SP_RESIDUE`, `DISPOSE_SP_RESIDUE`,
+`READ_SP_RESIDUE`). AudioToolbox's AAC encoder and decoder choose between an
+SME and a NEON kernel from that residue, so the pin selects the kernel the
+references used by construction and not through the compiler's frame layout (the
+encoder pins date from v0.2.0, the two read pins are new in v0.3.0; the output
+is meant to be unchanged). It is an observation of the tested macOS arm64
+AudioToolbox; see [VERIFICATION.md](VERIFICATION.md#v030-changes-and-evidence).
+
 For Linux, run on the target's native Docker host with a prepared offline
-registry cache (`index/` and `cache/`), a new output directory and the v0.2.0
+registry cache (`index/` and `cache/`), a new output directory and the v0.3.0
 native-library image (built by `tools/linux/build-image.sh`; check that the
-bridge, libFLAC and LAME it contains have the digests in
+bridge, libFLAC, LAME and libopus it contains have the digests in
 [LINUX.md](LINUX.md#linux-native-libraries)):
 
 ```sh
@@ -230,11 +265,13 @@ PN_LINUX_REGISTRY_DIR="$REGISTRY" PN_LINUX_RUN_TESTS=1 PN_LINUX_TMP_TARGET=1 \
 ```
 
 `PN_LINUX_RUN_TESTS=1` runs the regular all-target suite and then a
-library-gated lane: the `error_codes`, `linux_opt_in` and `portable_art_copy`
-suites with `--ignored`, plus the three WAV tag-chunk bridge tests of
-`tags_reference` (the default policy and the opt-in that keeps the chunks). Those
-tests need the approved bridge, libFLAC and LAME in the image, so the regular
-suite ignores them and never counts them as passes.
+library-gated lane: the `error_codes`, `linux_opt_in`, `portable_art_copy` and
+`opus_cli` suites with `--ignored`, the three WAV tag-chunk bridge tests of
+`tags_reference` (the default policy and the opt-in that keeps the chunks) and
+the Opus layer's own tests (`--lib opus::`, with `PN_OPUS_LIB` and
+`PN_OPUS_SHA256`). Those tests need the approved bridge, libFLAC, LAME and
+libopus in the image, so the regular suite ignores them and never counts them
+as passes.
 
 The v0.2.0 image IDs of the recorded build were arm64
 `sha256:352618c7e4e953d2883f3de95c3cb222dbe5fc55e81bc9426738e75ed988b070`
@@ -247,7 +284,19 @@ hashes were arm64
 `6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
 and amd64
 `1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`; the v0.2.0
-hashes are in the release evidence. The helper's output hashes and logs are
+and v0.3.0 hashes are in the release evidence.
+
+For v0.3.0 the Linux bridge matrices ran in
+`platinum-codec09-artbridge-arm64:study`
+(`sha256:abd22164e6e9e7ee968c6f5cd5d39ed54e5f1cdd15c7c75c5ad98bb69e326c7e`)
+and `platinum-codec09-artbridge-amd64:study`
+(`sha256:5fddd8a084e6eb28d2c9aa865f803e5acc0f8e0b8c8cdb6e8a88174c6d67e1c5`):
+the two v0.2.0 images above with the v09 bridge and the libopus stage of
+`linux/Dockerfile` applied on top. A fresh `tools/linux/build-image.sh` build of
+the real `linux/Dockerfile` gave the same bridge, libFLAC, LAME and libopus
+digests on both architectures, and a `docker run` compile of the bridge
+reproduced the pinned digest. Those image IDs are local build identities, not
+a pin. The helper's output hashes and logs are
 evidence for that build, not proof of universal audio-file parity.
 
 ## Linux and release packages
@@ -255,7 +304,7 @@ evidence for that build, not proof of universal audio-file parity.
 See [LINUX.md](LINUX.md) for the pinned multi-architecture native image,
 architecture-specific library allowlist, source builds and runtime image. From
 an appropriate native host, `sh tools/linux/package-release.sh PLATFORM
-v0.2.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
+v0.3.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
 without publishing. The available platform values are `macos-arm64`,
 `linux-arm64` and `linux-amd64`. The Linux allowlist means a locally rebuilt
 library is refused unless its digest matches an approved entry; matching a
@@ -265,10 +314,12 @@ user-configured codec hash alone is insufficient.
 
 Project-owned contributions are licensed under [LICENSE](../LICENSE), subject
 to third-party terms. The separate bridge statically links TagLib (LGPL-2.1);
-FLAC uses BSD-3-Clause terms and LAME LGPL-2.0-or-later. Linux codec patches
+FLAC uses BSD-3-Clause terms and LAME LGPL-2.0-or-later; the optional libopus
+uses BSD-3-Clause terms with royalty-free patent licenses. Linux codec patches
 and source/relink materials are supplied in release packages; the independently
 written portable ALAC implementation was informed by Apple's Apache-2.0
-reference. See [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) and
+reference, and the in-tree exact MP3 reader is a project-written port whose
+provenance is stated in THIRD_PARTY_NOTICES. See [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) and
 [NOTICE](../NOTICE), plus the package's `licenses/` and
 `corresponding-source/RELINK.txt`. Review the actual distribution and its
 dependencies; these notices do not constitute legal clearance or grant rights

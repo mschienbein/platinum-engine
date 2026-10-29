@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 /// These ABI values describe container families, not PN's input type codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-pub enum Format { Mp3 = 1, Mp4 = 2, Wav = 3, Aiff = 4, Flac = 5 }
+/// `Opus` is handled entirely in Rust (`crate::opus::tags`); it is never passed
+/// to the native bridge, whose ABI and hash are unchanged.
+pub enum Format { Mp3 = 1, Mp4 = 2, Wav = 3, Aiff = 4, Flac = 5, Opus = 6 }
 
 /// Match input uses the source family's direct-copy branch. The caller must
 /// first resolve the actual output codec and container as PN's recorder does.
@@ -31,7 +33,7 @@ pub enum OutputChoice { Explicit, MatchInput }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-pub enum DirectCopy { Id3 = 1, Mp4 = 2, Wav = 3, Aiff = 4, Flac = 5, Mp4ToId3 = 6 }
+pub enum DirectCopy { Id3 = 1, Mp4 = 2, Wav = 3, Aiff = 4, Flac = 5, Mp4ToId3 = 6, Opus = 7 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferMode { Direct(DirectCopy), Generic }
 
@@ -91,13 +93,17 @@ pub fn transfer_mode(source: Format, destination: Format, choice: OutputChoice) 
     if choice == OutputChoice::MatchInput {
         return Ok(TransferMode::Direct(match source {
             F::Mp3 => D::Id3, F::Mp4 => D::Mp4, F::Wav => D::Wav,
-            F::Aiff => D::Aiff, F::Flac => D::Flac,
+            F::Aiff => D::Aiff, F::Flac => D::Flac, F::Opus => D::Opus,
         }));
     }
     let direct = match (source, destination) {
         (F::Mp3, F::Mp3) => Some(D::Id3), (F::Mp4, F::Mp4) => Some(D::Mp4),
         (F::Wav, F::Wav) => Some(D::Wav), (F::Aiff, F::Aiff) => Some(D::Aiff),
         (F::Flac, F::Flac) => Some(D::Flac),
+        // Xiph comments are one data model: every comment and picture is carried.
+        (F::Opus, F::Opus) | (F::Flac, F::Opus) => Some(D::Opus),
+        // Opus reaches FLAC through a tag carrier and the bridge's FLAC -> FLAC copy.
+        (F::Opus, F::Flac) => Some(D::Flac),
         (F::Mp4, F::Mp3) => Some(D::Mp4ToId3),
         _ => None,
     };
@@ -119,6 +125,7 @@ pub enum TagError {
     MarkerCallbackPanicked,
     MarkerReadCallbackPanicked,
     InspectionCallbackPanicked,
+    Opus(crate::opus::OpusError),
 }
 impl fmt::Display for TagError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -136,6 +143,7 @@ impl fmt::Display for TagError {
             Self::MarkerCallbackPanicked => write!(f, "marker serialization panicked inside native callback"),
             Self::MarkerReadCallbackPanicked => write!(f, "marker reader panicked inside native callback"),
             Self::InspectionCallbackPanicked => write!(f, "tag inspection panicked inside native callback"),
+            Self::Opus(e) => write!(f, "{e}"),
         }
     }
 }
@@ -144,6 +152,7 @@ impl std::error::Error for TagError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Marker(e) => Some(e),
+            Self::Opus(e) => Some(e),
             #[cfg(target_os = "linux")]
             Self::LibraryPolicy(error) => Some(error),
             _ => None,
@@ -164,9 +173,15 @@ pub struct TransferReport {
     /// True when, under `TransferOptions::copy_artwork`, the bridge stored at
     /// least one embedded picture byte-for-byte where the reference bridge
     /// would have transcoded it to PNG (generic copies) or dropped it (FLAC
-    /// direct copies). Such an output is not byte-identical to macOS. Only set when
-    /// the whole transfer succeeded (`is_success`).
+    /// direct copies, and generic copies into or out of a WAV, which the
+    /// reference never carries a picture through). Such an output is not
+    /// byte-identical to macOS. Only set when the whole transfer succeeded
+    /// (`is_success`); for a WAV destination the picture then travels in the
+    /// ID3 chunk that `wav_tags_preserved` reports.
     pub artwork_copied: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "True when, under `TransferOptions::preserve_wav_chunks`, the marker rewrite kept at least one WAV chunk TagLib wrote that the reference marker writer drops. Only set when the whole transfer succeeded."] pub wav_tags_preserved: bool,
+    /// Opus outputs only: Opus loudness tags (R128_TRACK_GAIN, R128_ALBUM_GAIN)
+    /// that were not carried over because processing changes the loudness.
+    pub dropped_tags: Vec<String>,
 }
 impl TransferReport {
     pub fn is_success(&self) -> bool { self.copy_error.is_none() && self.marker_error.is_none() }
@@ -397,6 +412,7 @@ impl TagBridge {
     /// container, artwork record or callback is an error rather than a
     /// fabricated empty inventory.
     pub fn inspect(&self, path: impl AsRef<Path>, format: Format) -> Result<TagInspection, TagError> {
+        if format == Format::Opus { return crate::opus::tags::inspect(path.as_ref()); }
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
         let mut context = InspectionCallback { result: None, failure: None };
         let error = native_call(|out, len| {
@@ -423,6 +439,7 @@ impl TagBridge {
     /// parser); if only shorter PLTN chunks exist it retains the last one.
     /// WAV's payload includes any padding included in the declared chunk size.
     pub fn read_processing_marker(&self, path: impl AsRef<Path>, format: Format) -> Result<Option<Vec<u8>>, TagError> {
+        if format == Format::Opus { return crate::opus::tags::read_marker(path.as_ref()); }
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
         let mut context = ReadCallback { result: None, failure: None };
         let error = native_call(|out, len| {
@@ -453,6 +470,9 @@ impl TagBridge {
                                  destination_format: Format, choice: OutputChoice, marker: &Marker,
                                  options: TransferOptions) -> Result<TransferReport, TagError> {
         let source = source.as_ref(); let destination = destination.as_ref();
+        if source_format == Format::Opus || destination_format == Format::Opus {
+            return self.transfer_opus(source, destination, source_format, destination_format, choice, marker, options);
+        }
         let artwork = if options.copy_artwork {
             Some(self.artwork.ok_or_else(|| TagError::ArtworkTranscodeUnavailable(
                 "the loaded tag bridge cannot copy artwork byte-for-byte".into()))?)
@@ -463,7 +483,7 @@ impl TagBridge {
         if src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino() { return Err(TagError::SourceIsDestination); }
         let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
         let dst = CString::new(destination.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
-        let mut report = TransferReport { mode, copy_error: None, marker_error: None, artwork_copied: false, #[cfg(any(target_os = "linux", feature = "portable"))] wav_tags_preserved: false };
+        let mut report = TransferReport { mode, copy_error: None, marker_error: None, artwork_copied: false, #[cfg(any(target_os = "linux", feature = "portable"))] wav_tags_preserved: false, dropped_tags: Vec::new() };
         let mut result: c_uint = 0; #[cfg(any(target_os = "linux", feature = "portable"))] let wav_scope = crate::wav_preserve::scope(options.preserve_wav_chunks);
         match mode {
             TransferMode::Direct(op) => {

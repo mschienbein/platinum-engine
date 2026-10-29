@@ -34,13 +34,14 @@ case "$platform" in
     esac
     # Snapshot precisely the inputs consumed by the pinned bridge target.
     context=$out/context
-    mkdir -p "$context/native" "$context/linux" "$context/src/portable" \
+    mkdir -p "$context/native" "$context/linux" "$context/src/portable" "$context/tools/linux" \
       "$context/tools/portable/bridge" "$context/tools/portable/math/shim/src"
     cp "$root/linux/Dockerfile" "$context/Dockerfile"
     cp -R "$root/linux/patches" "$context/linux/patches"
     cp "$root/native/taglib_bridge_portable.cpp" "$root/native/taglib_bridge.h" "$context/native/"
     cp "$root/src/portable/math.rs" "$context/src/portable/math.rs"
     cp "$root/tools/portable/bridge/bridge.map" "$context/tools/portable/bridge/"
+    cp "$root/tools/linux/build-libopus.sh" "$context/tools/linux/"
     cp "$root/tools/portable/math/shim/Cargo.toml" "$root/tools/portable/math/shim/Cargo.lock" \
       "$root/tools/portable/math/shim/pn_codec_math.h" "$context/tools/portable/math/shim/"
     cp "$root/tools/portable/math/shim/src/lib.rs" "$context/tools/portable/math/shim/src/"
@@ -55,7 +56,7 @@ case "$platform" in
       sh "$root/tools/linux/build-cli.sh" "$image" "$out/cli"
     mkdir -p "$out/native/lib" "$out/native/archives" "$out/native/relink" \
       "$out/native/receipt" "$out/native/source/linux" "$out/native/source/native" \
-      "$out/native/source/src/portable" "$out/native/source/tools/portable/bridge" \
+      "$out/native/source/src/portable" "$out/native/source/tools/portable/bridge" "$out/native/source/tools/linux" \
       "$out/native/source/tools/portable/math" "$out/native/rust-license/licenses"
     docker run --rm --read-only --user "$(id -u):$(id -g)" \
       --tmpfs /tmp:exec,mode=1777 -e CARGO_HOME=/out/cli/cargo \
@@ -63,23 +64,25 @@ case "$platform" in
       -v "$root:/src:ro" -v "$out:/out" -w /src "$image" sh -eu -c '
         cp -P /opt/platinum-native/lib/libFLAC.so* /out/native/lib/
         cp -P /opt/platinum-native/lib/libmp3lame.so* /out/native/lib/
+        cp -P /opt/platinum-native/lib/libopus.so* /out/native/lib/
         cp /opt/platinum-native/lib/libpn-tag-bridge.so /out/native/lib/
         cp /opt/platinum-native/lib/libtag.a /opt/platinum-native/lib/libpn_codec_math.a /out/native/relink/
-        cp /build/taglib.tar.gz /build/flac.tar.xz /build/lame.tar.gz /out/native/archives/
+        cp /build/taglib.tar.gz /build/flac.tar.xz /build/lame.tar.gz /build/opus.tar.gz /out/native/archives/
         cp -R /opt/platinum-native/receipt/. /out/native/receipt/
         cp -R /build/patches /out/native/source/linux/patches
         cp /build/native/taglib_bridge_portable.cpp /build/native/taglib_bridge.h /out/native/source/native/
         cp /build/native/bridge.map /out/native/source/tools/portable/bridge/
+        cp /build/tools/linux/build-libopus.sh /out/native/source/tools/linux/
         cp /build/src/portable/math.rs /out/native/source/src/portable/
         cp -R /build/tools/portable/math/shim /out/native/source/tools/portable/math/shim
         # Recreate the original compilation unit from the image inputs and
         # require that linking it recreates the actual bridge in the image.
-        "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -DTAGLIB_STATIC \
+        "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2 -DTAGLIB_STATIC \
           -I/opt/platinum-native/include/taglib -c /build/native/taglib_bridge_portable.cpp \
           -o /out/native/relink/taglib_bridge.o
-        "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -shared -DTAGLIB_STATIC \
+        "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2 -shared -DTAGLIB_STATIC \
           -I/opt/platinum-native/include/taglib /out/native/relink/taglib_bridge.o \
-          /opt/platinum-native/lib/libtag.a -Wl,--exclude-libs,ALL \
+          /opt/platinum-native/lib/libtag.a -Wl,--exclude-libs,ALL -Wl,-z,relro,-z,now \
           -Wl,--version-script=/build/native/bridge.map -lz -o /tmp/relinked-bridge.so
         cmp /opt/platinum-native/lib/libpn-tag-bridge.so /tmp/relinked-bridge.so
         cargo metadata --locked --format-version 1 > /out/cli/cargo-metadata.json
@@ -119,6 +122,7 @@ expected = {
     'taglib.tar.gz': '5c80b1e5273849122ef11b5a9116e4b7f182b899cfdb28aefb704087216e1360',
     'flac.tar.xz': 'e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4',
     'lame.tar.gz': 'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e',
+    'opus.tar.gz': '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1',
 }
 for name, digest in expected.items():
     data = (root / name).read_bytes()
@@ -127,18 +131,15 @@ for name, digest in expected.items():
 PY
 
 mkdir -p "$payload/bin" "$payload/lib" "$payload/licenses/taglib" "$payload/licenses/flac" \
-  "$payload/licenses/lame" "$payload/licenses/apple-alac" "$payload/licenses/rust" \
+  "$payload/licenses/lame" "$payload/licenses/libopus" "$payload/licenses/apple-alac" "$payload/licenses/rust" \
   "$payload/corresponding-source/archives" "$payload/corresponding-source/relink" \
-  "$payload/corresponding-source/receipt" "$payload/corresponding-source/src/portable/audio" \
-  "$payload/corresponding-source/tools/portable/mp3dec"
+  "$payload/corresponding-source/receipt" "$payload/corresponding-source/src/portable/audio"
 cp "$out/cli/target/release/platinum" "$payload/bin/platinum"
 cp -R "$native/lib/." "$payload/lib/"
 cp "$root/LICENSE" "$payload/LICENSE"
 cp -R "$native/rust-license" "$payload/licenses/rust-standard-library"
 cp "$root/Cargo.toml" "$root/Cargo.lock" "$root/rust-toolchain.toml" "$payload/corresponding-source/"
 cp "$root/src/portable/audio/alac.rs" "$payload/corresponding-source/src/portable/audio/"
-cp "$root/src/portable/audio/mp3_tables.rs" "$payload/corresponding-source/src/portable/audio/"
-cp "$root/tools/portable/mp3dec/gen_tables.py" "$payload/corresponding-source/tools/portable/mp3dec/"
 cp -R "$native/source/." "$payload/corresponding-source/"
 cp -R "$native/archives/." "$payload/corresponding-source/archives/"
 cp -R "$native/relink/." "$payload/corresponding-source/relink/"
@@ -159,11 +160,14 @@ old = """RUN curl -fL https://github.com/taglib/taglib/archive/e36a9cabb9882e612
  && echo 'e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4  flac.tar.xz' | sha256sum -c - \\
  && curl -fL https://ftp.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz -o lame.tar.gz \\
  && echo 'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e  lame.tar.gz' | sha256sum -c - \\
+ && curl -fL https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz -o opus.tar.gz \\
+ && echo '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  opus.tar.gz' | sha256sum -c - \\
  && tar --no-same-owner -xzf taglib.tar.gz && tar --no-same-owner -xf flac.tar.xz && tar --no-same-owner -xzf lame.tar.gz"""
 new = """COPY archives/ /build/
 RUN echo '5c80b1e5273849122ef11b5a9116e4b7f182b899cfdb28aefb704087216e1360  taglib.tar.gz' | sha256sum -c - \\
  && echo 'e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4  flac.tar.xz' | sha256sum -c - \\
  && echo 'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e  lame.tar.gz' | sha256sum -c - \\
+ && echo '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  opus.tar.gz' | sha256sum -c - \\
  && tar --no-same-owner -xzf taglib.tar.gz && tar --no-same-owner -xf flac.tar.xz && tar --no-same-owner -xzf lame.tar.gz"""
 if text.count(old) != 1:
     raise SystemExit('native Dockerfile source-fetch block changed; review bundled-sources recipe')
@@ -173,22 +177,22 @@ fi
 
 case "$platform" in
   linux-*)
-    for file in libFLAC.so libFLAC.so.12 libmp3lame.so libmp3lame.so.0; do
+    for file in libFLAC.so libFLAC.so.12 libmp3lame.so libmp3lame.so.0 libopus.so libopus.so.0; do
       [ -L "$payload/lib/$file" ] && [ -f "$payload/lib/$file" ] || {
         echo "missing or broken native SONAME link: $file" >&2; exit 1;
       }
     done
     [ -f "$payload/lib/libpn-tag-bridge.so" ] || exit 1
-    flac=libFLAC.so.12; lame=libmp3lame.so.0; bridge=libpn-tag-bridge.so
+    flac=libFLAC.so.12; lame=libmp3lame.so.0; opus=libopus.so.0; bridge=libpn-tag-bridge.so
     ;;
   macos-arm64)
-    for file in libFLAC.dylib libFLAC.12.dylib libmp3lame.dylib; do
+    for file in libFLAC.dylib libFLAC.12.dylib libmp3lame.dylib libopus.dylib; do
       [ -L "$payload/lib/$file" ] && [ -f "$payload/lib/$file" ] || {
         echo "missing or broken native dylib link: $file" >&2; exit 1;
       }
     done
-    [ -f "$payload/lib/libpn-tag-bridge.dylib" ] && [ -f "$payload/lib/libmp3lame.0.dylib" ] || exit 1
-    flac=libFLAC.12.dylib; lame=libmp3lame.0.dylib; bridge=libpn-tag-bridge.dylib
+    [ -f "$payload/lib/libpn-tag-bridge.dylib" ] && [ -f "$payload/lib/libmp3lame.0.dylib" ] && [ -f "$payload/lib/libopus.0.dylib" ] || exit 1
+    flac=libFLAC.12.dylib; lame=libmp3lame.0.dylib; opus=libopus.0.dylib; bridge=libpn-tag-bridge.dylib
     ;;
 esac
 
@@ -198,6 +202,7 @@ tar -xOzf "$native/archives/taglib.tar.gz" taglib-e36a9cabb9882e61276161c23834d9
 tar -xOf "$native/archives/flac.tar.xz" flac-1.4.2/COPYING.Xiph > "$payload/licenses/flac/COPYING.Xiph"
 tar -xOzf "$native/archives/lame.tar.gz" lame-3.100/COPYING > "$payload/licenses/lame/COPYING"
 tar -xOzf "$native/archives/lame.tar.gz" lame-3.100/LICENSE > "$payload/licenses/lame/LICENSE"
+tar -xOzf "$native/archives/opus.tar.gz" opus-1.6.1/COPYING > "$payload/licenses/libopus/COPYING"
 
 # Verify the immutable upstream Git blobs, including Apple's full Apache text.
 curl -fLsS https://raw.githubusercontent.com/macosforge/alac/c38887c5c5e64a4b31108733bd79ca9b2496d987/LICENSE -o "$payload/licenses/apple-alac/LICENSE"
@@ -298,6 +303,11 @@ correction. Build recipes, configuration receipts, sources, and the Linux shim
 archive are included. See corresponding-source/RELINK.txt before modifying
 or rebuilding them.
 
+libopus 1.6.1 (optional Opus input and output) uses the BSD-3-Clause license and
+is subject to the royalty-free Opus patent licenses named in its COPYING; see
+licenses/libopus. Its unmodified source archive and build recipe
+(tools/linux/build-libopus.sh) are included.
+
 The portable ALAC encoder/decoder in src/portable/audio/alac.rs was independently
 written but reference-informed by Apple's macosforge/alac revision
 c38887c5c5e64a4b31108733bd79ca9b2496d987; no Apple code was pasted. Apple
@@ -307,16 +317,21 @@ upstream tree at that revision contains no NOTICE file. Derivative status and an
 attribution requirements require maintainer/license review; this notice is not
 a clearance conclusion.
 
-The opt-in MP3 decoder (Linux and portable builds) in src/portable/audio/mp3*.rs
-is project-owned Layer III code written from ISO/IEC 11172-3 and 13818-3; it
-links no decoder library and contains no code from LAME, mpglib, mpg123, libmad,
-minimp3 or FFmpeg. Its Huffman and synthesis-window tables are standard data;
-corresponding-source/tools/portable/mp3dec/gen_tables.py transcribes those
-numbers, not code, from the LAME 3.100 archive included in
-corresponding-source/archives (LGPL-2.0-or-later) into
-corresponding-source/src/portable/audio/mp3_tables.rs. Whether numeric standard
-data taken from that source needs attribution beyond this notice requires
-maintainer/license review; this notice is not a clearance conclusion.
+The exact MP3 reader (Linux and portable builds) in src/portable/audio/mp3/ is a
+project-written Rust implementation (no unsafe code, standard library only,
+integer arithmetic only) that needs no setting. It is a compatibility
+implementation: its purpose is to produce what Apple's AudioToolbox produces for
+an MP3 file, and its behavior was recovered from Apple's own binaries by static
+analysis, instruction-level transcription and recorded runtime states of the
+AudioCodecs component and AudioToolboxCore on macOS 27.2 (build 26B123) on one
+reference machine. It therefore contains numeric constants and algorithms that
+reproduce Apple's behavior, among them 33 constant tables that are bit-exact
+copies of data read from the arm64e slice of AudioCodecs; the table files and
+the module header in the public CLI source name the binary and the addresses.
+No Apple binary and no Apple source code is included, and the reader calls no
+Apple API. This is a statement of provenance, not a legal opinion, and no legal
+clearance of the reader, its constants or its algorithms is claimed. The macOS
+build uses AudioToolbox itself and does not use this reader.
 
 Rust dependency license texts, notices, authors and declarations are in
 licenses/rust. Rust standard-library notices and referenced license texts are
@@ -329,7 +344,7 @@ cat > "$payload/corresponding-source/RELINK.txt" <<'EOF'
 Corresponding native source and relinking
 ========================================
 The archives in archives/ are the exact checksum-verified public TagLib,
-FLAC and LAME sources used by these builds; they are included, not a written
+FLAC, LAME and libopus sources used by these builds; they are included, not a written
 offer. The source tree here contains the bridge, its header and, on Linux,
 the exact codec patches, codec-math headers and Rust shim source from the
 native build image. receipt/ records the build configuration and tools.
@@ -361,7 +376,7 @@ Use a static PIC library compatible with the original TagLib 1.11.1
 interfaces. Then link on Linux:
 
   c++ -shared "$SRC/relink/taglib_bridge.o" "$PREFIX/lib/libtag.a" \
-    -Wl,--exclude-libs,ALL -Wl,--version-script="$SRC/tools/portable/bridge/bridge.map" \
+    -Wl,--exclude-libs,ALL -Wl,-z,relro,-z,now -Wl,--version-script="$SRC/tools/portable/bridge/bridge.map" \
     -lz -o libpn-tag-bridge.so
 
 On macOS arm64:
@@ -373,11 +388,11 @@ On macOS arm64:
 On macOS, point libraries.tag_bridge to the newly linked trusted library in
 your own state. The object and source can also be rebuilt against compatible
 modified headers; the original link and build flags are in the native recipes.
-On Linux, the distributed CLI refuses a bridge, LAME or libFLAC with a digest
+On Linux, the distributed CLI refuses a bridge, LAME, libFLAC or libopus with a digest
 not in its per-architecture allowlist. To use a modified library, obtain the
 MIT-licensed public CLI source at https://github.com/mschienbein/platinum-engine,
 add its digest for the target architecture and library in src/linux_libraries.rs,
-and rebuild the CLI. Set the library path in your state; for LAME and libFLAC
+and rebuild the CLI. Set the library path in your state; for LAME, libFLAC and libopus
 also set the corresponding configured SHA-256. These changes permit a user
 build to load the modified library but do not establish output parity.
 Rebuilt libraries are not promised to match the distributed libraries.
@@ -389,6 +404,7 @@ To rebuild on macOS with the bundled archives, from this directory run:
   PN_NATIVE_ARCHIVES_DIR="$PWD/archives" sh tools/linux/build-macos-libs.sh /absolute/path/to/a/new/output-directory
 The script verifies those archives and uses the recorded settings. The LAME
 export-list patch is linux/patches/lame/0001-remove-obsolete-export.patch.
+libopus is built by tools/linux/build-libopus.sh from the bundled archive.
 EOF
 else
   cat >> "$payload/corresponding-source/RELINK.txt" <<'EOF'
@@ -406,7 +422,7 @@ and shim linkage. The exact patched sources are obtained by unpacking archives/
 and applying linux/patches/{flac,lame} in Dockerfile order; the math shim is
 built from tools/portable/math/shim and src/portable/math.rs. If you modify a
 hash-pinned input for your own rebuild, adjust its check to the modified input.
-Linux receipt/ includes FLAC and LAME configuration, flags, input hashes and
+Linux receipt/ includes FLAC, LAME and libopus configuration, flags, input hashes and
 compiler versions.
 EOF
 fi
@@ -442,6 +458,12 @@ reviewing the libraries, configure their absolute paths and codec file hashes:
   "\$pn" config set libraries.flac_sha256 "\$(json "\$(hash "\$flac")")"
   "\$pn" config set libraries.lame "\$(json "\$lame")"
   "\$pn" config set libraries.lame_sha256 "\$(json "\$(hash "\$lame")")"
+  opus="\$PWD/lib/$opus"
+  "\$pn" config set libraries.opus "\$(json "\$opus")"
+  "\$pn" config set libraries.opus_sha256 "\$(json "\$(hash "\$opus")")"
+
+Opus input and output are opt-in and have no Platinum Notes reference:
+  "\$pn" config set formats.opus true
 
 Use --state-dir before config to isolate state, and a separate output directory
 with backups for real media. Replacing a codec requires a new configured pin.

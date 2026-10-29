@@ -106,6 +106,13 @@ pub struct LibraryPaths {
     pub lame: Option<PathBuf>,
     pub lame_sha256: Option<String>,
     pub tag_bridge: Option<PathBuf>,
+    /// Fixed-point libopus 1.6.1 for the opt-in Opus format (`formats.opus`).
+    /// Omitted while unset so a settings file without it stays readable by
+    /// earlier releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_sha256: Option<String>,
 }
 
 /// Opt-ins for paths that are not proven byte-identical to the macOS arm64
@@ -115,9 +122,11 @@ pub struct LibraryPaths {
 /// in a separate namespace, never here.
 ///
 /// `allow_non_identical` enables, on Linux and `portable` builds only, the
-/// open-source MP3 decoder and the byte-for-byte copy of embedded cover art.
-/// macOS default builds always use Apple's decoder and image pipeline, so the
-/// setting is stored but has no effect there.
+/// byte-for-byte copy of embedded cover art that Apple's image pipeline would
+/// transcode and the preservation of the WAV tag chunks the reference marker
+/// writer drops. It does not gate MP3 input: the portable MP3 reader is verified
+/// identical to AudioToolbox and needs no opt-in. macOS default builds always
+/// use the reference paths, so the setting is stored but has no effect there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParitySettings {
@@ -125,6 +134,29 @@ pub struct ParitySettings {
 }
 impl ParitySettings {
     fn is_default(&self) -> bool { *self == Self::default() }
+}
+
+/// Opt-in formats that the original application does not accept. Everything
+/// under `formats.*` defaults to off; with it off the build behaves exactly as
+/// a build without that format, for inputs, outputs and discovery alike.
+///
+/// `opus` enables `.opus` (Ogg Opus, mono or stereo) input and `opus` output.
+/// There is no Platinum Notes reference for Opus; every item that involves it
+/// says so in its report. Needs `libraries.opus` and `libraries.opus_sha256`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatSettings {
+    pub opus: bool,
+}
+impl FormatSettings {
+    fn is_default(&self) -> bool { *self == Self::default() }
+}
+
+/// Read-only statement of what `formats.opus` does, shown by `config show`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FormatsEffect {
+    pub opus: bool,
+    pub note: &'static str,
 }
 
 /// Whether this build can take a non-identical path at all.
@@ -164,6 +196,8 @@ pub struct Settings {
     /// used the opt-in stays readable by earlier releases.
     #[serde(default, skip_serializing_if = "ParitySettings::is_default")]
     pub parity: ParitySettings,
+    #[serde(default, skip_serializing_if = "FormatSettings::is_default")]
+    pub formats: FormatSettings,
     pub selected_template: Option<SelectedTemplate>,
     pub custom_templates: Vec<Template>,
 }
@@ -176,6 +210,8 @@ struct ConfigView<'a> {
     libraries: &'a LibraryPaths,
     parity: ParitySettings,
     parity_effect: ParityEffect,
+    formats: FormatSettings,
+    formats_effect: FormatsEffect,
     selected_template: &'a Option<SelectedTemplate>,
     effective_selected_template: SelectedTemplate,
 }
@@ -202,24 +238,36 @@ impl Settings {
             mp3_mode: Mp3Mode::Cbr320,
             libraries: LibraryPaths::default(),
             parity: ParitySettings::default(),
+            formats: FormatSettings::default(),
             selected_template: None,
             custom_templates: Vec::new(),
         }
     }
 
-    /// Whether non-identical paths (open-source MP3 decoding, unchanged
-    /// cover-art copy) are active: the opt-in is set and this build has them.
+    /// Whether the non-identical paths (cover-art copy, WAV tag preservation) are active: the opt-in is set and
+    /// this build has it.
     pub fn non_identical_enabled(&self) -> bool {
         NON_IDENTICAL_PATHS_AVAILABLE && self.parity.allow_non_identical
+    }
+    /// The opted-in formats, as discovery and classification take them.
+    pub fn admitted_formats(&self) -> crate::file_workflow::AdmittedFormats {
+        crate::file_workflow::AdmittedFormats { opus: self.formats.opus }
+    }
+    pub fn formats_effect(&self) -> FormatsEffect {
+        if self.formats.opus {
+            FormatsEffect { opus: true, note: "enabled: .opus input and opus output are available (mono or stereo Ogg Opus at 48 kHz, no sample-rate conversion; needs libraries.opus and libraries.opus_sha256); there is no Platinum Notes reference for Opus, so each Opus item says so in its report" }
+        } else {
+            FormatsEffect { opus: false, note: "disabled: .opus files and opus output are refused exactly as in the original application" }
+        }
     }
     pub fn parity_effect(&self) -> ParityEffect {
         match (NON_IDENTICAL_PATHS_AVAILABLE, self.parity.allow_non_identical) {
             (false, _) => ParityEffect { effective: false,
-                note: "no effect in this macOS default build: Apple's decoder and image pipeline are always used, so this setting is stored but ignored" },
+                note: "no effect in this macOS default build: the reference paths (Apple's image pipeline and marker writer) are always used, so this setting is stored but ignored" },
             (true, false) => ParityEffect { effective: false,
-                note: "disabled: identical-or-refuse behaviour; MP3 input is refused and artwork that would need Apple image conversion is refused, each with a typed error code" },
+                note: "disabled: identical-or-refuse behaviour; artwork that would need Apple image conversion is refused with a typed error code and the WAV tag chunks the reference drops are dropped" },
             (true, true) => ParityEffect { effective: true,
-                note: "enabled: MP3 input is decoded with the open-source decoder, embedded cover art is copied unchanged and the tag chunks of a WAV source are kept; items using these paths list them in report.non_identical_paths and are not guaranteed byte-identical to macOS" },
+                note: "enabled: embedded cover art is copied unchanged and the tag chunks of a WAV source are kept; items using these paths list artwork_copy and wav_tag_preservation in report.non_identical_paths and are not guaranteed byte-identical to macOS" },
         }
     }
 
@@ -234,10 +282,13 @@ impl Settings {
             }
             OutputMode::SameFolder => {}
         }
-        for (field, path) in [("libraries.flac", &self.libraries.flac), ("libraries.lame", &self.libraries.lame), ("libraries.tag_bridge", &self.libraries.tag_bridge)] {
+        if self.output.format == AudioFormat::Opus && !self.formats.opus {
+            return Err(invalid("output.format", "opus output requires formats.opus"));
+        }
+        for (field, path) in [("libraries.flac", &self.libraries.flac), ("libraries.lame", &self.libraries.lame), ("libraries.tag_bridge", &self.libraries.tag_bridge), ("libraries.opus", &self.libraries.opus)] {
             if let Some(path) = path { path_nonempty(path, field)?; }
         }
-        for (field, digest) in [("libraries.flac_sha256", &self.libraries.flac_sha256), ("libraries.lame_sha256", &self.libraries.lame_sha256)] {
+        for (field, digest) in [("libraries.flac_sha256", &self.libraries.flac_sha256), ("libraries.lame_sha256", &self.libraries.lame_sha256), ("libraries.opus_sha256", &self.libraries.opus_sha256)] {
             if let Some(digest) = digest {
                 if digest.len() != 64 || !digest.bytes().all(|c| c.is_ascii_hexdigit()) {
                     return Err(invalid(field, "expected 64 hexadecimal SHA-256 digits"));
@@ -256,6 +307,7 @@ impl Settings {
         Ok(serde_json::to_value(ConfigView {
             output: &self.output, processor_max: self.processor_max, mp3_mode: self.mp3_mode,
             libraries: &self.libraries, parity: self.parity, parity_effect: self.parity_effect(),
+            formats: self.formats, formats_effect: self.formats_effect(),
             selected_template: &self.selected_template,
             effective_selected_template: self.effective_selection()?,
         })?)
@@ -270,6 +322,10 @@ impl Settings {
             "libraries" => serde_json::to_value(&self.libraries)?,
             "parity" => serde_json::to_value(self.parity)?,
             "parity.allow_non_identical" => serde_json::to_value(self.parity.allow_non_identical)?,
+            "formats" => serde_json::to_value(self.formats)?,
+            "formats.opus" => serde_json::to_value(self.formats.opus)?,
+            "libraries.opus" => serde_json::to_value(&self.libraries.opus)?,
+            "libraries.opus_sha256" => serde_json::to_value(&self.libraries.opus_sha256)?,
             "libraries.flac" => serde_json::to_value(&self.libraries.flac)?,
             "libraries.flac_sha256" => serde_json::to_value(&self.libraries.flac_sha256)?,
             "libraries.lame" => serde_json::to_value(&self.libraries.lame)?,
@@ -305,6 +361,10 @@ impl Settings {
             "libraries" => next.libraries = decode(field, value)?,
             "parity" => next.parity = decode(field, value)?,
             "parity.allow_non_identical" => next.parity.allow_non_identical = decode(field, value)?,
+            "formats" => next.formats = decode(field, value)?,
+            "formats.opus" => next.formats.opus = decode(field, value)?,
+            "libraries.opus" => next.libraries.opus = decode(field, value)?,
+            "libraries.opus_sha256" => next.libraries.opus_sha256 = decode(field, value)?,
             "libraries.flac" => next.libraries.flac = decode(field, value)?,
             "libraries.flac_sha256" => next.libraries.flac_sha256 = decode(field, value)?,
             "libraries.lame" => next.libraries.lame = decode(field, value)?,

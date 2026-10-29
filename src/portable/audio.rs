@@ -3,6 +3,10 @@
 //! No resampling is substituted for AudioConverter: a differing client rate
 //! returns a typed error. Decoding is outside the engine's scoped FPCR.FZ DSP
 //! callbacks. This module does not call platform audio or math libraries.
+//!
+//! MP3, MP2 and MP1 elementary streams are read by [`mp3`], the bit-exact
+//! port of AudioToolbox's MPEG audio path (container, priming trim, decoder and
+//! read errors); like every other codec here it needs no opt-in.
 
 #[path = "audio/alac.rs"]
 pub mod alac;
@@ -10,7 +14,7 @@ pub mod alac;
 pub mod gsm;
 #[path = "audio/mp4.rs"]
 pub mod mp4;
-#[path = "audio/mp3.rs"]
+#[path = "audio/mp3/mod.rs"]
 pub mod mp3;
 
 use std::error::Error;
@@ -450,6 +454,21 @@ impl AlacReadState {
 fn read_at(file: &mut File, offset: u64, bytes: &mut [u8], path: &Path) -> Result<(), CodecError> {
     file.seek(SeekFrom::Start(offset)).and_then(|_| file.read_exact(bytes)).map_err(|e| io_error("read audio", path, e))
 }
+/// The first bytes of the file, zero padded when it is shorter: every sniff
+/// below needs a full match, so a short file simply matches none of them.
+fn read_prefix(file: &mut File, bytes: &mut [u8; 12], path: &Path) -> Result<(), CodecError> {
+    file.seek(SeekFrom::Start(0)).map_err(|e| io_error("read audio", path, e))?;
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_error("read audio", path, e)),
+        }
+    }
+    Ok(())
+}
 fn be32(bytes: &[u8]) -> u32 { u32::from_be_bytes(bytes.try_into().expect("four bytes")) }
 fn le32(bytes: &[u8]) -> u32 { u32::from_le_bytes(bytes.try_into().expect("four bytes")) }
 fn be16(bytes: &[u8]) -> u16 { u16::from_be_bytes(bytes.try_into().expect("two bytes")) }
@@ -600,12 +619,10 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
     let aiff = (&header[..4] == b"FORM" && &header[8..12] == b"AIFF") || aifc;
     if !wav && !aiff {
         if &header[4..8] == b"ftyp" { return Err(unsupported_mp4(file, path, length)?); }
-        if header[0] == 0xff && header[1] & 0xf6 == 0xf0 {
+        if is_adts_aac(header) {
             return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" });
         }
-        if &header[..3] == b"ID3" || (header[0] == 0xff && header[1] & 0xe0 == 0xe0) {
-            return Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason: "Apple's decoder output is not reproducible" });
-        }
+        // `Reader::open` sends everything that is not PCM, MP4 or ADTS to the MP3 reader first.
         return Err(CodecError::UnsupportedFormat("expected uncompressed RIFF/WAVE or AIFF PCM"));
     }
     let mut offset = 12u64;
@@ -648,7 +665,7 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
                 (0x11, 4) => Encoding::WavIma,
                 (0x02, 4) => Encoding::WavMs,
                 (0x31, _) if !extensible || gsm_extensible_supported => Encoding::WavGsm,
-                (0x55, _) => return Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason: "Apple's decoder output is not reproducible" }),
+                (0x55, _) => return Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason: "MP3 inside a WAVE container is not reproduced; only elementary MP3 streams are" }),
                 (0xff, _) => return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" }),
                 _ => return Err(CodecError::UnsupportedFormat("WAVE encoding or bit depth has not been reproduced")),
             };
@@ -764,15 +781,6 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
     Ok(ParsedPcm { source, encoding, data_offset, frames, coefficients })
 }
 
-/// Opt-in switches for decoders whose output is deterministic but not
-/// byte-identical to AudioToolbox. Everything is off by default; `Reader::open`
-/// uses the default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReaderOptions {
-    /// Decode MP3 with the open-source portable decoder instead of refusing.
-    pub non_identical_mp3: bool,
-}
-
 /// Sequential same-rate PCM, ALAC, companded, ADPCM, GSM and float32 CAF reader.
 ///
 /// macOS arm64 comparisons cover WAVE/AIFF integer depths 1..=32 (all 8/16-bit
@@ -791,6 +799,29 @@ pub struct ReaderOptions {
 /// requires nonzero byte-aligned depth and either a low-18-bit channel mask or
 /// bit 31 set. Other masks are refused, including some accepted by Apple; see
 /// `gsm-01/refusal-summary.json` for the sampled limitation.
+///
+/// Which reader opens a file is decided as AudioToolbox's `AudioFile` decides it. A name ending in `.mp1`, `.mp2`, `.mp3`,
+/// `.mpa` or `.mpeg` (any case) commits to the MPEG audio types: whatever the content is, only the MPEG reader looks at
+/// it (a WAVE or an MP4 named `.mp3` is an MPEG stream with junk in front of it, or `'dta?'`). Any other name leaves the
+/// choice to the content: leading ID3v2/ID3v1 blocks are stepped over, then WAVE, AIFF, CAF, MP4 and ADTS are told by
+/// their signatures, FLAC and Ogg are typed refusals (AudioToolbox decodes them, this port does not), a valid layer I/II/III
+/// frame header (or nothing at all, `'wht?'`) selects the MPEG reader and anything else is `'typ?'` (AudioToolbox's
+/// answer when no type recognises the data; free-format MPEG, ID3v2 tags with a footer and one to three stray bytes are
+/// refused this way).
+///
+/// MP3, MP2 and MP1 elementary streams open through [`mp3::reader::Mp3Reader`]: the file is read into memory
+/// (at most 2 GiB), `source_format`, `file_length_frames`, `bitrate` and the
+/// trimmed samples are what `ExtAudioFileRead` delivers on macOS, and a file
+/// Apple refuses is refused with its `OSStatus` (`'dta?'`, `'wht?'`, -39,
+/// `'fmt?'`). The contract is AudioToolbox's for the same sequence of read
+/// sizes: sequential reads of any size deliver the frames, and fail with the
+/// status, that `ExtAudioFileRead` does for those sizes (the frames a failed
+/// read had gathered are lost, so the number delivered before an error depends
+/// on the sizes, as it does on macOS). Not modelled: seeking, a client rate
+/// other than the file's (refused), and reading from a reader on which
+/// `file_length_frames` or `bitrate` was called first (AudioToolbox's length
+/// query scans the whole file and changes what later reads see; the engine
+/// queries on a reader it never reads from).
 pub struct Reader {
     file: File,
     path: PathBuf,
@@ -802,17 +833,10 @@ pub struct Reader {
     raw: Vec<u8>,
     packets: Option<PacketState>,
     alac: Option<AlacReadState>,
-    non_identical: bool,
     mp3: Option<Box<Mp3ReadState>>,
 }
 impl Reader {
     pub fn open(path: impl AsRef<Path>, sample_rate: Option<f64>) -> Result<Self, CodecError> {
-        Self::open_with(path, sample_rate, ReaderOptions::default())
-    }
-    /// True when the samples came from a backend that is not byte-identical to
-    /// the AudioToolbox reference (currently only the opt-in MP3 decoder).
-    pub fn non_identical(&self) -> bool { self.non_identical }
-    pub fn open_with(path: impl AsRef<Path>, sample_rate: Option<f64>, options: ReaderOptions) -> Result<Self, CodecError> {
         let path = path.as_ref();
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b"flac") {
@@ -820,7 +844,13 @@ impl Reader {
         }
         let mut file = File::open(path).map_err(|e| io_error("open input", path, e))?;
         let length = file.metadata().map_err(|e| io_error("inspect audio", path, e))?.len();
-        let mut header = [0u8; 12]; read_at(&mut file, 0, &mut header, path)?;
+        // ExtAudioFileOpenURL names no file type, so AudioFile takes it from the file name extension, and an MPEG audio
+        // extension commits to the MPEG audio types: whatever the content is (a WAVE, an MP4, ADTS, FLAC or random bytes),
+        // only the MPEG reader looks at it, and its refusal is final. Any other name leaves the choice to the content.
+        if has_mpeg_extension(path) { return Self::open_mp3(file, path, length, sample_rate); }
+        let skipped = leading_tag_length(&mut file, length, path)?;
+        if skipped != 0 { return Self::open_behind_tags(file, path, length, skipped, sample_rate); }
+        let mut header = [0u8; 12]; read_prefix(&mut file, &mut header, path)?;
         if matches!(&header[4..8], b"ftyp" | b"moov" | b"free" | b"wide" | b"mdat") {
             let info = match mp4::read_alac(&mut file) {
                 Ok(info) => info,
@@ -861,14 +891,10 @@ impl Reader {
             let client = client_format(rate, source.channels_per_frame, false)?;
             let frames = info.frames;
             return Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Alac,
-                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)), non_identical: false, mp3: None });
+                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)), mp3: None });
         }
-        // `NotMp3` (no confirmed MP3 stream) falls through, so every other input keeps the classification
-        // and error it has without the opt-in.
-        if options.non_identical_mp3 && !is_pcm_container(&header) {
-            if let Some(stream) = open_mp3_stream(path)? {
-                return Self::from_mp3(file, path, stream, sample_rate);
-            }
+        if !is_pcm_container(&header) && !adts_sniff(&header, length) {
+            return Self::open_unrecognised(file, path, length, &header, sample_rate);
         }
         let parsed = parse_pcm(&mut file, path, length, &header)?;
         let rate = same_rate(parsed.source.sample_rate, sample_rate)?;
@@ -884,16 +910,16 @@ impl Reader {
             _ => None,
         };
         Ok(Self { file, path: path.to_owned(), source: parsed.source, client, encoding: parsed.encoding,
-            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None, non_identical: false, mp3: None })
+            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None, mp3: None })
     }
     pub fn source_format(&self) -> StreamDescription { self.source }
     pub fn client_format(&self) -> StreamDescription { self.client }
     pub fn file_length_frames(&self) -> Result<i64, CodecError> {
-        if let Some(mp3) = &self.mp3 { return Ok(mp3.stream.info().length_frames); }
+        if let Some(mp3) = &self.mp3 { return Ok(mp3.reader.file_length_frames()); }
         i64::try_from(self.frames).map_err(|_| CodecError::InvalidInput("frame count exceeds i64"))
     }
     pub fn bitrate(&self) -> Result<u32, CodecError> {
-        if let Some(mp3) = &self.mp3 { return Ok(mp3.stream.info().bitrate); }
+        if let Some(mp3) = &self.mp3 { return Ok(mp3.reader.bitrate()); }
         if let Some(alac) = &self.alac {
             return alac.bitrate.ok_or(CodecError::InvalidInput("ALAC bitrate exceeds u32"));
         }
@@ -986,7 +1012,8 @@ impl Reader {
         self.position += frames as u64;
         Ok(frames)
     }
-    /// Read complete interleaved frames; the unused output tail is untouched.
+    /// Read complete interleaved frames; the unused output tail is untouched (an MP3 read that reaches the end of the valid
+    /// frames fills it with the decoder's padding, as AudioToolbox does).
     pub fn read(&mut self, output: &mut [f32]) -> Result<usize, CodecError> {
         if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 != 0 { return Err(CodecError::InvalidInput("use read_stereo_planar for a planar reader")); }
@@ -1004,7 +1031,8 @@ impl Reader {
         Ok(frames)
     }
     /// Read stereo planes, duplicating mono. PCM uses the first two channels;
-    /// ALAC follows the verified default layout's left/right channel positions.
+    /// ALAC follows the verified default layout's left/right channel positions. The unused tail is untouched, except for an
+    /// MP3 read that reaches the end of the valid frames (see [`Reader::read`]).
     pub fn read_stereo_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize, CodecError> {
         if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 == 0 { return Err(CodecError::InvalidInput("reader is not configured for planar stereo")); }
@@ -1025,84 +1053,202 @@ impl Reader {
     pub fn close(self) -> Result<(), CodecError> { Ok(()) }
 }
 
-/// State of the opt-in MP3 backend (see `audio/mp3.rs`).
+/// MP3 decoding state: the exact reader plus the first-failure poisoning every
+/// codec here has.
 struct Mp3ReadState {
-    stream: mp3::Mp3Stream,
+    reader: mp3::reader::Mp3Reader,
+    /// int16 samples of the current read, interleaved at the source channel count.
+    scratch: Vec<i16>,
     failed: bool,
 }
 
-/// WAVE, AIFF/AIFC and CAF inputs are never probed as MP3.
+/// The largest MP3 input that is decoded: the whole file is held in memory.
+const MAX_MP3_BYTES: u64 = 1 << 31;
+
+/// WAVE, AIFF/AIFC and CAF inputs are PCM containers; under a name without an MPEG audio extension they are never opened as MP3.
 fn is_pcm_container(header: &[u8; 12]) -> bool {
     (&header[..4] == b"RIFF" && &header[8..12] == b"WAVE")
         || (&header[..4] == b"FORM" && matches!(&header[8..12], b"AIFF" | b"AIFC"))
         || &header[..4] == b"caff"
 }
 
-fn mp3_error(path: &Path, error: mp3::Mp3Error) -> CodecError {
-    match error {
-        mp3::Mp3Error::NotMp3 => CodecError::UnsupportedFormat("data is not an MP3 stream"),
-        mp3::Mp3Error::Unsupported(reason) => CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason },
-        mp3::Mp3Error::Corrupt(message) => CodecError::InvalidInput(message),
-        mp3::Mp3Error::Io(operation, source) => io_error(operation, path, source),
-    }
+/// ADTS framing: a 12-bit sync and layer bits 00, which no MPEG audio layer
+/// uses. AAC has no portable decoder.
+fn is_adts_aac(header: &[u8; 12]) -> bool { header[0] == 0xff && header[1] & 0xf6 == 0xf0 }
+
+/// AudioFile's ADTS answer when the file starts with ADTS framing: `'typ?'` unless the header can belong to a stream. Fitted on
+/// 17,000 random headers on macOS 27.2 (4 outliers, all with a frame length of 8 or 9): at least seven bytes, a frame length
+/// of eight or more, a sampling-frequency index below 13, and no profile 3 in the MPEG-2 (ID bit set) variant.
+fn adts_sniff(header: &[u8; 12], remaining: u64) -> bool {
+    if remaining < 7 || !is_adts_aac(header) { return false; }
+    let frame = (usize::from(header[3] & 3) << 11) | (usize::from(header[4]) << 3) | usize::from(header[5] >> 5);
+    frame >= 8 && (header[2] >> 2) & 15 < 13 && !(header[1] & 8 != 0 && header[2] >> 6 == 3)
 }
 
-/// Probe `path` with a fresh handle; `None` means it is not an MP3 stream.
-fn open_mp3_stream(path: &Path) -> Result<Option<mp3::Mp3Stream>, CodecError> {
-    let file = File::open(path).map_err(|e| io_error("open input", path, e))?;
-    match mp3::Mp3Stream::open(file) {
-        Ok(stream) => Ok(Some(stream)),
-        Err(mp3::Mp3Error::NotMp3) => Ok(None),
-        Err(error) => Err(mp3_error(path, error)),
+/// File name extensions that make AudioFile choose its MPEG audio types (`.mp1 .mp2 .mp3 .mpa .mpeg`, any case). Observed on
+/// macOS 27.2 with random data: these answer `'dta?'`, the names the engine hands to this reader otherwise `'typ?'`
+/// (`.ogg .oga .opus` also commit, to the Ogg types, and `.aac .adts` to ADTS; the engine never opens those names here).
+fn has_mpeg_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        let extension = extension.as_encoded_bytes();
+        [&b"mp1"[..], b"mp2", b"mp3", b"mpa", b"mpeg"].iter().any(|name| extension.eq_ignore_ascii_case(name))
+    })
+}
+
+const DTA: i32 = 0x6474_613f; // 'dta?': recognised as a type, but the data does not open
+const TYP: i32 = 0x7479_703f; // 'typ?': no file type recognises the data
+fn open_refusal(status: i32) -> CodecError { CodecError::Native { operation: "ExtAudioFileOpenURL", status } }
+
+/// Bytes of leading ID3v2 and ID3v1 blocks, which AudioFile steps over before it identifies the format (same size rule as
+/// the MPEG container: `ID3` + syncsafe size + 10 without footer, `TAG` 128). May exceed the length of the file.
+fn leading_tag_length(file: &mut File, length: u64, path: &Path) -> Result<u64, CodecError> {
+    let mut offset = 0u64;
+    for _ in 0..1_000_000 {
+        if offset >= length { break; }
+        let wanted = (length - offset).min(10) as usize;
+        let mut head = [0u8; 10];
+        read_at(file, offset, &mut head[..wanted], path)?;
+        let size = mp3::container::id3_size(&head[..wanted]);
+        if size == 0 { break; }
+        offset = offset.saturating_add(size as u64);
+    }
+    Ok(offset)
+}
+
+/// What AudioFile's per-type content sniffing makes of the data at the start of a file (or behind its leading tags) whose
+/// name carries no MPEG audio extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content { Adts, Flac, Ogg, Wave, Aiff, Caf, Mp4, Mpeg, Unknown }
+
+/// `remaining` is the number of bytes from the start of `header` to the end of the file. The MPEG types answer yes to a
+/// valid layer I/II/III frame header in the first four bytes (`MPEGAudioFormat::FileDataIsThisFormat`) and to nothing at
+/// all (the reader then answers `'wht?'`); one to three bytes, a free-format or any invalid header answer no.
+fn identify(header: &[u8; 12], remaining: u64) -> Content {
+    if remaining == 0 { return Content::Mpeg; }
+    if adts_sniff(header, remaining) { return Content::Adts; }
+    if header.starts_with(b"fLaC") { return Content::Flac; }
+    if header.starts_with(b"OggS") { return Content::Ogg; }
+    if &header[..4] == b"RIFF" && &header[8..12] == b"WAVE" { return Content::Wave; }
+    if &header[..4] == b"FORM" && matches!(&header[8..12], b"AIFF" | b"AIFC") { return Content::Aiff; }
+    if &header[..4] == b"caff" { return Content::Caf; }
+    if matches!(&header[4..8], b"ftyp" | b"moov" | b"free" | b"wide" | b"mdat") { return Content::Mp4; }
+    if remaining >= 4 && mp3::container::parse_sync_word(be32(&header[..4])).is_some() { return Content::Mpeg; }
+    Content::Unknown
+}
+
+fn aac_refusal() -> CodecError {
+    CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" }
+}
+fn flac_refusal() -> CodecError {
+    CodecError::UnsupportedCodec { codec: "FLAC", operation: "decoding", reason: "AudioToolbox's own FLAC reader, used for a FLAC stream whose file name does not end in flac, is not reproduced" }
+}
+fn ogg_refusal() -> CodecError {
+    CodecError::UnsupportedFormat("Ogg audio (Opus, FLAC and the other codecs AudioToolbox opens by content) is not decoded by this build")
+}
+
+/// The native call that failed while opening: the container parser
+/// (`ExtAudioFileOpenURL`) or the client-format setter, with Apple's status.
+fn mp3_open_error(error: mp3::reader::ReaderError) -> CodecError {
+    let operation = match error {
+        mp3::reader::ReaderError::Open(_) => "ExtAudioFileOpenURL",
+        _ => "ExtAudioFileSetProperty(client format)",
+    };
+    CodecError::Native { operation, status: error.status() }
+}
+
+fn mp3_read_error(operation: &'static str, error: mp3::reader::ReaderError) -> CodecError {
+    match error {
+        mp3::reader::ReaderError::Poisoned => CodecError::Poisoned,
+        other => CodecError::Native { operation, status: other.status() },
     }
 }
 
 impl Reader {
-    /// A reader over the portable MP3 decoder; its source description is the
-    /// one AudioToolbox reports for MP3 files.
-    fn from_mp3(file: File, path: &Path, stream: mp3::Mp3Stream, sample_rate: Option<f64>) -> Result<Self, CodecError> {
-        let info = stream.info();
-        let source = StreamDescription { sample_rate: f64::from(info.sample_rate), format_id: u32::from_be_bytes(*b".mp3"),
-            format_flags: 0, bytes_per_packet: 0, frames_per_packet: info.frames_per_packet, bytes_per_frame: 0,
-            channels_per_frame: info.channels, bits_per_channel: 0, reserved: 0 };
+    /// A reader over the exact MP3 decoder; its source description is the one
+    /// AudioToolbox reports for MPEG audio files (flags, packet and frame bytes
+    /// and bit depth are zero).
+    fn open_mp3(mut file: File, path: &Path, length: u64, sample_rate: Option<f64>) -> Result<Self, CodecError> {
+        const TOO_LARGE: CodecError = CodecError::UnsupportedFormat("MP3 input larger than 2 GiB is not supported: the file is decoded from memory");
+        if length > MAX_MP3_BYTES { return Err(TOO_LARGE); }
+        let mut data = Vec::new();
+        data.try_reserve_exact(length as usize)
+            .map_err(|_| io_error("read audio", path, io::ErrorKind::OutOfMemory.into()))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| io_error("read audio", path, e))?;
+        (&mut file).take(MAX_MP3_BYTES + 1).read_to_end(&mut data).map_err(|e| io_error("read audio", path, e))?;
+        if data.len() as u64 > MAX_MP3_BYTES { return Err(TOO_LARGE); }
+        let reader = mp3::reader::Mp3Reader::open(data).map_err(mp3_open_error)?;
+        let format = reader.source_format();
+        let source = StreamDescription { sample_rate: f64::from(format.sample_rate), format_id: format.format_id,
+            format_flags: 0, bytes_per_packet: 0, frames_per_packet: format.frames_per_packet, bytes_per_frame: 0,
+            channels_per_frame: format.channels, bits_per_channel: 0, reserved: 0 };
         let rate = same_rate(source.sample_rate, sample_rate)?;
-        let client = client_format(rate, info.channels, false)?;
+        let client = client_format(rate, format.channels, false)?;
+        // `frames` and `position` serve the PCM and ALAC paths only; an MP3 answers `file_length_frames` from its
+        // container model. Open issues no length query: on AudioToolbox that query scans the whole file and so changes
+        // what later reads see, which the model does not reproduce (the engine queries length and bitrate on a reader
+        // it does not read from).
         Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Float32 { big_endian: false },
-            frames: info.length_frames.max(0) as u64, position: 0, raw: Vec::new(), packets: None, alac: None,
-            non_identical: true, mp3: Some(Box::new(Mp3ReadState { stream, failed: false })) })
+            frames: 0, position: 0, raw: Vec::new(), packets: None, alac: None,
+            mp3: Some(Box::new(Mp3ReadState { reader, scratch: Vec::new(), failed: false })) })
     }
-    /// Interleaved (source channels) or planar read; AudioToolbox's MP3 path
-    /// delivers the same 16-bit-grid samples for both.
+    /// A file with no MPEG audio extension whose start is not WAVE, AIFF, CAF, MP4 or ADTS: what is left of AudioFile's
+    /// content sniffing is FLAC and Ogg (typed refusals: AudioToolbox decodes them, this port does not), the MPEG types
+    /// (`identify`) and, when no type recognises the data, `'typ?'`.
+    fn open_unrecognised(file: File, path: &Path, length: u64, header: &[u8; 12], sample_rate: Option<f64>) -> Result<Self, CodecError> {
+        match identify(header, length) {
+            Content::Mpeg => Self::open_mp3(file, path, length, sample_rate),
+            Content::Flac => Err(flac_refusal()),
+            Content::Ogg => Err(ogg_refusal()),
+            _ => Err(open_refusal(TYP)),
+        }
+    }
+    /// The same for a file that starts with ID3v2/ID3v1 blocks (`skipped` bytes), which AudioFile steps over before it sniffs.
+    /// ADTS, FLAC, Ogg and WAVE are then still opened by AudioToolbox (the first three are refused as above, WAVE because
+    /// its parser here starts at the first byte); AIFF, CAF and MP4 are sniffed but do not open (`'dta?'`).
+    fn open_behind_tags(file: File, path: &Path, length: u64, skipped: u64, sample_rate: Option<f64>) -> Result<Self, CodecError> {
+        let remaining = length.saturating_sub(skipped);
+        let mut header = [0u8; 12];
+        let mut file = file;
+        if remaining != 0 {
+            let wanted = remaining.min(12) as usize;
+            read_at(&mut file, skipped, &mut header[..wanted], path)?;
+        }
+        match identify(&header, remaining) {
+            Content::Mpeg => Self::open_mp3(file, path, length, sample_rate),
+            Content::Adts => Err(aac_refusal()),
+            Content::Flac => Err(flac_refusal()),
+            Content::Ogg => Err(ogg_refusal()),
+            Content::Wave => Err(CodecError::UnsupportedFormat("RIFF/WAVE data behind a leading ID3 tag has not been reproduced")),
+            Content::Aiff | Content::Caf | Content::Mp4 => Err(open_refusal(DTA)),
+            Content::Unknown => Err(open_refusal(TYP)),
+        }
+    }
+    /// One `ExtAudioFileRead`: interleaved at the source channel count, or two planes (mono duplicated). The float samples
+    /// are the int16 ones over 32768. Like AudioToolbox's converter, a read at the end of the valid frames fills the buffer
+    /// with every frame it decoded (the stream's padding) and returns the lower count: the engine processes whole blocks.
     fn read_mp3(&mut self, output: &mut [f32], right: Option<&mut [f32]>) -> Result<usize, CodecError> {
-        let channels = self.source.channels_per_frame as usize;
         let state = self.mp3.as_mut().expect("MP3 state");
-        let result = match right {
-            Some(right) => state.stream.read_planar(output, right),
-            None => {
-                let frames = output.len() / channels;
-                let mut left = [0.0f32; 1152];
-                let mut other = [0.0f32; 1152];
-                let mut done = 0usize;
-                let mut outcome = Ok(());
-                while done < frames {
-                    let want = (frames - done).min(1152);
-                    match state.stream.read_planar(&mut left[..want], &mut other[..want]) {
-                        Ok(0) => break,
-                        Ok(got) => {
-                            for i in 0..got {
-                                if channels == 1 { output[done + i] = left[i]; }
-                                else { output[(done + i) * 2] = left[i]; output[(done + i) * 2 + 1] = other[i]; }
-                            }
-                            done += got;
-                            if got < want { break; }
-                        }
-                        Err(error) => { outcome = Err(error); break; }
-                    }
-                }
-                outcome.map(|()| done)
+        let channels = state.reader.channels();
+        let planar = right.is_some();
+        let requested = if planar { output.len() } else { output.len() / channels };
+        if requested == 0 { return Ok(0); }
+        state.scratch.resize(requested * channels, 0);
+        let frames = match state.reader.read(&mut state.scratch, requested) {
+            Ok(frames) => frames,
+            Err(error) => {
+                state.failed = true;
+                return Err(mp3_read_error(if planar { "ExtAudioFileRead(planar stereo)" } else { "ExtAudioFileRead" }, error));
             }
         };
-        result.map_err(|error| { state.failed = true; mp3_error(&self.path, error) })
+        let samples = &state.scratch[..state.reader.last_written() * channels];
+        match right {
+            Some(right) => for (i, frame) in samples.chunks_exact(channels).enumerate() {
+                output[i] = f32::from(frame[0]) / 32_768.0;
+                right[i] = f32::from(frame[channels - 1]) / 32_768.0;
+            },
+            None => for (dst, &sample) in output.iter_mut().zip(samples) { *dst = f32::from(sample) / 32_768.0; },
+        }
+        Ok(frames)
     }
 }
 

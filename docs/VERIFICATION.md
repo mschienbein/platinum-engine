@@ -20,7 +20,526 @@ reference-platform comparisons run on the M4 Mac in the release battery.
 The portable math and vector implementations model the recorded M4 reference;
 finite test coverage does not establish universal cross-platform parity.
 
+## v0.3.0 changes and evidence
+
+v0.3.0 replaces the opt-in MP3 decoder of v0.2.0 with a bit-exact port of
+AudioToolbox's MP3 reader, adds one opt-in format (Opus), moves the
+Linux/portable tag bridge to v09, aligns two refusals across platforms, pins one
+more native call context on macOS and adds two error codes. It changes no
+processing numerics. The evidence is kept separate by claim, each figure names
+the platforms it was measured on, ignored tests are never counted as passes,
+and the freeze and battery results of the release build are listed at the end
+of this section.
+
+- **Exact MP3 input (replaces the v0.2.0 opt-in decoder).**
+  `src/portable/audio/mp3/` is a bit-exact port, in safe integer-only Rust, of
+  AudioToolbox's MP3 reader path: the AudioFile container model (sync search,
+  ID3v2/ID3v1, Xing/Info/LAME/VBRI, packet table, priming), the `ExtAudioFile`
+  priming trim and read rules, the converter's packet-group reads with their
+  `'bada'`/`'dta?'` read errors, the `AudioCodec` wrapper (529-frame decoder
+  delay, end-of-file tail) and Apple's integer Spirit DSP Layer I/II/III decoder
+  (macOS 27.2 build 26B123, arm64e slice
+  `70e5d4a56b24d037b940328916df496a20267eb206f8e316216ae7bef69a1626` of
+  `AudioCodecs`). It needs no setting and is **claimed identical** within these
+  bounds: sequential reads of generated inputs, planar and interleaved, of any
+  size, on one reference machine (Mac16,13, Apple M4). It replaces, and does not
+  extend, the open-source decoder that v0.2.0 shipped behind
+  `parity.allow_non_identical` and listed as `mp3_decode`: that decoder, the
+  `mp3_decode` member and the setting's MP3 gating no longer exist, and Linux
+  and `portable` builds no longer refuse MP3 input when the setting is off
+  ([upgrade notes](LINUX.md#upgrading-from-v020)). Nothing is established for
+  another macOS version or CPU generation, and seeking, a client rate other than
+  the file's and reads from a reader on which the file length or bitrate was
+  queried first are not modelled (the engine does none of these).
+- **File-type admission.** The portable reader now decides which reader opens a
+  file as AudioFile does: a name ending `.mp1 .mp2 .mp3 .mpa .mpeg` commits to
+  the MPEG reader whatever the bytes are; under any other name the content
+  decides. The rule is in [LINUX.md](LINUX.md#mp3-input). Like
+  `ExtAudioFileRead`, an MP3 read that reaches the end of the valid frames fills
+  the caller's buffer with every frame the decoder produced (the padding)
+  and returns the lower count, and the engine pulls whole 512-frame blocks, so
+  these frames reach its effects; `process` output now equals the macOS default
+  build's byte for byte for the inputs below.
+- **Opt-in Opus.** `formats.opus` (default off) adds Ogg Opus input and output;
+  see the Opus evidence below. Platinum Notes refuses `.opus`, so there is no
+  reference.
+- **Tag bridge v09 (Linux and `portable`).** ABI 5 and the feature word
+  (`pn_tag_bridge_features()` = 1) are unchanged and no export was added. With
+  `parity.allow_non_identical` on, generic copies treat a WAV like MP3 and AIFF:
+  the picture of a FLAC, MP3, AIFF, M4A or WAV source is stored byte for byte as
+  an `APIC` frame in the WAV's `ID3 ` chunk and the `APIC` frames of a WAV source
+  are the pictures copied into FLAC, MP3, AIFF and M4A (type, description,
+  canonical MIME, validators and size limits as for MP3 and AIFF); WAV to WAV and
+  `match-input` are direct copies and are unchanged, and with the setting off no
+  picture moves into or out of a WAV (the output is byte-identical to v08 and
+  v07). The picture reaches the finished WAV through the existing `wav_preserve`
+  rewrite; no Rust change was needed. The destination ID3v2 tag is checked
+  against the 268,435,455-byte limit of its 28-bit size field before anything is
+  written (v08 counted `64 + picture bytes` per picture, let about sixteen
+  maximal FLAC pictures through and TagLib 1.11.1 then wrote the size modulo
+  2^28); this closes the v0.2.0 follow-up on the ID3 size preflight. The Linux
+  bridge is built with `-fstack-protector-strong -D_FORTIFY_SOURCE=2
+  -Wl,-z,relro,-z,now`; the macOS comparison dylib is built by
+  `tools/portable/bridge/build-macos-portable.sh`. The macOS production bridge
+  (v07) is unchanged. Digests: [LINUX.md](LINUX.md#linux-native-libraries).
+- **macOS AAC decode call context.** AudioToolbox's AAC decoder has the same two
+  output classes as its encoder, selected per `ExtAudioFileRead` call: the SME
+  512-point inverse-transform kernel runs if and only if its stack temporaries
+  are 64-byte aligned, that is when `sp % 64 == 16` at the read's entry (class
+  S); every other residue runs the generic NEON kernel (class G), and the two
+  round differently. The native application's reads and the engine's have been
+  class G, but only through frame layout: the entry residue was whatever the
+  caller's compiled frame produced (0 in the shipped v0.2.0 binary, measured
+  under lldb; the AAC research recorded 32 for the interleaved read of another
+  build). Both `ExtAudioFileRead`
+  call sites now enter AudioToolbox through the same `call_with_sp_residue`
+  trampoline that pins the encoder's write and dispose calls, with
+  `READ_SP_RESIDUE` 0, so the decoder is class G by construction and no longer
+  by compiler frame layout. Output is unchanged for every input the v0.2.0
+  layout decoded. This is an observation of the tested macOS arm64
+  AudioToolbox, not a cross-version guarantee; the verification of the pin is in
+  the release evidence below.
+- **Error codes.** 39 (the 37 of v0.2.0 plus `opus_not_enabled` and
+  `unsupported_opus_variant`); the documented table, `ErrorCode::ALL` and the CLI
+  scenario ledger are kept identical by a test. The 37/37 ledger under "v0.2.0
+  release evidence" is v0.2.0's.
+- **Alignment fixes** (no output byte changes). A RIFF/WAVE or AIFF file named
+  `.mp3` is refused on Linux and `portable` as `invalid_input_file`
+  (`ExtAudioFileOpenURL`, `'dta?'`) exactly as on macOS, because a name ending
+  `.mp1 .mp2 .mp3 .mpa .mpeg` commits to the MPEG reader (v0.2.0 processed it by
+  content). `inspect` of a symlink on macOS now reports `invalid_input_path`
+  (stage `inspect source identity`) as on Linux; it reported `io_error`.
+- **Held as-is.** A cross-format copy into a WAV under the opt-in always writes
+  tempo and key, so a source without tags gains an `ID3 ` chunk holding `TBPM`
+  "0" and an empty `TKEY` and lists `wav_tag_preservation`; keeping only chunks
+  that carry source data was considered and is not changed (open). AAC input and
+  output stay refused on Linux, and Rust ports of the AudioToolbox AAC paths are
+  research and are not shipped. The unflagged direct M4A-to-MP3 copy still has
+  no ID3 size check (reference parity). The macOS default build is otherwise
+  unchanged.
+
+### Exact MP3 input: evidence
+
+All observations are on the reference machine named above, with generated audio
+only; inferences are not listed as results.
+
+1. *Three corpora against Apple.* `corpus` (7,100 files in 35 families: LAME
+   CBR/VBR/ABR at every rate, bitrate and mode, ffmpeg/Lavc, every tag and
+   container variant, ID3/APE/Lyrics, junk, tiny and long files, loud and
+   overshooting streams, Layer I/II, foreign formats and about 3,500 damaged
+   files), `fuzz` (2,300 files: 21 syntactic Layer III profiles and Layer II with
+   mixed blocks, MPEG-1 and LSF intensity stereo, linbits, overflow, reservoir,
+   free-format and corrupt streams) and `held` (6,440 files with fresh seeds
+   never used in development: 5,000 random byte-level mutants of real streams,
+   840 fresh fuzz-profile files, 600 fresh random LAME encodes). Per file the
+   open or refusal status (numeric), the stream description, file length,
+   bitrate, the float32 PCM of 512-frame planar reads, of interleaved 512-frame
+   reads and of 4096-frame planar reads, and the numeric `OSStatus` of any read
+   error were compared: 7,100, 2,300 and 6,440 files, **zero mismatches** on
+   macOS arm64, Linux arm64 (Docker) and Linux x86_64 (Docker on ns2). Apple's
+   results are the engine's own `apple_codec::Reader` driven by a probe, replayed
+   from SHA-256-verified dumps on every platform and regenerated live for the
+   held-out set.
+2. *Live sweeps on the final reader.* Read sizes 1 to 8192, odd sizes, mixed
+   size sequences and 26,000 regenerated mutation files: 41,360 + 113,740 +
+   20,680 + 47,520 + 25,850 + 104,660 + 52,330 + 738 cases, all identical in
+   frames, numeric status and sample SHA-256. 85 of the 7,100 corpus files
+   differ between 512- and 4096-frame reads in Apple's own results, and the port
+   reproduces that.
+3. *Codec and function level.* Layer III 16-bit output equals Apple's
+   `AudioCodec` output on 6,381 of 6,381 and 2,102 of 2,102 openable corpus and
+   fuzz files; `DecodeFrame` was compared call by call (status, consumed bytes,
+   PCM) on 174,088 real, damaged, fuzz and Layer I/II frames, on 44,570
+   debugger stage dumps with the full decoder state and on 411,000 injected
+   granules. These counts are the workers' reports; the lead re-ran the
+   end-to-end comparisons above.
+4. *The newer CPU slice.* The `arm64e.x1` slice, selected by newer cores, has 33
+   of 33 tables and all read-only data byte-identical to the base slice; 61 of
+   83 call-closure functions are identical and 22 differ only by CSSC, CPA or
+   PAuth_LR toolchain instructions. Its machine code, with those three classes
+   rewritten to their Arm-ARM equivalents, ran on the M4 against Apple's real
+   image: 20.5 million `DecodeFrame` calls and 14 leaf routines at 10^7 vectors
+   each, no mismatch. x1 silicon itself never ran.
+5. *Hostile input and speed.* Whole-reader fuzzing (bit flips, byte rewrites,
+   truncation, splices, inserts, header rewrites, duplicated regions; optimized
+   with overflow checks and debug assertions on) ran 1.2 million iterations on
+   the first assembly, 1.2 million after the structured-synthesis wave and,
+   on the final build, 0.96 million at 512-frame reads plus 0.3 million at mixed
+   read sizes: no panic, overflow-check failure or hang, slowest iteration
+   207 ms (inputs up to 400 KB). 100 MB hostile files (random, zeros, 0xFF,
+   repeated sync headers, 240,000 bad-payload frames) open or decode in 0.02 to
+   1.1 s with a typed refusal or `'bada'`. The final build decodes at 973 times
+   real time in the worst case (320 kbit/s white noise, 44.1 kHz stereo; whole
+   process, one core) and 1,345 to 1,477 times real time for open and decode
+   inside the engine tree on three platforms.
+6. *Repository tests.* A 315-file subset with Apple's recorded results (and 63 of
+   those files again at 100-, 513- and 4096-frame reads, planar and
+   interleaved) and 40 recorded decoder-state granules are part of the test
+   suite (`tests/portable_mp3.rs`, `tests/fixtures/mp3-exact/README.md`) and are
+   replayed bit-identically on macOS arm64, Linux aarch64 and Linux x86_64 with
+   no Apple component. In the integration tree (macOS, `--features portable`,
+   at the time of the admission slice): `portable_mp3` 14 passed, 1 ignored;
+   `portable_mp3_hostile` 2 passed (20,000 mutants, 1,500 of them through
+   files); `portable_audio` 1 passed, 6 ignored; `--lib portable::audio` 43
+   passed; the default build ran the same three targets with 14 and 2 passed
+   and 1 passed with 39 ignored native captures. The research crate's own 37 unit
+   tests passed in the research tree.
+
+Limits: a chained ID3 header (after a valid first tag) whose version or
+revision byte is 0xff makes Apple's open spin forever, and the port refuses it
+with `'dta?'` (nothing to compare); MPEG-2.5 Layer I/II is opened by AudioFile
+but its converter fails `'fmt?'`, which the port reproduces; states from which
+Apple would corrupt memory or loop are total in the port (no panic, no loop) but
+are not Apple's behaviour, and no test input reaches them; the references are
+one OS build on one CPU; the full corpora, the Apple dumps and the table
+generator and verifier scripts are research evidence, not part of the public
+source.
+
+### File-type admission and process output: evidence
+
+Observed on the same machine with the engine's `apple_codec::Reader` and the
+macOS default CLI against the `--features portable` CLI (the portable build used
+the portable-08 macOS bridge dylib, as no v09 existed then, the default build
+its production bridge). The matrix: 162 generated contents (real LAME and
+ffmpeg MP3 and synthetic MPEG streams of every tag and rate variant, Layer I/II,
+WAV, AIFF, AIFF-C, CAF, M4A ALAC/AAC/Opus, 3GP, ADTS, FLAC, hand-built Ogg
+headers, stubs, MP3-in-WAVE, random, empty and one-byte files) under 721
+(content, extension) cells; `inspect`, `analyze` and `process` on both binaries,
+4,326 runs per matrix.
+
+1. *Matrix.* Before the admission fix `portable` equalled the macOS default
+   build in 624, 511 and 479 of 721 cells (`inspect`, `analyze`, `process`);
+   after it, in 669, 556 and 546. Every remaining difference is classified (0
+   unclassified): SRC not reproduced 0/112/122, AAC 20/20/20, FLAC by content
+   8/8/8, Ogg 12/12/12, unverified variants 8/8/8, MP3-in-WAVE 4/4/4, and one
+   pre-existing FLAC-reader cell for `analyze` and `process`. 28 cells whose
+   portable output changed (22 MP3 cells from the buffer-tail fix, 6 ALAC and
+   mono-WAV files named `.mp3` that macOS decodes as MPEG) now all equal the
+   macOS default output.
+2. *Admission rule.* `tests/fixtures/mp3-exact/admission.json` records 500 cases
+   (421 identical to macOS, 79 typed platform refusals) and is replayed by
+   `portable_mp3.rs` without Apple; the old routing fails 3 tests (194 of 500
+   cases differ).
+3. *Buffer tails.* `tests/fixtures/mp3-exact/tails.json` records 188 recordings
+   over 62 inputs (164 with a written tail); a reader that writes only the
+   delivered frames fails 164 of them. At reader level Apple default and
+   `portable` are identical on 14,274 recordings (2,379 files, 512, 100 and 4096
+   frames, planar and interleaved).
+4. *End to end.* 2,379 MP3 inputs named `.mp3` (the 315 pack members and 2,064
+   prefixes of them: 1 to 8 whole frames, some with 7 bytes cut off): `inspect`
+   identical in all; `analyze` identical except the documented missing waveform
+   (563 cells, non-44.1 kHz) and sample-rate refusals; `process`: both builds
+   processed 922 inputs, **910 with byte-identical output SHA-256** and 12
+   different; only the default build processed 946 (MP3 at 8, 11.025, 12, 16 and
+   24 kHz and 24 kHz output: sample-rate conversion); both refused 511 (486 with
+   the same code and stage, 25 with the sample-rate refusal against an Apple
+   failure). The 12 are synthetic fuzz-profile streams (`p_intensity1`,
+   `p_long`, `p_linbits`; no LAME or ffmpeg input is among them): the decoded
+   samples are identical to Apple's at reader level and a WAV of them processes
+   identically on both builds, but Apple's own output for these streams depends
+   on what the process decoded before (the same file read planar, planar,
+   interleaved at 44.1 kHz and planar again gives a different last pass, which
+   is the order the engine decodes in), which a port cannot reproduce.
+5. *Default build unchanged by the slice.* Default build before and after the
+   admission edits: 721 of 721 cells identical in all three commands, output
+   SHA-256 included. The slice was run on macOS only (no Linux run; the tests are
+   platform independent by construction).
+
+Remaining documented differences between the macOS default build and
+`portable`/Linux for these inputs, all typed refusals or reference quirks:
+
+| Class | What | Portable answer |
+| --- | --- | --- |
+| Sample-rate conversion | MP3 at 8, 11.025, 12, 16 and 24 kHz (analysis, process); WAV, AIFF and AIFF-C below 44.1 kHz such as 22.05 and 8 kHz; MP3 24 kHz output; Layer II 22.05 kHz (macOS: `decode_failed` mid-read) | `unsupported_sample_rate_conversion` |
+| AAC | ADTS, MP4 `mp4a` under any non-`.mp3` name | `unsupported_input_codec` |
+| FLAC by content | `fLaC` data under a name not ending in `flac` (Apple's FLAC reader decodes it) | `unsupported_input_codec` |
+| Ogg by content | Ogg Opus under a name that is neither `.mp3` nor `.opus` (Apple opens it); Ogg FLAC and Vorbis variants (Apple: `'fmt?'`, `'dta?'`) | `unsupported_input_format` |
+| Unverified variants | stereo IMA4 AIFF-C (macOS opens), Opus in MP4 (macOS: `'pck?'`, `invalid_input_file`) | `unsupported_input_format` |
+| MP3 in WAVE (tag 0x55) | macOS: `'dta?'` for the usual layouts, opens some | `unsupported_input_codec` |
+| ID3-prefixed WAVE | not a difference through the CLI: the tag stage refuses it before any reader opens it (`marker_unverifiable`, stage `inspect tags`) on every build, macOS included; the reader's own typed refusal (`unsupported_input_format`) is reachable only through the library API | typed |
+| ADTS-like garbage | macOS answers `'typ?'`, `'fmt?'`, `'wht?'`, `'dta?'` or opens (the ADTS sniff rule was fitted on 17,000 random headers and has 4 outliers, at frame length 8 or 9) | AAC refusal or `'typ?'` |
+| CAF | the engine never reaches the reader (the tag stage refuses CAF as `marker_unverifiable` on both builds); the reader handles float32 CAF only | typed |
+| MP3 over 2 GiB | refused (decoded from memory) | `unsupported_input_format` |
+| Apple decoder state | 12 synthetic fuzz streams: Apple's second decode in one process differs from its first | not modelled |
+
+Not differences (identical on both builds): every `inspect` cell whose
+container the engine's tag stage accepts; `m4p`, `wl.mp3`, `ogg`, `opus`, `caf`,
+`mp2`, `flac`-named and extension-less inputs (refused before the reader, same
+codes); the MP3 analysis waveform, which `portable` omits for non-44.1 kHz input
+(`waveform_unavailable`, an existing guard). One observation that is not about
+MP3 and is unchanged since v0.2.0: an Apple-encoded FLAC (`afconvert`) named
+`.flac` is read by the macOS default FLAC path as 16,384 of 17,640 frames
+(analysis volume `-Infinity`) and by `portable` as all 17,640; engine-encoded
+FLAC is identical on both, and the v0.2.0 release binary reproduces the 16,384.
+This is left as is.
+
+### Opus evidence
+
+v0.3.0 adds one opt-in format. **Platinum Notes refuses `.opus`, so there is no
+reference to match**: nothing below is a parity claim, and each Opus item says
+so in `report.no_platinum_notes_reference`. The claim is narrower and different:
+*the same input and settings give the same output bytes on macOS default, macOS
+`portable`, Linux aarch64 and Linux x86_64*. Everything in the processing chain
+other than the Opus layer is unchanged. The Opus corpus runs below were made
+on the v0.2.0 candidate tree plus the Opus patch, that is before the exact MP3
+reader existed, so their MP3-input refusals on `portable` and Linux are those of
+that tree; the measured numbers are reproduced unchanged.
+
+The evidence is in `local-artifacts/opus-lane-01/` (scripts, generated inputs,
+per-build results and logs; no real media):
+
+1. *Default-off equivalence.* `tests/opus_cli.rs`: with `formats.opus` off,
+   discovery ignores `.opus`, `inspect` reports the unchanged
+   `unsupported_input_format`, `.ogg` stays unsupported, `--format opus` is
+   refused with `opus_not_enabled`, and a default state file has no new member.
+2. *libopus identity.* The fixed-point, no-SIMD, no-float libopus 1.6.1 built by
+   `tools/linux/build-libopus.sh` was run through a 1,159-case, 127,032-packet
+   encode/decode matrix (all frame sizes and TOC configurations, bitrates,
+   VBR/CVBR, complexity, bandwidth, DTX/FEC, mid-stream control changes, PLC,
+   FEC recovery, corrupted packets) on Apple clang (macOS arm64), gcc 12 and
+   clang 14 (Linux aarch64 and x86_64) at `-O0/-O2/-O3` and LTO: 20 builds, one
+   byte-identical result file. RFC 8251 vectors 01 to 12 pass (24/24) on three
+   platforms with identical decoded streams. The same build under UBSan was
+   clean. An arm64 NEON build is **not** bit-exact against the C code (74 of
+   1,481 lines differ; `silk_warped_autocorrelation_FIX_neon`) and an x86
+   SSE4.1/AVX2 build is, which is why the product build disables intrinsics.
+   The shipped Linux libraries are rebuilt by the real `linux/Dockerfile` and
+   equal the standalone results for clang 14.0.6 (receipts in
+   `libopus/release-image/`).
+3. *Ogg Opus conformance.* An independent verifier written from RFC 3533, 7845
+   and 6716 (`corpus/verify_ogg_opus.py`) checks every file the CLI wrote:
+   valid and supported, one logical stream, OpusHead version 1 / family 0 /
+   48 kHz / pre-skip 312 / output gain 0, EOS present, exact sample count, the
+   source comments verbatim and in order (minus the old marker and R128 gain
+   tags), exactly one new marker where the report says `present`, pictures
+   byte-identical. ffmpeg decodes 268 reference outputs to the same frame count.
+4. *Four-build corpus.* A generated 392-file corpus (206 valid Opus files:
+   11 signals mono and stereo, durations from one sample to 3 minutes, bitrates
+   6 to 510 kbit/s, CBR/VBR/CVBR, 2.5 to 120 ms frames, applications, input
+   rates 8 to 48 kHz, pre-skip, gain, initial-granule and end-trim variants,
+   page layouts, tag and picture variants; 26 WAV/FLAC/ALAC/AAC/MP3/AIFF sources;
+   160 hostile files) gives 1,156 engine cases. On all four builds: 794 cases
+   identical in output SHA-256 and reported fields, 346 refused with the same
+   code, 16 documented platform refusals (MP3/AAC input and MP3 artwork on the
+   builds that did not have them at that tree), **0 different**.
+5. *Generated PCM to Opus.* 54 48 kHz WAV sources (17 signals including
+   silence, DC, sweeps, noise at -6/-30/-60 dBFS, impulses, clipped, music-like
+   and speech-like material, mono and stereo, 16 and 24 bit; lengths of 1 to
+   580,321 frames around the 960-sample frame and 312-sample lookahead): 54 of
+   54 identical on all four builds.
+6. *Opus to the other formats.* WAV, AIFF, FLAC, MP3 and AAC outputs of six
+   sources (tags, pictures): 20 identical, 10 documented platform refusals
+   (AAC output only exists on macOS default; artwork conversion on `portable`
+   and Linux without the opt-in), none different. ALAC bytes carry the wall
+   clock in the MP4 header, so ALAC is run with the hidden
+   `--controlled-mp4-time-1904`: 4 identical, 2 artwork refusals.
+7. *Hostile input.* 160 damaged or out-of-scope files (bit flips, truncation at
+   every kind of boundary, bad checksums, sequence/serial/granule faults,
+   chained and multiplexed streams, mapping families 1 and 255, more than two
+   channels, zero-length and oversized packets, comment headers up to and just
+   over the 64 MiB limit, non-Opus Ogg, non-Ogg bytes): none crashed and a
+   refused file publishes nothing; every refusal or acceptance is in the expected class
+   (160/160) and 130 carry exactly the corpus's code. The rest differ only in
+   which check reports first (a non-Ogg file is reported by the marker check as
+   `marker_unverifiable`; a malformed packet is `invalid_input_file` at scan
+   time rather than `decode_failed`). `h_page_continued_first_audio` is
+   RFC-valid (the lost first packet is dropped) but is refused rather than
+   silently shortening the audio. Three fuzz tests (random damage, valid
+   checksums, corrupt packets) run in the unit tests.
+8. *Test counts per build* (`--include-ignored`, with the library, bridge and
+   pins supplied): `cargo test --lib opus::` 32 passed, `tests/opus_cli.rs` 7
+   passed, `tests/error_codes.rs` 19 passed on macOS default, macOS `portable`,
+   Linux aarch64 and Linux x86_64.
+9. *Library-gated Linux lane.* `tools/linux/build-cli.sh` (non-root, read-only
+   tree, `PN_LINUX_RUN_TESTS=1`) on the frozen v0.2.0 tree plus the Opus patch:
+   the build, the all-target tests (480 passed, 0 failed; 131 ignored on aarch64,
+   129 on x86_64) and the 34 library-gated tests (`error_codes` 7, `linux_opt_in`
+   14, `portable_art_copy` 5, `opus_cli` 4, Opus unit tests 4) pass on both
+   architectures.
+
+Limits: mapping family 0 (mono and stereo) only; 48 kHz processing with no
+sample-rate conversion (other rates, more than two channels and chained or
+multiplexed streams are refused with codes); no Opus waveform view; the ALAC
+and AAC MP4 clock caveat and the Linux artwork and AAC refusals are the
+existing ones (MP3 input is decoded exactly on Linux and `portable` since
+v0.3.0). Float builds of libopus are not accepted (they import libm and
+their output depends on FMA contraction); the loader runs a known-answer test
+and refuses a library whose output differs.
+
+### Tag bridge v09: evidence
+
+Synthetic audio and synthetic images only; the native Platinum Notes application
+was never launched. Receipts are in the private evidence directory.
+
+1. *Flag off, retained v08/v07 matrices* on Linux aarch64 and x86_64: 604
+   transfers, 86 inspections, 232 source-status cases, 36 legacy-MPEG cases, 37
+   fault runs and 9 WAV-mode cases, identical to the retained v07 reports
+   (ignoring only bridge digest, platform and temporary paths). The macOS
+   portable v09 dylib against the native v07 production bridge: 690 rows, 0
+   failures, 112 expected refusals; its 232 source-status rows equal v08's. No
+   behavioural difference with the flag off.
+2. *Artwork matrix.* 1,188 cases and 1,781 bridge runs (v08: 887 and 1,293), 0
+   failures on aarch64, x86_64 and the macOS portable dylib, and the 1,781
+   results (status, message, result flags, output SHA-256, callbacks, marker,
+   TagLib read-back) identical between the two Linux architectures. The new WAV
+   cells cover every pair FLAC/MP3/AIFF/MP4/WAV to WAV and WAV to
+   FLAC/MP3/AIFF/MP4 for JPEG, PNG, GIF, BMP and WebP, 21 picture types, three
+   description encodings, multiple, empty and mixed-empty pictures, the 41 valid
+   corpus images, bad images refused with the destination unchanged, 10 MB and
+   17 MB pictures and destinations that already hold artwork. Verified by TagLib
+   read-back, by independent standard-library parsers and on the host (ffprobe
+   and ffmpeg extracted 1,341 pictures byte for byte, `metaflac` 330 pictures,
+   586 decoded-audio MD5s; 0 failures, WAV outputs included); audio payload bytes
+   are unchanged. Against v08 on the 1,285 shared cells, 96 results differ, all
+   of them WAV cells with the flag on.
+3. *ID3 size-limit cells.* 40 cells per architecture, 0 failures, identical on
+   both (68 records): sixteen near-maximal FLAC pictures, one huge ID3 picture,
+   eight UTF-16-description pictures and a destination holding a 200 MB `PRIV`
+   frame, into MP3, AIFF and WAV, with the rendered tag exactly on the limit
+   (accepted, size field 268,435,455, re-reads, pictures byte-equal), one byte
+   over only because of the marker frame (refused after the serialize callback,
+   nothing written) and one byte over from the pictures alone (refused before any
+   callback). v08 accepted all 28 over-limit cells it was given: the 24 MP3 and
+   AIFF ones were written with a wrapped size field (0 for exactly 2^28), and a
+   WAV stored no picture at all.
+4. *Tests.* `portable_art_copy` has 12 tests (7 new); 12 of 12 pass with the
+   macOS v09 dylib (`--features portable`, together with `linux_opt_in` 17 of 17
+   and the three `tags_reference` WAV-chunk tests) and in the codec09 images on
+   aarch64 and x86_64, run in the `build-cli.sh` form (read-only tree, offline
+   registry). The new tests fail against the v08 dylib (7 of 12).
+5. *Real engine path.* The `platinum` CLI (`--features portable` on macOS, and
+   the Linux release binary built by `build-cli.sh` in each image): tag-less
+   FLAC, MP3, ALAC (M4A), AIFF and WAV sources with PNG, JPEG, WebP, a
+   four-picture set and none, converted to WAV, FLAC, MP3, AIFF and ALAC with the
+   setting on and off: 240 runs, 0 failures on macOS, aarch64 and x86_64,
+   identical records. On: every source to WAV and WAV to FLAC, MP3, AIFF and
+   ALAC keep the picture bytes (type and description kept except for MP4, which
+   has none), and items list `artwork_copy` (plus `wav_tag_preservation` into a
+   WAV); WebP into ALAC and out of a WAV is refused like any source. Off:
+   unchanged; no picture is carried into or out of a WAV (35 WAV-involved runs
+   succeed without pictures), the other generic copies are still refused with
+   `artwork_conversion_unavailable`, and WAV to WAV loses the ID3 chunk as before.
+6. *Hardening.* `readelf` on both architectures: `BIND_NOW`, `FLAGS_1 NOW`,
+   `GNU_RELRO`, undefined `__stack_chk_fail` and `__memcpy_chk`, and exactly the
+   nine ABI exports. A fresh build of the real `linux/Dockerfile` and a derived
+   image gave the same bridge, libFLAC, LAME and libopus digests on both
+   architectures, and a container compile reproduced the pinned bridge.
+
+`PN_COPY_MP4_TO_ID3` (the unflagged direct M4A-to-MP3 copy) has no size check:
+reference parity, outside this change. The x86_64 base image is the ns2 rebuild
+from v0.1.0 that v08 used; its libFLAC and LAME digests equal the pins.
+
+All counts describe the recorded synthetic corpora and environments and are not
+a universal parity proof.
+
+### v0.3.0 release evidence (freeze-01)
+
+The release tree is the frozen snapshot `freeze-01` (747 files; source manifest
+SHA-256 `17e875b02efa5668690ab7d5ac6f97418b28c0ad0857fa9f5e45c5cb134d1396`,
+snapshot manifest `d0077b33c1c79710c83ef63a84a83fa44c3f7643ee3f317df3a0faeb3c7f48f5`;
+the build left the source unchanged). The text of README, this guide, LINUX.md,
+the CLI contract and `release.yml` changed after the freeze (documentation and
+workflow pins only; no source file).
+
+| Binary | SHA-256 |
+| --- | --- |
+| macOS arm64 (source and path remapped, 0 `/Users/` paths) | `fa4e1f3e0a8c3bbac1f54ff0363006336c52fca7e00852e6d1cef1a898ffdd6d` |
+| Linux aarch64 | `7157424200dd277949a90fec5d9c44e56560ca7613846f32d1e11bd152be6d8d` |
+| Linux x86_64 | `c4e5e9539dda255b521ac2251ff297c7e5429b0976a42785bc8896b6b0907676` |
+
+The macOS binary differs from v0.2.0's (`75c2ac87…`) because the exact-MP3
+module, the Opus layer, the decoder read pin and the identity mappings are
+compiled into it, so the whole macOS battery was rerun on it.
+
+1. *All-target tests on the frozen tree.* Linux aarch64 532 passed, 0 failed,
+   147 ignored (50 suites); x86_64 530 passed, 0 failed, 145 ignored. The
+   library-gated lane (`error_codes`, `linux_opt_in`, `portable_art_copy`,
+   `opus_cli`, the WAV tag bridge tests and the Opus unit tests, with the pinned
+   native libraries) passed 48 of 48 on each architecture. macOS default from the
+   snapshot: 569 passed, 0 failed, 200 ignored (50 suites), plus public-dependency
+   38, waveform 1, `mp3-xing` 1, `error_codes` 8, `opus_cli` 4, Opus unit tests 4,
+   `sp_pin_tests` 6 and 184 Node tool tests (154 `parity-matrix` tests, which now
+   include the v0.3.0 `formats` members, and 30 others).
+2. *macOS battery* on `fa4e1f3e…` (receipt `release-final-fa4e1f3e.json`, SHA-256
+   `36bb6d5d1c7702a3609bb4bb489e8ac1d078b7533cdc537f01481170d5d786b8`; no
+   failure, no unclassified difference): 71/71 retained replay cases, 8/8
+   dynamics and pitch cases, 10/10 controlled-clock MP4 exports, the E05 case,
+   5/5 boundary files, 11/11 strict family cases, 6/6 coverage extensions, the
+   documented expected failures (u02: 5, f01: 4), the CLI smoke, the W04 exact-path
+   workflow and the three workflows; 13/13 synthetic AAC outputs equal to the
+   v0.1.0 and v0.2.0 binaries and 4/4 native AAC references on all three; every
+   per-case output digest (120/120) and status (131/131) equals both the v0.1.0
+   and the v0.2.0 baselines, and default behaviour matches both on 212/212
+   comparison records. The only differences are the announced ones: the new
+   `formats` and `formats_effect` members of the effective configuration, the
+   reworded `parity_effect.note`, `inspect` of a symlink (including a dangling or
+   directory symlink) reporting `invalid_input_path` instead of `io_error`, and
+   `inspect` of a FIFO returning `invalid_input_path` instead of blocking. A macOS
+   default MP3 reference of 315 pack members x inspect, analyze and process into
+   WAV, AIFF, FLAC, MP3, ALAC and match-input (4,310 rows) matches the admission
+   matrix (709/721 cells identical; the other 12 use seven afconvert-made
+   contents that are not byte-reproducible). Three synthetic fuzz members
+   (`fuzz/p_reservoir/p_reservoir_1_0022`, `fuzz/p_long/p_long_1_0024`,
+   `fuzz/p_intensity1/p_intensity1_1_0062`) give different bytes on repeated runs
+   of the same macOS binary, and did so identically in the v0.1.0 and v0.2.0
+   binaries: any macOS reference for them is a set of outputs, and the Linux
+   output equals one of them.
+3. *Linux battery* (receipt `receipt-freeze-01.json`, SHA-256
+   `8f9350e166b5069289563006df2a435add08348796f42787fb53e8eff9dd313b`; 83
+   independent checks of the receipt pass; the loaded libraries of every run were
+   verified against the approved digests; aarch64 and x86_64 are identical on every
+   scenario and step):
+   - Opt-in off: native references 113 exact, 16 typed refusals and 3 matching
+     native errors on both architectures (v0.2.0: 104, 25, 3; 24 case-level
+     differences, all in the intentional-change ledger: MP3 inputs and a file of Ogg
+     bytes named `.mp3` that now equal the recorded Platinum Notes output, and a
+     changed message for three misnamed Ogg files), 16/16 workflows, 535 of 575 stress
+     cases byte-identical to the macOS default build (40 sample-rate refusals), 30/30
+     pitch cases, the Docker Desktop bind subset 44 exact + 2 refusals + 1 native
+     match + 16 workflows; a new 500-case corpus (20 generated MP3 sources x 5
+     templates x 5 output formats): 400 byte-identical to the macOS default build,
+     100 sample-rate refusals (16, 11.025, 8 and 24 kHz sources), none different.
+   - Exact MP3 input, no setting, against the macOS default build: 315 pack
+     members, 146 corpus, 172 prefix and 721 admission scenarios, all verified
+     (1,167 + 904 + 967 + 515 identical items; the same typed refusals; sample-rate
+     refusals; documented classes only: AAC, Ogg by content, unverified variants,
+     FLAC by content, MP3 in WAVE; the 28 hits of the Apple-state class are the
+     fuzz members above, each backed by repeated macOS runs).
+   - Cover art and WAV tags: 207 scenarios and 8 ID3-limit cells (both sides of
+     268,435,455). Error codes: 245 scenarios, 3 limit cases and 3 SIGINT cases; the
+     39-code ledger is accounted for (33 observed through the CLI, 5 not reachable
+     from it, 1 through SIGINT). Opus: 26 input/output scenarios and 7 valid-stream
+     scenarios; the Opus output (791 identical items) equals macOS default and macOS
+     portable.
+4. *AAC decode read pin.* Versus the v0.2.0 binary, 43,380 engine results over 525
+   generated AAC files (afconvert, the engine's own AAC output, ffmpeg streams with
+   PNS, intensity and TNS, 120 held-out ffmpeg streams and 235 Apple-encoded
+   streams) with environment padding of 0 to 400 KiB, `--jobs` 1 to 10, batches and
+   long paths: 0 differences; a deliberately wrong pin (residue 16, the SME class)
+   changed 455 of 474 class-sensitive `analyze` and 445 of 470 `process` results,
+   so the corpus discriminates; a debugger breakpoint on `ExtAudioFileRead` saw
+   `sp % 64 == 0` in all 336 sessions.
+5. *Reviews.* A static security review, a code review and a hands-on security
+   review (631,050 mutated MP3 streams and 657,996 structure-aware Ogg Opus files
+   through the real libopus without a panic, hang or out-of-range read; the bridge
+   with TagLib 1.11.1 under ASan and UBSan over about 75,000 calls with no report;
+   all downloads hash-pinned) found no critical, high or medium issue. Fixed before
+   the freeze: a missing `libraries.opus` path now reports `library_load_failed`;
+   libopus is handed to readers only while `formats.opus` is on (a processed file's
+   recorded original ending in `.opus` could otherwise be decoded with the format
+   off); an Opus stream whose end-of-stream page ends in an unfinished packet is
+   refused; a FIFO named as an input or recorded original no longer blocks the macOS
+   `inspect` and `analyze`; the verification tools accept the new default `formats`
+   members; a disallowed `f64::max` in an Opus test; stale comments and the
+   release-tooling and notice defects the review found. The bounded limits that
+   remain are listed in [LINUX.md](LINUX.md#hostile-input-limits). Open for the
+   maintainer: the provenance of the MP3 reader (see `THIRD_PARTY_NOTICES`).
+
+
 ## v0.2.0 changes and evidence
+
+This section and the next record what v0.2.0 shipped, as published. Where v0.3.0
+supersedes a statement it says so; the superseded text is kept for the record.
 
 v0.2.0 adds one explicit opt-in and one reporting contract and pins one native
 call context; it changes no processing numerics.
@@ -39,9 +558,13 @@ call context; it changes no processing numerics.
   executable is byte-identical with and without it. Each
   affected item lists the path in `report.non_identical_paths`. With the setting
   off, Linux behavior is the v0.1.0 identical-or-refuse behavior; on a macOS
-  default build it has no effect.
+  default build it has no effect. **Superseded in v0.3.0:** the open-source MP3
+  decoder and its `mp3_decode` member are gone, replaced by the exact reader
+  that needs no setting; the setting now enables only the cover-art copy and the
+  WAV tag chunks.
 - **Error codes.** Every failed item, batch error and top-level error carries a
   stable `code`; the table is in the [CLI contract](../research/CLI_CONTRACT.md#error-codes).
+  (37 codes in v0.2.0, 39 in v0.3.0.)
 - **Unchanged.** Exit statuses, the command line, no-clobber and atomic
   publication, ALAC, and AAC refusal on Linux (now with a code).
 - **macOS AAC call context.** AudioToolbox's AAC encoder runs its 512-point DFTs
@@ -62,6 +585,8 @@ call context; it changes no processing numerics.
   process-environment sizes, and the four native references still match. This is
   an observation of the tested macOS arm64 AudioToolbox, not a cross-version
   guarantee; the evidence is in `local-artifacts/release-v0.2.0/aac-layout-control-01/`.
+  **Superseded in v0.3.0:** both `ExtAudioFileRead` call sites, including the
+  interleaved one, now use the trampoline too (see v0.3.0 above).
 
 The evidence for this release is kept separate by claim, and ignored tests are
 never counted as passes:
@@ -75,9 +600,11 @@ never counted as passes:
 2. *Default-off equivalence on Linux.* The same refusals, with the same messages
    and now with codes, for MP3 and AAC input, AAC output, unreproduced
    sample-rate conversion and artwork that needs Apple image transcoding.
+   (MP3 input is no longer refused in v0.3.0.)
 3. *Opt-in end to end on Linux.* Generated MP3 inputs and cover-art sources
    processed with the setting on; the reported `non_identical_paths`, the
-   byte-for-byte picture comparison and the decoder's own tests.
+   byte-for-byte picture comparison and the decoder's own tests. (The MP3 part
+   exercised the open-source decoder that v0.3.0 replaced.)
 4. *Error codes.* Unit tests for every typed mapping and stage label, CLI
    scenarios per reachable code, and a test that keeps the documented table,
    `ErrorCode::ALL` and the scenario ledger identical.
@@ -163,8 +690,10 @@ Every output hash is identical to the v0.1.0 receipts (0 differences in each
 corpus). Default-off comparisons against the v0.1.0 Linux executables on the
 same 16 inputs: 248 records on each architecture, 0 stable differences, tagged
 WAVs included. With the setting **on**, aarch64 and x86_64 agree on every step:
-MP3 175/175 scenarios, cover art 184/184 scenarios (896/896 cells) and error
-codes 174/174 scenarios covering the 37/37-code ledger. `wav_tag_preservation`
+MP3 175/175 scenarios (these exercised the open-source decoder that v0.3.0
+replaced), cover art 184/184 scenarios (896/896 cells) and error
+codes 174/174 scenarios covering the 37/37-code ledger (v0.2.0's; v0.3.0 has 39
+codes). `wav_tag_preservation`
 is declared on 53 items and never in a setting-off step; against v0.1.0 only the
 cross-format WAV outputs (AIFF, ALAC and FLAC to WAV) differ and each lists it.
 
@@ -173,15 +702,23 @@ cross-format WAV outputs (AIFF, ALAC and FLAC to WAV) differ and each lists it.
 - A RIFF/WAVE file named `.mp3` is processed by content on Linux, with the
   setting on or off; the macOS default build refuses it with
   `invalid_input_file` because the Apple stack chooses by extension. This
-  predates v0.2.0.
+  predates v0.2.0. **Superseded in v0.3.0:** Linux and `portable` refuse it as
+  `invalid_input_file` too (a name ending `.mp1 .mp2 .mp3 .mpa .mpeg` commits to
+  the MPEG reader).
 - `inspect` on a symlink returns `invalid_input_path` as the contract says on
-  Linux; the macOS builds return `io_error`.
+  Linux; the macOS builds return `io_error`. **Superseded in v0.3.0:** macOS
+  reports `invalid_input_path` (stage `inspect source identity`) as well.
 - W03 early cancellation depends on signal timing; when the first attempt does
   not land in the analysis stage it is reconciled with the separate one-signal
   probe, as in v0.1.0 (the original attempt is retained).
 - With the setting off, an MP3 with junk bytes before its first frame and no
   ID3 tag is classified `unsupported_input_format` on Linux, while macOS decodes
-  it. The open-source decoder claims only confirmed MP3 streams.
+  it. The open-source decoder claims only confirmed MP3 streams. **Superseded in
+  v0.3.0:** the exact reader decodes it on Linux exactly as on macOS (it
+  reproduces AudioFile's stream search), with the setting on or off; data that is
+  not MPEG audio under an `.mp3` name is refused by the MPEG reader
+  (`invalid_input_file`, `'dta?'`) as on macOS, and under other names it is
+  identified by content (see [LINUX.md](LINUX.md#mp3-input)).
 - The direct M4A-to-MP3 picture path is the reference path (not the opt-in
   copy); its ID3 picture has type 0, no description, and `image/png` for GIF,
   BMP and WebP bytes, as on macOS.
@@ -194,11 +731,18 @@ cross-format WAV outputs (AIFF, ALAC and FLAC to WAV) differ and each lists it.
   on even a source without tags gains an `ID3 ` chunk (`TBPM` "0", empty `TKEY`)
   and lists `wav_tag_preservation`; a v0.3.0 follow-up will consider keeping only
   chunks that carry source data. An MP3-to-WAV copy carries the text tags but
-  never a picture.
+  never a picture. **Superseded in v0.3.0:** with the setting on a cross-format
+  copy carries the picture into and out of a WAV; the tempo-and-key ID3 chunk
+  policy is unchanged and open.
 - Follow-ups for v0.3.0 include a stricter preflight for very large pictures
   converted to ID3 (about sixteen 16 MiB FLAC pictures can pass the current
   check and still exceed the ID3 size limit; the likely effect is a failed item,
   not a corrupt publication) and hardening flags for the bridge build.
+  **Superseded in v0.3.0:** both are done, and the evidence disagrees with the
+  expectation above: v0.2.0's bridge did let such tags through and TagLib wrote
+  a wrapped size field (0 for exactly 2^28), so the effect was a corrupt tag, not
+  a failed item, which the v09 preflight now refuses (see "Tag bridge v09:
+  evidence").
 
 All counts describe the recorded synthetic corpora and environments and are not
 a universal parity proof.
@@ -626,6 +1170,18 @@ DSP controls were replayed unchanged. These are bounded observations, not a
 guarantee for other compiler or macOS versions. Investigation receipts:
 `local-artifacts/hash-parity/aac-regression-01/`.
 
+Since v0.3.0 the alignment wrapper is no longer what fixes the decoder's class.
+AudioToolbox's AAC decoder selects its 512-point inverse-transform kernel per
+`ExtAudioFileRead` call from the stack-pointer residue (`sp % 64 == 16` runs the
+SME kernel, class S; every other residue the NEON kernel, class G), and the
+planar and interleaved reads entered at a residue that frame layout alone
+selected (0 in the shipped v0.2.0 binary). Both call sites now go through the same
+`call_with_sp_residue` trampoline as the encoder's write and dispose calls with
+`READ_SP_RESIDUE` 0, class G by construction; the `#[repr(align(64))]` list
+wrappers remain. The pin is meant to leave every output unchanged, and its
+verification is part of the v0.3.0 release evidence. It is an observation of
+the tested macOS arm64 AudioToolbox, not a cross-version guarantee.
+
 An opt-in regression test checks exact decoded sample words for the pinned
 generated `aac-repeat-01.m4a` fixture:
 
@@ -760,6 +1316,13 @@ A separate opt-in replay consumed three captured native waveform-component input
 ## Public source boundary
 
 The public repository starts with independent history. It includes Rust and portable sources, public TagLib bridge sources, synthetic tests, the reviewed FFT coefficient table and compact test fixtures, Linux build recipes, build instructions, typed preset parameters and the transformed human-readable template configuration required by the CLI. It excludes original serialized preset blobs, extracted compiled resources, screenshots, decompiler/disassembly exports, native libraries, audio captures and private research history. Optional reference tests may contain authored probe code or expect separately supplied captures; their presence does not mean those captures or proprietary components are distributed or needed by the production CLI. Static reconstruction and measured values are reference-derived, not a clean-room or licensing-clearance claim.
+
+The exact MP3 reader's checked-in fixtures (`tests/fixtures/mp3-exact/`) are
+generated audio only, recorded against AudioToolbox on the reference machine.
+The full corpora (about 0.9 GB of deterministic regenerations), the Apple
+reference dumps, the debugger sessions and the generator and verifier scripts of
+the decoder's numeric tables stay in the private evidence; the table files carry
+provenance comments naming the Apple binary and addresses they were read from.
 
 Some source comments and explicitly ignored diagnostics intentionally name
 `local-artifacts` paths for private evidence. The ignore file and developer

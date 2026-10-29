@@ -1,8 +1,11 @@
 // Portable implementation of the ABI in taglib_bridge.h.
 // Generic copies that may require NSImage/ImageIO artwork transcoding refuse
 // before saving or invoking callbacks with status 2 and a diagnostic. Direct
-// copies, marker operations, inspection, and generic copies to WAV do not
-// transcode artwork. Nonempty but undecodable artwork also refuses because
+// copies, marker operations, inspection, and generic copies to or from WAV do
+// not transcode artwork: the reference never moves a picture into or out of a
+// WAV on a generic copy, and without PN_TAG_COPY_ARTWORK_BYTES neither does
+// this bridge (with it, WAV is an ID3-capable container like MP3 and AIFF).
+// Nonempty but undecodable artwork also refuses because
 // NSImage validity cannot be determined on Linux. Empty artwork is skipped by
 // the reference and its corresponding destination artwork is cleared.
 // No Apple frameworks are used.
@@ -365,9 +368,15 @@ struct State {
         if (xiph) { if (s.isEmpty()) xiph->removeField("INITIALKEY"); else xiph->addField("INITIALKEY", s, true); }
         set_text(v2, "TKEY", s.isNull() ? String("") : s);
     }
-    bool supports_images() const { return format != PN_TAG_WAV; }
+    // Pictures in a WAV's ID3 chunk are invisible to the reference: its setters
+    // never touch them and a WAV source never supplies any. Under
+    // PN_TAG_COPY_ARTWORK_BYTES (artwork_bytes) WAV is an ID3-capable container
+    // like MP3 and AIFF.
+    bool artwork_bytes = false;
+    bool wav_images_hidden() const { return wav && !artwork_bytes; }
+    bool supports_images() const { return format != PN_TAG_WAV || artwork_bytes; }
     bool has_images() const {
-        if (wav) return false;
+        if (wav_images_hidden()) return false;
         if (m4) { auto &m = m4->itemListMap(); return m.contains("covr") && !m["covr"].toCoverArtList().isEmpty(); }
         if (flac) return !flac->pictureList().isEmpty();
         return first_frame(v2, "APIC") != nullptr;
@@ -384,7 +393,7 @@ struct State {
             auto images = flac->pictureList();
             for (auto i = images.begin(); i != images.end(); ++i)
                 if (!(*i)->data().isEmpty()) return false;
-        } else if (v2 && !wav) {
+        } else if (v2 && !wav_images_hidden()) {
             const auto &frames = v2->frameList("APIC");
             for (auto i = frames.begin(); i != frames.end(); ++i) {
                 Picture *picture = dynamic_cast<Picture *>(*i);
@@ -789,14 +798,48 @@ ArtList artwork_from_mp4(MP4::Tag *tag) {
 ArtList source_artwork(State &s) {
     if (s.m4) return artwork_from_mp4(s.m4);
     if (s.flac) return artwork_from_flac(s.flac->pictureList());
-    if (s.v2 && !s.wav) return artwork_from_id3(s.v2);
+    if (s.v2 && !s.wav_images_hidden()) return artwork_from_id3(s.v2);
     return {};
+}
+
+// An ID3v2 tag size is a 28-bit synchsafe integer that counts every frame and
+// the padding (not the 10-byte header). TagLib 1.11.1 does not check it and
+// writes the value modulo 2^28, which corrupts the tag header.
+constexpr uint64_t id3v2_max_tag_size = 0x0fffffffull;
+
+// The size field TagLib 1.11.1 will write for this tag, taken from its own
+// render: the frames as they are in memory plus padding (the old size when the
+// frames still fit into it, 1024 bytes otherwise), as the MPEG, AIFF and WAV
+// saves write it (version 4). render() records the new size in the tag's
+// header, where the real save reads it back as the old size to compute its
+// padding; restore it, so that checking changes no output byte. This copies
+// the whole tag once, as the save will.
+uint64_t id3v2_size_field(ID3 *tag) {
+    ID3v2::Header *header = tag->header();
+    const unsigned size = header->tagSize(), version = header->majorVersion();
+    const uint64_t rendered = tag->render(4).size();
+    header->setTagSize(size);
+    header->setMajorVersion(version);
+    return rendered - ID3v2::Header::size();
+}
+
+// Refuse, before anything is written, a destination tag that cannot be saved.
+// Run after the pictures are in the tag (the rendered size covers their frame
+// headers, MIME types, descriptions in the encoding they are rendered in, and
+// every other frame already in the tag) and again after the marker frame is
+// set, so the figure is the one TagLib will write.
+void require_id3_fits(ID3 *tag) {
+    if (!tag) return;
+    const uint64_t field = id3v2_size_field(tag);
+    if (field > id3v2_max_tag_size)
+        throw ArtworkTranscode("artwork copy refused: the destination's ID3v2 tag would be " + std::to_string(field) +
+                               " bytes with its pictures, other frames and padding, above the ID3v2 tag size limit of 268435455");
 }
 
 // Refuse before any destination change when the destination cannot hold a
 // picture as-is.
 void preflight_artwork(int format, const ArtList &pictures) {
-    uint64_t id3_total = 0;
+    uint64_t id3_data = 0;
     for (const ArtPicture &p : pictures) {
         const std::string number = std::to_string(p.ordinal);
         if (format == PN_TAG_MP4 && p.info.kind == ImageKind::WebP)
@@ -808,9 +851,13 @@ void preflight_artwork(int format, const ArtList &pictures) {
                 throw ArtworkTranscode("artwork copy refused: picture " + number +
                                        " exceeds the 16777215-byte FLAC metadata block limit");
         }
-        if (format == PN_TAG_MP3 || format == PN_TAG_AIFF) id3_total += 64ull + p.data.size();
+        if (format == PN_TAG_MP3 || format == PN_TAG_AIFF || format == PN_TAG_WAV) id3_data += p.data.size() + p.description.size();
     }
-    if (id3_total >= 0x0fffffffull)
+    // Cheap necessary condition, before the pictures are rendered: the tag
+    // holds at least the picture bytes and one byte per description character
+    // (the narrowest encoding). The exact size is checked by
+    // require_id3_fits once the frames are in place.
+    if (id3_data > id3v2_max_tag_size)
         throw ArtworkTranscode("artwork copy refused: pictures exceed the ID3v2 tag size limit");
 }
 
@@ -1842,11 +1889,13 @@ static void copy_generic(uint32_t flags, uint32_t &result, int sf, int df, const
     }
     State &source = *source_storage;
     State destination(df, dst, true);
+    const bool artwork_bytes = (flags & PN_TAG_COPY_ARTWORK_BYTES) != 0;
+    source.artwork_bytes = destination.artwork_bytes = artwork_bytes;
     bool copy_images = destination.supports_images() && source.has_images();
     ArtList artwork;
     if (copy_images && !source.images_are_empty()) {
         source.check_source();
-        if (!(flags & PN_TAG_COPY_ARTWORK_BYTES)) throw ArtworkTranscode();
+        if (!artwork_bytes) throw ArtworkTranscode();
         artwork = source_artwork(source);
         preflight_artwork(destination.format, artwork);
     }
@@ -1871,10 +1920,18 @@ static void copy_generic(uint32_t flags, uint32_t &result, int sf, int df, const
         destination.clear_images();
         if (!artwork.empty()) {
             place_artwork(destination, artwork);
+            // Everything is still in memory: refuse an ID3v2 tag that cannot be
+            // saved before the marker callback runs or anything is written.
+            if (artwork_bytes) require_id3_fits(destination.v2);
             result |= PN_TAG_RESULT_ARTWORK_COPIED;
         }
     }
     set_marker(destination, serialize, context);
+    // The marker frame and every other frame are now in the tag: the size TagLib
+    // will write is known, and a tag above the format's limit is refused
+    // instead of being saved with a wrapped size field. Without the opt-in
+    // this is the reference behaviour, unchecked.
+    if (artwork_bytes) require_id3_fits(destination.v2);
     require(destination.save(), "generic metadata save failed");
     if (destination.wav) require(rewrite_wav && rewrite_wav(context, dst) == 0, "WAV marker rewrite failed");
 }

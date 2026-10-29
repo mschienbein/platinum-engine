@@ -332,7 +332,7 @@ test('typed reference values are independently compared to candidate processing 
 });
 
 test('v0.2.0 default parity members of the effective configuration are accepted and nothing else is', async t => {
-  const note = "no effect in this macOS default build: Apple's decoder and image pipeline are always used, so this setting is stored but ignored";
+  const note = "no effect in this macOS default build: the reference paths (Apple's image pipeline and marker writer) are always used, so this setting is stored but ignored";
   const withMembers = x => Object.assign(x.values.r.details.effective_config, { parity: { allow_non_identical: false }, parity_effect: { effective: false, note } });
   await t.test('default members are accepted', t => {
     const x = makeCase(t); withMembers(x); x.save('r');
@@ -347,6 +347,29 @@ test('v0.2.0 default parity members of the effective configuration are accepted 
     ['missing effect note', config => { delete config.parity_effect.note; }],
     ['empty effect note', config => { config.parity_effect.note = ''; }],
     ['unknown configuration member', config => { config.other = 1; }]
+  ];
+  for (const [name, mutate] of rejected) await t.test(name, t => {
+    const x = makeCase(t); withMembers(x); mutate(x.values.r.details.effective_config); x.save('r');
+    const { result, report } = x.compare('candidate', x.review);
+    assert.equal(result.status, 2, result.stderr); assert.ok(report.flags.some(flag => flag.includes('effective configuration is incomplete or invalid')), JSON.stringify(report.flags));
+  });
+});
+
+test('v0.3.0 default formats members of the effective configuration are accepted and nothing else is', async t => {
+  const note = 'disabled: .opus files and opus output are refused exactly as in the original application';
+  const withMembers = x => Object.assign(x.values.r.details.effective_config, { formats: { opus: false }, formats_effect: { opus: false, note } });
+  await t.test('default members are accepted, with and without the v0.2.0 parity members', t => {
+    const x = makeCase(t); withMembers(x); x.save('r');
+    const run = x.compare('candidate', x.review);
+    assert.equal(run.result.status, 0, run.result.stderr); assert.equal(run.report.status, 'reviewed-complete-file-match-for-this-case');
+  });
+  const rejected = [
+    ['opus enabled', config => { config.formats.opus = true; }],
+    ['effect claimed', config => { config.formats_effect.opus = true; }],
+    ['unknown formats member', config => { config.formats.extra = 1; }],
+    ['unknown effect member', config => { config.formats_effect.extra = 1; }],
+    ['missing effect note', config => { delete config.formats_effect.note; }],
+    ['empty effect note', config => { config.formats_effect.note = ''; }]
   ];
   for (const [name, mutate] of rejected) await t.test(name, t => {
     const x = makeCase(t); withMembers(x); mutate(x.values.r.details.effective_config); x.save('r');

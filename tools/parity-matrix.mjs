@@ -720,7 +720,10 @@ function validEffectiveConfig(value, template, receipt, root, manifest) {
   // v0.2.0 adds `parity` and `parity_effect`; a candidate run may only carry the default-build, default-setting values.
   if (Object.hasOwn(value ?? {}, 'parity') && stable(value.parity) !== stable({ allow_non_identical: false })) return false;
   if (Object.hasOwn(value ?? {}, 'parity_effect') && !(onlyKnownKeys(value.parity_effect, ['effective', 'note']) && value.parity_effect.effective === false && typeof value.parity_effect.note === 'string' && value.parity_effect.note.length > 0)) return false;
-  return onlyKnownKeys(value, ['output', 'processor_max', 'mp3_mode', 'libraries', 'parity', 'parity_effect', 'selected_template', 'effective_selected_template', 'overwrite']) && Object.hasOwn(value, 'selected_template') && (value.selected_template === null || stable(value.selected_template) === stable(selection)) && positiveInt(value.processor_max) && value.mp3_mode === mp3 && validOutput(value.output, root) &&
+  // v0.3.0 adds `formats` and `formats_effect` (the opt-in Opus format); same rule: only the default-setting, disabled values.
+  if (Object.hasOwn(value ?? {}, 'formats') && stable(value.formats) !== stable({ opus: false })) return false;
+  if (Object.hasOwn(value ?? {}, 'formats_effect') && !(onlyKnownKeys(value.formats_effect, ['opus', 'note']) && value.formats_effect.opus === false && typeof value.formats_effect.note === 'string' && value.formats_effect.note.length > 0)) return false;
+  return onlyKnownKeys(value, ['output', 'processor_max', 'mp3_mode', 'libraries', 'parity', 'parity_effect', 'formats', 'formats_effect', 'selected_template', 'effective_selected_template', 'overwrite']) && Object.hasOwn(value, 'selected_template') && (value.selected_template === null || stable(value.selected_template) === stable(selection)) && positiveInt(value.processor_max) && value.mp3_mode === mp3 && validOutput(value.output, root) &&
     value.output.format === (format === 'match-input' ? 'match_input' : format) && selected.id === template?.unique_id && stable(args) === stable(expected);
 }
 function checkCandidate(root, manifest, receipt, value, context, label, flags) {

@@ -30,6 +30,9 @@ pub enum ErrorCode {
     InvalidInputFile,
     InvalidInputPath,
     NoInputFiles,
+    // Opt-in formats (settings `formats.*`).
+    OpusNotEnabled,
+    UnsupportedOpusVariant,
     // Processed-marker safety.
     AlreadyProcessed,
     MarkerAmbiguous,
@@ -71,6 +74,7 @@ impl ErrorCode {
         Self::UnsupportedInputCodec, Self::UnsupportedInputFormat, Self::UnsupportedOutputCodec, Self::UnsupportedOutputFormat,
         Self::UnsupportedSampleRateConversion, Self::ArtworkConversionUnavailable, Self::ProtectedSource,
         Self::InvalidInputFile, Self::InvalidInputPath, Self::NoInputFiles,
+        Self::OpusNotEnabled, Self::UnsupportedOpusVariant,
         Self::AlreadyProcessed, Self::MarkerAmbiguous, Self::MarkerUnverifiable, Self::MarkerInvalid,
         Self::TagCopyFailed,
         Self::LibraryNotConfigured, Self::LibraryUnapproved, Self::LibraryLoadFailed,
@@ -93,6 +97,8 @@ impl ErrorCode {
             Self::InvalidInputFile => "invalid_input_file",
             Self::InvalidInputPath => "invalid_input_path",
             Self::NoInputFiles => "no_input_files",
+            Self::OpusNotEnabled => "opus_not_enabled",
+            Self::UnsupportedOpusVariant => "unsupported_opus_variant",
             Self::AlreadyProcessed => "already_processed",
             Self::MarkerAmbiguous => "marker_ambiguous",
             Self::MarkerUnverifiable => "marker_unverifiable",
@@ -168,13 +174,14 @@ pub fn stage_code(stage: &str) -> Option<ErrorCode> {
         "create intermediate directory" | "create intermediate" | "pin intermediate" | "configure intermediate"
         | "write intermediate" | "close intermediate" | "remove intermediate" | "open intermediate" => IoError,
         // Encoding and publication.
-        "load FLAC encoder" | "load MP3 encoder" => LibraryLoadFailed,
-        "create MP3 encoder" | "create MP3 PCM converter" | "create FLAC encoder" | "create Apple encoder"
+        "load FLAC encoder" | "load MP3 encoder" | "load Opus encoder" => LibraryLoadFailed,
+        "create MP3 encoder" | "create MP3 PCM converter" | "create FLAC encoder" | "create Apple encoder" | "create Opus encoder"
+        | "encode Opus output" | "finish Opus output"
         | "configure Apple encoder" | "convert MP3 PCM" | "encode MP3 output" | "encode FLAC output"
         | "encode Apple output" | "finish Apple output" | "finish FLAC output" | "finish MP3 output"
         | "abort Apple output" | "abort MP3 PCM converter" | "close MP3 PCM converter" | "set controlled MP4 time"
         | "inspect encoded output" | "inspect encoded length" | "close encoded inspection" => EncodeFailed,
-        "sync FLAC output" | "create MP3 staging file" | "create FLAC staging file" | "begin output" | "pin output stage"
+        "sync FLAC output" | "sync Opus output" | "create MP3 staging file" | "create FLAC staging file" | "create Opus staging file" | "begin output" | "pin output stage"
         | "verify output stage" | "pin tagged output" | "publish output" => IoError,
         "plan overwrite" => OutputConflict,
         // Reporting (emitted by the CLI layer).
@@ -201,6 +208,7 @@ fn typed_code(error: &dyn Any) -> Option<ErrorCode> {
     if let Some(e) = error.downcast_ref::<crate::tags::TagError>() { return tag_code(e); }
     if let Some(e) = error.downcast_ref::<crate::flac::FlacError>() { return flac_code(e); }
     if let Some(e) = error.downcast_ref::<crate::mp3::Mp3Error>() { return mp3_code(e); }
+    if let Some(e) = error.downcast_ref::<crate::opus::OpusError>() { return opus_code(e); }
     if let Some(e) = error.downcast_ref::<crate::metadata::MarkerError>() { return marker_code(e); }
     if error.downcast_ref::<std::io::Error>().is_some() { return Some(ErrorCode::IoError); }
     #[cfg(target_os = "linux")]
@@ -249,6 +257,8 @@ fn input_code(error: &crate::audio_input::AudioInputError) -> Option<ErrorCode> 
         E::Library(_) => Some(ErrorCode::LibraryLoadFailed),
         E::InvalidInput(_) => Some(ErrorCode::InvalidInputFile),
         E::Unsupported(_) => Some(ErrorCode::UnsupportedInputFormat),
+        E::Opus(e) => opus_code(e),
+        E::MissingOpusLibrary | E::MissingOpusDigest => Some(ErrorCode::LibraryNotConfigured),
         E::Allocation | E::Decoder { .. } | E::DecoderData(_) | E::Converter { .. } | E::UnexpectedNativeResult(_) | E::Poisoned => None,
     }
 }
@@ -279,6 +289,28 @@ fn mp3_code(error: &crate::mp3::Mp3Error) -> Option<ErrorCode> {
     }
 }
 
+/// Opus input and output: the type of the failure decides, so a stage that can
+/// also fail for other reasons still reports the specific cause.
+fn opus_code(error: &crate::opus::OpusError) -> Option<ErrorCode> {
+    use crate::opus::OpusError as E;
+    match error {
+        // Resolving the configured libopus path is part of loading it (the contract: every load stage).
+        E::Io { operation: "resolve library path", .. } => Some(ErrorCode::LibraryLoadFailed),
+        E::Io { .. } => Some(ErrorCode::IoError),
+        E::Library(_) | E::IncompatibleLibrary { .. } => Some(ErrorCode::LibraryLoadFailed),
+        #[cfg(target_os = "linux")]
+        E::LibraryPolicy(e) => Some(policy_code(e)),
+        E::InvalidDigest | E::DigestMismatch { .. } | E::SelfTest(_) => Some(ErrorCode::LibraryUnapproved),
+        E::NotOpus(_) => Some(ErrorCode::UnsupportedInputCodec),
+        E::Invalid(_) | E::Limit(_) => Some(ErrorCode::InvalidInputFile),
+        E::Unsupported(_) => Some(ErrorCode::UnsupportedOpusVariant),
+        E::SampleRate { .. } => Some(ErrorCode::UnsupportedSampleRateConversion),
+        E::Decode { .. } => Some(ErrorCode::DecodeFailed),
+        E::Encode { .. } => Some(ErrorCode::EncodeFailed),
+        E::Poisoned => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn policy_code(error: &crate::linux_libraries::LibraryPolicyError) -> ErrorCode {
     use crate::linux_libraries::LibraryPolicyError as E;
@@ -298,6 +330,7 @@ fn tag_code(error: &crate::tags::TagError) -> Option<ErrorCode> {
         E::PathContainsNul => Some(ErrorCode::InvalidInputPath),
         E::SourceIsDestination => Some(ErrorCode::OutputConflict),
         E::Marker(e) => marker_code(e),
+        E::Opus(e) => opus_code(e),
         E::MarkerCallbackPanicked | E::MarkerReadCallbackPanicked | E::InspectionCallbackPanicked => Some(ErrorCode::InternalError),
         E::Library(_) => None,
     }
@@ -348,6 +381,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_missing_libopus_path_is_a_library_load_failure_and_other_opus_io_stays_io_error() {
+        use crate::opus::{OpusError, io_error};
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(opus_code(&io_error("resolve library path", missing())), Some(ErrorCode::LibraryLoadFailed));
+        assert_eq!(opus_code(&io_error("read input", missing())), Some(ErrorCode::IoError));
+        assert_eq!(opus_code(&OpusError::Library("x".into())), Some(ErrorCode::LibraryLoadFailed));
+    }
+
+    #[test]
     fn codes_are_unique_snake_case_and_complete() {
         let mut seen = std::collections::BTreeSet::new();
         for code in ErrorCode::ALL {
@@ -358,7 +400,7 @@ mod tests {
         }
         // Adding a variant without listing it here fails the match in `as_str`;
         // this guards the list itself.
-        assert_eq!(seen.len(), 37);
+        assert_eq!(seen.len(), 39);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod metadata;
 pub mod mp3;
 pub mod multipass;
 pub mod multipass_graph;
+pub mod opus;
 pub mod phase;
 pub mod pitch;
 pub mod pitch_detect;

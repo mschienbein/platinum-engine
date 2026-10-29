@@ -1,7 +1,9 @@
 //! Sequential input selected the same way as MIKAudio: paths ending in
-//! `flac`, case-insensitively, use its separate native-FLAC path; everything
-//! else uses AudioToolbox. The caller supplies a trusted public libFLAC 1.4.2;
-//! the original framework is never loaded by this module.
+//! `flac`, case-insensitively, use its separate native-FLAC path; paths ending
+//! in `.opus` use the opt-in Opus path (only when `formats.opus` hands the engine
+//! a pinned libopus); everything else uses AudioToolbox (macOS) or the portable
+//! reader (Linux and `portable` builds). The caller supplies a trusted public
+//! libFLAC 1.4.2; the original framework is never loaded by this module.
 //!
 //! MIKAudio converts decoded FLAC integers through a system AudioConverter,
 //! rather than an assumed integer-to-float formula. Its FLAC stream-format
@@ -32,15 +34,13 @@ const CONVERTER_FRAMES: usize = 4096;
 /// No library is loaded for non-FLAC inputs. Supply a trusted open-source
 /// libFLAC 1.4.2 path and the expected full-file SHA-256. A pin does not prove
 /// source provenance; the caller is responsible for trusting the actual build.
-///
-/// `allow_non_identical` lets Linux and `portable` builds decode MP3 with the
-/// open-source decoder instead of refusing it. It is ignored by macOS default
-/// builds, which always use AudioToolbox.
 #[derive(Clone, Debug, Default)]
 pub struct InputLibraries {
     pub flac: Option<PathBuf>,
     pub flac_sha256: Option<String>,
-    pub allow_non_identical: bool,
+    /// Fixed-point libopus 1.6.1 and its SHA-256 pin; needed only for `.opus` input.
+    pub opus: Option<PathBuf>,
+    pub opus_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -49,6 +49,9 @@ pub enum AudioInputError {
     FlacLibrary(FlacError),
     MissingFlacLibrary,
     MissingFlacDigest,
+    Opus(crate::opus::OpusError),
+    MissingOpusLibrary,
+    MissingOpusDigest,
     DigestMismatch { expected: String, actual: String },
     Library(String),
     InvalidInput(&'static str),
@@ -67,6 +70,9 @@ impl fmt::Display for AudioInputError {
             Self::FlacLibrary(e) => write!(f, "{e}"),
             Self::MissingFlacLibrary => f.write_str("a trusted libFLAC 1.4.2 path is required for FLAC input"),
             Self::MissingFlacDigest => f.write_str("an explicit SHA-256 pin is required for FLAC input"),
+            Self::Opus(e) => write!(f, "{e}"),
+            Self::MissingOpusLibrary => f.write_str("Opus input needs formats.opus on and a trusted libopus 1.6.1 path (libraries.opus)"),
+            Self::MissingOpusDigest => f.write_str("an explicit SHA-256 pin (libraries.opus_sha256) is required for Opus input"),
             Self::DigestMismatch { expected, actual } => write!(f, "libFLAC SHA-256 mismatch: expected {expected}, got {actual}"),
             Self::Library(e) => write!(f, "libFLAC input: {e}"),
             Self::InvalidInput(e) => write!(f, "invalid audio input: {e}"),
@@ -82,11 +88,12 @@ impl fmt::Display for AudioInputError {
 }
 impl Error for AudioInputError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self { Self::Apple(e) => Some(e), Self::FlacLibrary(e) => Some(e), _ => None }
+        match self { Self::Apple(e) => Some(e), Self::FlacLibrary(e) => Some(e), Self::Opus(e) => Some(e), _ => None }
     }
 }
 impl From<apple_codec::CodecError> for AudioInputError { fn from(e: apple_codec::CodecError) -> Self { Self::Apple(e) } }
 impl From<FlacError> for AudioInputError { fn from(e: FlacError) -> Self { Self::FlacLibrary(e) } }
+impl From<crate::opus::OpusError> for AudioInputError { fn from(e: crate::opus::OpusError) -> Self { Self::Opus(e) } }
 
 /// Sequential input facade supporting the interleaved source-channel reader
 /// and the two-plane render-input reader. FLAC reads use MIKAudio's two-channel
@@ -94,40 +101,27 @@ impl From<FlacError> for AudioInputError { fn from(e: FlacError) -> Self { Self:
 pub enum AudioReader {
     Apple(apple_codec::Reader),
     Flac(FlacReader),
+    Opus(OpusInput),
 }
 impl AudioReader {
     pub fn open(path: impl AsRef<Path>, processing_rate: Option<f64>, libraries: &InputLibraries) -> Result<Self, AudioInputError> {
         let path = path.as_ref();
         let bytes = path.as_os_str().as_bytes();
-        if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b"flac") {
+        if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".opus") {
+            Ok(Self::Opus(OpusInput::open(path, processing_rate, libraries)?))
+        } else if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b"flac") {
             let lib = libraries.flac.as_ref().ok_or(AudioInputError::MissingFlacLibrary)?;
             let digest = libraries.flac_sha256.as_deref().ok_or(AudioInputError::MissingFlacDigest)?;
             Ok(Self::Flac(FlacReader::open(path, lib, digest)?))
         } else {
-            #[cfg(any(target_os = "linux", feature = "portable"))]
-            let reader = apple_codec::Reader::open_with(path, processing_rate,
-                apple_codec::ReaderOptions { non_identical_mp3: libraries.allow_non_identical })?;
-            #[cfg(not(any(target_os = "linux", feature = "portable")))]
-            let reader = apple_codec::Reader::open(path, processing_rate)?;
-            Ok(Self::Apple(reader))
-        }
-    }
-    /// Whether a path that is not proven byte-identical to the macOS reference
-    /// (the open-source MP3 decoder) produces this reader's samples.
-    pub fn non_identical(&self) -> bool {
-        match self {
-            #[cfg(any(target_os = "linux", feature = "portable"))]
-            Self::Apple(r) => r.non_identical(),
-            #[cfg(not(any(target_os = "linux", feature = "portable")))]
-            Self::Apple(_) => false,
-            Self::Flac(_) => false,
+            Ok(Self::Apple(apple_codec::Reader::open(path, processing_rate)?))
         }
     }
     pub fn source_format(&self) -> StreamDescription {
-        match self { Self::Apple(r) => r.source_format(), Self::Flac(r) => r.source }
+        match self { Self::Apple(r) => r.source_format(), Self::Flac(r) => r.source, Self::Opus(r) => r.source }
     }
     pub fn client_format(&self) -> StreamDescription {
-        match self { Self::Apple(r) => r.client_format(), Self::Flac(r) => r.client }
+        match self { Self::Apple(r) => r.client_format(), Self::Flac(r) => r.client, Self::Opus(r) => r.client }
     }
     /// Configure the graph's two-plane float input. For FLAC, MIKAudio's native
     /// setter ignores the requested rate and never reconfigures the converter;
@@ -142,18 +136,21 @@ impl AudioReader {
                     bits_per_channel: 32, reserved: 0 };
                 Ok(())
             }
+            Self::Opus(r) => r.set_stereo_planar(sample_rate),
         }
     }
-    /// Read into two equal-sized planes, leaving the unreturned tail untouched.
+    /// Read into two equal-sized planes, leaving the unreturned tail untouched (except for an MP3 read that reaches the end of
+    /// the valid frames: AudioToolbox fills the buffer with the decoder's padding behind the returned count, and so does the
+    /// portable reader).
     /// MIKAudio's FLAC path copies its two internal planes even for mono; the
     /// second is zero, not a duplicate. Its output remains at the source rate.
     pub fn read_stereo_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize, AudioInputError> {
-        match self { Self::Apple(r) => Ok(r.read_stereo_planar(left, right)?), Self::Flac(r) => r.read_stereo_planar(left, right) }
+        match self { Self::Apple(r) => Ok(r.read_stereo_planar(left, right)?), Self::Flac(r) => r.read_stereo_planar(left, right), Self::Opus(r) => r.read_stereo_planar(left, right) }
     }
     /// STREAMINFO's 36-bit total for FLAC, or AudioToolbox's #frm property.
     /// A FLAC total of zero is the format's unknown/empty value.
     pub fn file_length_frames(&self) -> Result<i64, AudioInputError> {
-        match self { Self::Apple(r) => Ok(r.file_length_frames()?), Self::Flac(r) => Ok(r.total_samples as i64) }
+        match self { Self::Apple(r) => Ok(r.file_length_frames()?), Self::Flac(r) => Ok(r.total_samples as i64), Self::Opus(r) => Ok(r.reader.info().frames as i64) }
     }
     /// MIKAudio provides its AudioFile bitrate query only for its Apple path;
     /// it has no FLAC bitrate operation, so no synthetic estimate is returned.
@@ -161,21 +158,64 @@ impl AudioReader {
         match self {
             Self::Apple(r) => Ok(r.bitrate()?),
             Self::Flac(_) => Err(AudioInputError::Unsupported("MIKAudio exposes no FLAC bitrate query")),
+            Self::Opus(r) => Ok(r.reader.info().bitrate()),
         }
     }
     pub fn flac_library_identity(&self) -> Option<&LibraryIdentity> {
-        match self { Self::Flac(r) => Some(r.validation.identity()), Self::Apple(_) => None }
+        match self { Self::Flac(r) => Some(r.validation.identity()), Self::Apple(_) | Self::Opus(_) => None }
+    }
+    /// The libopus that decoded this input, for reports.
+    pub fn opus_library_identity(&self) -> Option<&crate::opus::LibraryIdentity> {
+        match self { Self::Opus(r) => Some(r.library.identity()), _ => None }
     }
     /// Read interleaved frames. FLAC uses the source channel count regardless
     /// of the most recent planar setter; above two source channels only the
     /// packed first-two-channel prefix is written, like the native one-buffer
     /// path. A short final read does not write any unreturned tail.
     pub fn read(&mut self, output: &mut [f32]) -> Result<usize, AudioInputError> {
-        match self { Self::Apple(r) => Ok(r.read(output)?), Self::Flac(r) => r.read(output) }
+        match self { Self::Apple(r) => Ok(r.read(output)?), Self::Flac(r) => r.read(output), Self::Opus(r) => r.read(output) }
     }
     pub fn close(self) -> Result<(), AudioInputError> {
-        match self { Self::Apple(r) => Ok(r.close()?), Self::Flac(r) => r.close() }
+        match self { Self::Apple(r) => Ok(r.close()?), Self::Flac(r) => r.close(), Self::Opus(r) => r.close() }
     }
+}
+
+/// Ogg Opus input: mono or stereo at 48 kHz, decoded without any sample-rate
+/// conversion. Mono is duplicated into both planes of a planar read.
+pub struct OpusInput {
+    reader: crate::opus::OpusReader,
+    library: crate::opus::OpusLibrary,
+    source: StreamDescription,
+    client: StreamDescription,
+}
+impl OpusInput {
+    fn open(path: &Path, rate: Option<f64>, libraries: &InputLibraries) -> Result<Self, AudioInputError> {
+        let lib = libraries.opus.as_ref().ok_or(AudioInputError::MissingOpusLibrary)?;
+        let digest = libraries.opus_sha256.as_deref().ok_or(AudioInputError::MissingOpusDigest)?;
+        let library = crate::opus::OpusLibrary::load(lib, digest)?;
+        let reader = crate::opus::OpusReader::open(&library, path, rate)?;
+        let channels = reader.channels() as u32;
+        let sample_rate = f64::from(crate::opus::SAMPLE_RATE);
+        let source = StreamDescription { sample_rate, format_id: u32::from_be_bytes(*b"opus"), format_flags: 0,
+            bytes_per_packet: 0, frames_per_packet: crate::opus::FRAME_SAMPLES as u32, bytes_per_frame: 0,
+            channels_per_frame: channels, bits_per_channel: 0, reserved: 0 };
+        let client = StreamDescription { sample_rate, format_id: LPCM, format_flags: 9, bytes_per_packet: channels * 4,
+            frames_per_packet: 1, bytes_per_frame: channels * 4, channels_per_frame: channels, bits_per_channel: 32, reserved: 0 };
+        Ok(Self { reader, library, source, client })
+    }
+    fn set_stereo_planar(&mut self, sample_rate: f64) -> Result<(), AudioInputError> {
+        if sample_rate != f64::from(crate::opus::SAMPLE_RATE) {
+            return Err(crate::opus::OpusError::SampleRate { source: f64::from(crate::opus::SAMPLE_RATE), requested: sample_rate }.into());
+        }
+        self.client = StreamDescription { sample_rate, format_id: LPCM, format_flags: 0x29, bytes_per_packet: 4,
+            frames_per_packet: 1, bytes_per_frame: 4, channels_per_frame: 2, bits_per_channel: 32, reserved: 0 };
+        Ok(())
+    }
+    fn read(&mut self, output: &mut [f32]) -> Result<usize, AudioInputError> { Ok(self.reader.read(output)?) }
+    fn read_stereo_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize, AudioInputError> {
+        Ok(self.reader.read_stereo_planar(left, right)?)
+    }
+    fn close(self) -> Result<(), AudioInputError> { Ok(self.reader.close()?) }
 }
 
 // Public libFLAC 1.4.2 ABI. FLAC__Frame begins with FLAC__FrameHeader.

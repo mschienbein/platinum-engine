@@ -10,7 +10,7 @@ Production processing uses Rust DSP and explicitly configured public native libr
 
 ### Linux capability and error boundary
 
-By default Linux refuses MP3 and AAC decoding, AAC encoding, unequal-rate
+By default Linux refuses AAC decoding, AAC encoding, unequal-rate
 sample-rate conversion, artwork conversion that requires Apple's transcoder,
 unverified codec and container variants (including unverified GSM masks), and
 ALAC packet conditions known to lose native audio. Portable ALAC output admits
@@ -20,10 +20,19 @@ refused before publication; analysis of non-MP3 inputs at or below 22,050 Hz is
 refused. A non-44.1 kHz waveform is unavailable rather than approximated; an
 otherwise supported analysis can still succeed.
 
-One opt-in, `parity.allow_non_identical` (below), relaxes two of those refusals
-on Linux and `portable` builds, MP3 input decoding and the unchanged copy of
-embedded cover art, and keeps the WAV tag chunks the reference marker writer
-drops. AAC stays refused. Without the opt-in Linux behaves exactly as v0.1.0 did.
+MP3 input is not among the refusals: Linux and `portable` builds decode it
+(and MPEG Layer I/II streams, which the engine treats as an unrecognized source
+codec exactly as on macOS) with the bit-exact port of AudioToolbox's MPEG audio
+path, which needs no setting and is an identical path (see
+[MP3 input](../docs/LINUX.md#mp3-input)). Which reader opens a file follows
+AudioToolbox's `AudioFile`: a name ending `.mp1`, `.mp2`, `.mp3`, `.mpa` or
+`.mpeg` (any case) commits to the MPEG reader whatever the bytes are, so a
+RIFF/WAVE or AIFF file named `.mp3` is refused as `invalid_input_file` on Linux
+exactly as on macOS; under any other name the content decides. One opt-in,
+`parity.allow_non_identical` (below), relaxes one refusal on Linux and
+`portable` builds, the unchanged copy of embedded cover art, and keeps the WAV
+tag chunks the reference marker writer drops. AAC stays refused. Without the
+opt-in Linux behaves as v0.1.0 did except that MP3 input is decoded.
 
 The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
 `UnsupportedSampleRateConversion` variants; artwork uses
@@ -59,51 +68,41 @@ parity.allow_non_identical true`; the `process` command line is unchanged.
 
 What it enables, on Linux and on `--features portable` builds only:
 
-- **MP3 input** is decoded by an open-source, deterministic decoder (a
-  from-scratch ISO 11172-3/13818-3 Layer III implementation in safe Rust with
-  binary64 arithmetic and no libm) instead of being refused. It emits the same
-  16-bit sample grid as AudioToolbox but is **not byte-exact**: in the
-  maintainer's 389-file generated corpus 95.08 % of 46.1 million samples equal
-  AudioToolbox's and none differs by more than 4 least-significant bits, so
-  results are not guaranteed byte-identical to macOS. Its output is
-  bit-identical across macOS arm64, Linux aarch64 and Linux x86_64. MP3 *output*
-  always used the pinned LAME build and is unaffected. Xing, Info and VBRI
-  headers are read as AudioToolbox reads them, and a truncated final frame is
-  accepted. Streams it does not reproduce are refused with
-  `unsupported_input_codec` (MPEG Layer I/II, free-format, mixed blocks, MPEG-2
-  intensity stereo, Xing/Info headers without a usable frame count, a VBRI frame
-  shorter than its fields, ambiguous data before the first or after the last
-  frame, audio after a gap, an encoder delay past the stream); damaged streams
-  (a damaged granule, any frame CRC mismatch, a missing bit reservoir after the
-  first good frame) fail with `invalid_input_file`, possibly only when the audio
-  is read; MPEG rates other than 22,050, 32,000, 44,100 and 48,000 Hz need
-  sample-rate conversion for processing and are refused with
-  `unsupported_sample_rate_conversion` (`inspect` still reports them). The
-  decoder only claims a confirmed MP3 stream (consecutive consistent frame
-  headers): any other input, such as FLAC or Ogg data under another name, keeps
-  the classification and code it has without the setting.
 - **Embedded cover art** (FLAC `PICTURE`, ID3 `APIC`, MP4 `covr`) is stored in
   the output byte for byte where the macOS bridge would re-encode it as PNG
   through Apple's image stack (generic cross-format copies, which the default
   Linux bridge refuses) or silently drop it (FLAC-to-FLAC direct copies).
   Same-family ID3, MP4 and AIFF direct copies already moved the picture
-  unchanged and are untouched. A picture in a WAV's `ID3 ` chunk follows the WAV
-  tag chunks rule below instead (the next bullet; see also the WAV tag-chunk
-  paragraph in the processed-marker section). With the setting on, pictures are
-  preserved for same-format processing (`match-input`: FLAC, MP3, AIFF, M4A, and
-  WAV to WAV through `wav_tag_preservation`); cross-format copies into or out of
-  a WAV (for example MP3 or FLAC to WAV, WAV to FLAC) still carry no picture,
-  because the portable bridge excludes WAV from image handling, as the macOS
-  reference does, and are planned for v0.3.0. Stored MIME is the canonical type of the
-  validated bytes; MP4 `covr` has no type or description. On this generic path,
+  unchanged and are untouched. With the setting on, a WAV is an ID3-capable
+  container like MP3 and AIFF: the pictures of a FLAC, MP3, AIFF, M4A or WAV
+  source are stored unchanged as `APIC` frames in the WAV's `ID3 ` chunk by a
+  generic cross-format copy (the output lists `artwork_copy` and, because the
+  chunk is kept, `wav_tag_preservation`), and the `APIC` frames of a WAV source
+  are copied to FLAC, MP3, AIFF and M4A outputs. WAV to WAV and `match-input`
+  are direct copies: a WAV's picture there travels with its `ID3 ` chunk through
+  `wav_tag_preservation` (the next bullet; see also the WAV tag-chunk paragraph
+  in the processed-marker section), and FLAC, MP3, AIFF and M4A same-format
+  processing preserves pictures as before. With the setting off, no picture
+  moves into or out of a WAV on a cross-format copy (it is ignored, not
+  refused), as in the reference. Stored MIME is the canonical type of the
+  validated bytes, and the description keeps its text encoding for ID3 sources;
+  MP4 `covr` has no type or description. On this generic path,
   pictures read from MP4 become front covers in ID3 and FLAC. The direct
   M4A-to-MP3 path keeps the reference behaviour instead and is not reported as
   `artwork_copy`: its ID3 picture has type 0 and no description, and GIF, BMP
   and WebP bytes are labelled `image/png`, exactly as on macOS. The item is refused with
   `artwork_conversion_unavailable`, before anything is written, when a picture
   is not a structurally complete JPEG, PNG, GIF, BMP or WebP, when MP4 `covr`
-  would have to hold WebP, or when a FLAC metadata block would exceed
-  16 MiB − 1.
+  would have to hold WebP, when a FLAC metadata block would exceed
+  16 MiB − 1, or when the destination's ID3v2 tag (MP3, AIFF or WAV output: the
+  pictures, frame headers, descriptions in the encoding they are written in,
+  the tag's other frames, the processed-marker frame and padding) would exceed
+  the 268,435,455-byte limit of its 28-bit size field. A picture in a WAV is
+  validated like every other destination's: in v0.2.0 a picture inside a WAV's
+  ID3 chunk, or one converted into a WAV, was never examined (the WAV was
+  excluded from the picture path), so a malformed picture did not matter there;
+  since v0.3.0 such a conversion is refused with the setting on, and still
+  ignored with it off.
 - **WAV tag chunks** (`ID3 `/`id3 ` and INFO `LIST`) that TagLib writes into a
   WAV output are all kept, instead of losing the one TagLib saved last (see the
   WAV tag-chunk paragraph under the processed-marker rules). The marker
@@ -119,9 +118,13 @@ What it enables, on Linux and on `--features portable` builds only:
   reference's, byte for byte.
 
 It never enables AAC decoding or encoding, sample-rate conversion, or any other
-refused path; those keep their codes. On a macOS default build the setting is
-stored and shown but has **no effect**: Apple's decoder and image stack are
-always used and every path is the reference path. `config show` states this
+refused path; those keep their codes. It does not gate MP3 input, which has no
+setting: until v0.2.0 the setting also gated an open-source, non-byte-exact MP3
+decoder on Linux (items using it listed `mp3_decode`), and v0.3.0 replaced it
+by the exact port; a state file that stores the setting remains valid and keeps
+its meaning for the two paths above.
+On a macOS default build the setting is stored and shown but has **no effect**:
+Apple's image stack is always used and every path is the reference path. `config show` states this
 per build, next to the stored value:
 
 ```json
@@ -147,17 +150,91 @@ Every `process`, `analyze` and `inspect` report carries
 actually produced something in that item's result. It is **always present** on
 successful reports on every platform and is `[]` whenever every path used is an
 identical one, which is always the case on macOS default builds and on Linux
-without the opt-in. Failed items have no report and therefore no list. The
-defined members, in this order when several apply, are:
+without the opt-in; `analyze` and `inspect` only decode and read container
+properties, which are identical everywhere, so their list is always `[]`. Failed
+items have no report and therefore no list. The defined members, in this order
+when several apply, are:
 
 | Member | Meaning |
 | --- | --- |
-| `mp3_decode` | The input MP3 was decoded by the open-source decoder and the result depends on it: for `process` and `analyze` the measurements and audio derive from it, and `analyze` also lists it when the waveform of the recorded original backup (an MP3) is reported, but not when that waveform is unavailable; for `inspect` the open-source MP3 model supplied the reported length and bitrate. |
 | `artwork_copy` | At least one embedded picture was stored byte for byte where the macOS bridge would have transcoded or dropped it (only `process`). It is absent when the source had no artwork or every picture moved through a path identical to macOS. |
-| `wav_tag_preservation` | A WAV output kept at least one tag chunk (`ID3 `, INFO `LIST`) that TagLib wrote and the reference marker writer drops (only `process`, WAV destinations). It is listed for a WAV source whose tag chunks TagLib copied, and for every cross-format copy into a WAV: that copy always writes tempo and key, so even a source without tags gains an `ID3 ` chunk holding an empty key and a zero tempo. It is absent for a WAV source without tag chunks and whenever TagLib wrote no chunk after the declared RIFF end. |
+| `wav_tag_preservation` | A WAV output kept at least one tag chunk (`ID3 `, INFO `LIST`) that TagLib wrote and the reference marker writer drops (only `process`, WAV destinations). It is listed for a WAV source whose tag chunks TagLib copied, and for every cross-format copy into a WAV: that copy always writes tempo and key, so even a source without tags gains an `ID3 ` chunk holding an empty key and a zero tempo (a picture copied into a WAV travels in that chunk). It is absent for a WAV source without tag chunks and whenever TagLib wrote no chunk after the declared RIFF end. |
 
 New members may be added in later releases; consumers must treat an unknown
-member as non-identical and must not require an exact array.
+member as non-identical and must not require an exact array. v0.2.0 also
+defined `mp3_decode` (an open-source MP3 decoder on Linux behind the setting);
+MP3 decoding is identical to macOS since v0.3.0 and the member no longer exists.
+
+## Opt-in format: Opus
+
+Platinum Notes refuses `.opus` files, so Opus has **no Platinum Notes reference**.
+It is therefore a separate opt-in, never part of `parity.*`: the boolean setting
+`formats.opus` (default `false`; `config get|set|reset formats.opus`, also
+`config get formats`) turns on Ogg Opus (RFC 7845) input and output, and
+`libraries.opus` / `libraries.opus_sha256` name the pinned libopus (see
+[docs/BUILD.md](../docs/BUILD.md)). A state file that never enabled it has no
+`formats` member and stays readable by earlier releases.
+
+With the setting **off** every build behaves as before: discovery ignores `.opus`
+(`process` and `analyze` of a selection holding only `.opus` files report
+`no_input_files` at stage `discovery`), `inspect` of a named `.opus` reports
+`unsupported_input_format`, `.ogg` stays unsupported, no libopus is handed to
+any reader (a processed file whose marker names a recorded original ending in
+`.opus` cannot make `analyze` decode it: the original's waveform is reported
+unavailable), `process --format opus` is refused with `opus_not_enabled`
+(usage error, exit 2) and `config set output.format opus` is a `settings_error`.
+`config show` carries `formats` and `formats_effect` next to `parity`.
+
+With it **on**, on macOS default, macOS `--features portable`, Linux aarch64 and
+Linux x86_64, the same input and settings produce the same output bytes. This
+rests on a fixed-point libopus 1.6.1 (no float, no SIMD, no libm), a
+known-answer self-test at load time, 24-bit PCM at the library boundary, and an
+Ogg layer with a fixed packet and page layout and a content-derived serial
+number. Scope:
+
+- Input: a single logical Ogg stream, channel mapping family 0, one or two
+  channels, pre-skip, output gain and end trimming honoured exactly, every page
+  checksum, sequence number, serial and granule position validated. Chained,
+  multiplexed, multistream, mapping-family 1/255 and more-than-two-channel
+  streams are refused with `unsupported_opus_variant`; damaged streams with
+  `invalid_input_file`, including two cases that would otherwise silently shorten
+  the audio: a first audio page that continues a packet from before the stream's
+  first page (RFC 7845 permits it; the lost packet would be dropped), and an
+  end-of-stream page that ends in a packet that never completes; a valid Ogg
+  stream of another codec with
+  `unsupported_input_codec`. The comment header is limited to 64 MiB, audio
+  packets to 61,440 bytes.
+- Processing and output are always at 48 kHz with no sample-rate conversion. A
+  source that is processed at another rate (44.1 kHz, 96 kHz, ...) is refused
+  with `unsupported_sample_rate_conversion`; sources with more than two channels
+  are refused with `unsupported_opus_variant`. The waveform view of `analyze` is
+  `waveform_unavailable` for Opus on every build.
+- Output bitrate policy (as for AAC and MP3 it is fixed and independent of the
+  source's own bitrate): variable bitrate, 128 kbit/s per channel (stereo 256
+  kbit/s, the same target as the engine's AAC output; mono 128 kbit/s),
+  complexity 10, 20 ms frames, application `audio`, signal `music`, full
+  bandwidth, no DTX, no in-band FEC, 24-bit input. Pre-skip is the encoder delay
+  (312 samples); the last page carries the exact end granule.
+- Tags: user comments are copied verbatim and in order from an Opus or FLAC
+  source (FLAC `PICTURE` blocks become `METADATA_BLOCK_PICTURE` comments with
+  the same bytes, so artwork is never converted); the old `PLATINUMNOTES` field
+  is replaced by the new marker, which is stored exactly as in a FLAC Xiph
+  comment (`PLATINUMNOTES=` + the same wrapped Base64 text). The Opus loudness
+  tags `R128_TRACK_GAIN` and `R128_ALBUM_GAIN` are the only comments not carried
+  over (RFC 7845 section 5.2.1: the gain tags describe the loudness the
+  processing has just replaced; the header gain is applied to the audio and the
+  output header gain is 0); the names left out are in `opus_output.dropped_tags`.
+  Other sources (MP3, MP4, WAV, AIFF, a FLAC with an ID3 prefix) reach Opus
+  through the tag bridge's usual seven-key copy and, when they carry artwork,
+  need the byte-for-byte artwork copy (`parity.allow_non_identical` on Linux and
+  portable builds; macOS default refuses such sources with
+  `artwork_conversion_unavailable`). From Opus to another format the same bridge
+  copy applies, with the artwork behaviour that FLAC sources already have.
+
+Every `process`, `inspect` and `analyze` report of an item that reads or writes
+Opus carries `no_platinum_notes_reference` (a sentence saying so); a `process`
+report also carries `opus_output` (`encoder`, `library_sha256`,
+`target_bitrate_bps`, `vbr`, `complexity`, `frame_ms`, `dropped_tags`).
 
 ## Error codes
 
@@ -191,19 +268,21 @@ code would be a test failure and the final fallback is `internal_error`.
 
 | Code | Meaning | Reachable |
 | --- | --- | --- |
-| `unsupported_input_codec` | The input's audio codec cannot be decoded here: AAC/MP4A on Linux; MP3 on Linux without `parity.allow_non_identical` (or an MP3 stream the open-source decoder does not support); `match-input` of an unrecognized source codec. | Linux/portable; unrecognized codec on all |
-| `unsupported_input_format` | The input's container, sample format, bit depth, channel layout or file extension is not admitted (for example OGG, an unverified WAV subtype, multichannel FLAC waveform). | all |
+| `unsupported_input_codec` | The input's audio codec cannot be decoded here: AAC/MP4A on Linux (also AAC data, and FLAC data under a name not ending in `flac`, when the name does not select their reader); MP3 inside a WAVE container whose name does not end `.mp3`; `match-input` of an unrecognized source codec (for example MPEG Layer I/II). | Linux/portable; unrecognized codec on all |
+| `unsupported_input_format` | The input's container, sample format, bit depth, channel layout or file extension is not admitted (for example OGG, an unverified WAV subtype, multichannel FLAC waveform, an MP3 larger than 2 GiB). | all |
 | `unsupported_output_codec` | The requested output encoding is unavailable: AAC output on Linux. | Linux/portable |
 | `unsupported_output_format` | The requested output encoder cannot write this audio's format although the input is fine: ALAC output above 96,000 Hz or with more than 8 channels on Linux. A format refusal raised in an encoder stage always has this side. | Linux/portable; macOS when an Apple encoder refuses the format |
 | `unsupported_sample_rate_conversion` | Processing or analysis needs sample-rate conversion that Linux does not reproduce. | Linux/portable |
 | `artwork_conversion_unavailable` | Embedded artwork would need Apple image transcoding on Linux, or (opt-in on) the destination cannot store the picture unchanged. | Linux/portable |
 | `protected_source` | The input is a protected `m4p` or `wl.mp3` source. | all |
-| `invalid_input_file` | The input is malformed, truncated, empty of audio or otherwise not decodable, or its tag container cannot be read. | all |
+| `invalid_input_file` | The input is malformed, truncated, empty of audio or otherwise not decodable, or its tag container cannot be read. A name ending `.mp1 .mp2 .mp3 .mpa .mpeg` selects the MPEG reader, so a file with that name whose bytes are not MPEG audio (for example a RIFF/WAVE or AIFF file named `.mp3`) is refused here (`'dta?'`), and data that no reader recognizes under another name is `'typ?'`; this is the same on macOS and Linux. | all |
 | `invalid_input_path` | The input path is a symlink, neither file nor directory, cannot be represented in JSON, or cannot be passed to the tag bridge. | all |
 | `no_input_files` | A selected input held no admitted audio files. | all |
+| `opus_not_enabled` | Opus output was requested (`--format opus`) while `formats.opus` is off. | all |
+| `unsupported_opus_variant` | The Ogg Opus stream or layout is outside what the engine supports: chained or multiplexed stream, channel mapping family other than 0, more than two channels (input or output), a newer OpusHead major version. | all |
 | `already_processed` | A processed marker or `_PN` suffix says the file was already processed. | all |
 | `marker_ambiguous` | A WAV marker is empty or incomplete and needs `--allow-ambiguous-marker`. | all |
-| `marker_unverifiable` | The absence of a processed marker cannot be established (unknown container, duplicate marker chunks, hidden-marker risk, unreadable marker). | all |
+| `marker_unverifiable` | The absence of a processed marker cannot be established (unknown container, duplicate marker chunks, hidden-marker risk, unreadable marker, a WAVE behind a leading ID3 tag: the tag stage refuses it before any reader opens it, on every build). | all |
 | `marker_invalid` | A processing marker is malformed, cannot be serialized, or the written marker does not verify. | all |
 | `tag_copy_failed` | Copying source tags or writing the marker failed. | all |
 | `library_not_configured` | A required library path or SHA-256 pin (tag bridge, libFLAC, LAME) is not configured. | all |
@@ -267,7 +346,7 @@ unsafe or replaced object is reported rather than followed or overwritten.
 
 ```text
 platinum process INPUT... [--jobs N] [--template-index N | --template-id ID]
-    [--format wav|aiff|alac|flac|mp3|aac|match-input]
+    [--format wav|aiff|alac|flac|mp3|aac|opus|match-input]
     [--output-dir DIR | --same-folder | --replace-originals --backup-dir DIR]
     [--mirror | --no-mirror] [--mp3-mode cbr320|vbr192]
     [--overwrite] [--allow-ambiguous-marker]
@@ -565,7 +644,7 @@ backup's waveform or error, and the latter may be null. The diagnostic-only
 claim the original clock's sampling phase.
 
 On the portable path, MP3 postflight inspects the encoded output without
-enabling MP3 input decoding. For an `Info` tag with a LAME or erased identifier
+decoding it. For an `Info` tag with a LAME or erased identifier
 the packet estimate is `ceil((declared_bytes - tag_frame_size) * 8 /
 bitrate_of_the_first_frame_after_the_tag * rate / samples_per_packet)` in the
 observed AudioToolbox binary64 operation order: it uses the declared byte
@@ -679,16 +758,18 @@ deliberate Engine safety choice.
 | --- | --- |
 | `output` | `{"mode":...,"format":...}` using `file_workflow::OutputSettings`. |
 | `output.mode` | `"same_folder"`, `{"specific_folder":{"directory":"...","mirror":false}}`, or `{"replace":{"backup_directory":"..."}}`. Choosing replacement forces `match_input`. |
-| `output.format` | `"wav"`, `"aiff"`, `"alac"`, `"flac"`, `"mp3"`, `"aac"`, or `"match_input"`. An incompatible replacement format is rejected. |
+| `output.format` | `"wav"`, `"aiff"`, `"alac"`, `"flac"`, `"mp3"`, `"aac"`, `"opus"` (only while `formats.opus` is on; otherwise a `settings_error`), or `"match_input"`. An incompatible replacement format is rejected. |
 | `processor_max` | Integer clamped to `1..=max(1, available_cores)` on set, load, and save. |
 | `mp3_mode` | `"cbr320"` or `"vbr192"`. |
-| `libraries` | Object with `flac`, `flac_sha256`, `lame`, `lame_sha256`, `tag_bridge`; each is a string or `null`. Individual paths such as `libraries.flac_sha256` are also writable. A non-null digest is 64 hex digits; FLAC input/output and LAME output loading require caller-pinned digests. The ABI-5 tag bridge is required for processing, analysis, inspection and marker-only restore. Paths and digests are caller-supplied; settings alone does not load the libraries or establish their provenance. |
+| `libraries` | Object with `flac`, `flac_sha256`, `lame`, `lame_sha256`, `tag_bridge`, and (opt-in Opus) `opus` and `opus_sha256`; each is a string or `null`, and `opus` and `opus_sha256` are omitted from the state file while unset. Individual paths such as `libraries.flac_sha256` are also writable. A non-null digest is 64 hex digits; FLAC input/output, LAME output and Opus input/output loading require caller-pinned digests. The ABI-5 tag bridge is required for processing, analysis, inspection and marker-only restore. Paths and digests are caller-supplied; settings alone does not load the libraries or establish their provenance. |
 | `selected_template` | `null`, `{"builtin":{"id":"..."}}`, or `{"custom":{"index":0,"id":"..."}}`; custom IDs can be `null` and must match the indexed object. Prefer `select_template` for validated selection. |
 | `effective_selected_template` | Read-only resolved selection; even when `selected_template` is `null`, this shows the first built-in's identity. |
 | `parity` | `{"allow_non_identical":false}`; the opt-in group described under "Opt-in non-identical paths". It is omitted from the state file while default. |
 | `parity.allow_non_identical` | Boolean, default `false`. Writable individually; `config reset parity.allow_non_identical` restores the default. |
+| `formats` | `{"opus":false}`; the opt-in format group described under "Opt-in format: Opus". It is omitted from the state file while default; `config show` adds a read-only `formats_effect`. |
+| `formats.opus` | Boolean, default `false`. Writable individually; `config reset formats.opus` restores the default. Enables Ogg Opus input and `opus` output; needs `libraries.opus` and `libraries.opus_sha256`. |
 
-On Linux, the FLAC, LAME and TagLib bridge libraries must additionally match
+On Linux, the FLAC, LAME, libopus and TagLib bridge libraries must additionally match
 the exact architecture-specific SHA-256 identities in `src/linux_libraries.rs`.
 An unapproved library is refused even if the caller supplies its own matching
 digest; the typed policy error names the actual and expected identities. FLAC
@@ -750,9 +831,9 @@ establish encoded-file parity.
 
 ## Files and encoders
 
-The CLI accepts `wav`, `aiff`, `alac`, `flac`, `mp3`, `aac`, and
-`match-input` output selections. AAC and ALAC use an M4A container. Input
-discovery recognizes WAV, AIFF/AIF, MP3, M4A and FLAC; protected M4P/WL.MP3
+The CLI accepts `wav`, `aiff`, `alac`, `flac`, `mp3`, `aac`, `match-input` and,
+while `formats.opus` is on, `opus` output selections. AAC and ALAC use an M4A container. Input
+discovery recognizes WAV, AIFF/AIF, MP3, M4A and FLAC (and `.opus` while `formats.opus` is on); protected M4P/WL.MP3
 and `.ogg` sources are rejected. The reference's recovered normal extension
 filter excludes `.ogg` and `.oga`; on macOS AudioToolbox can decode Ogg content
 under a permitted extension, with source tags unavailable if TagLib cannot
@@ -783,13 +864,13 @@ On Linux and in the macOS `portable` feature, a non-MP3 source at or below
 22,050 Hz is refused because the reference processing-rate conversion has not
 been reproduced. For other non-44.1 kHz sources, analysis can proceed but the
 primary waveform is `null` with `waveform_unavailable` explaining the missing
-conversion. By default MP3 and AAC decoding fail before publication on Linux
-and in the `portable` feature; with `parity.allow_non_identical` on, MP3 input
-decodes through the open-source decoder (AAC stays refused). AAC encoding and
-output sample-rate conversion fail before publication. Portable FLAC and MP3 output can use caller-pinned
+conversion. An MP3 whose rate is not 22,050, 32,000, 44,100 or 48,000 Hz needs
+the processing-rate conversion and is refused the same way (`inspect` still
+reports it). AAC decoding, AAC encoding and output sample-rate conversion
+fail before publication. Portable FLAC and MP3 output can use caller-pinned
 encoders; sampled patched Linux builds are documented separately and are not
-a proof of whole-pipeline parity. MP3 output is inspected without enabling MP3
-input decoding; the postflight validates MPEG frame structure and computes the
+a proof of whole-pipeline parity. MP3 output is inspected without decoding it;
+the postflight validates MPEG frame structure and computes the
 gapless length using the observed AudioToolbox reporting rules. Portable pitch
 and warmth no longer have their provisional refusals; unsupported FFT
 shapes still fail when the portable setup cannot be created. The verified

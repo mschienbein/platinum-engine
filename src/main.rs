@@ -77,13 +77,13 @@ impl RunTemplate {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum FormatArg { Wav, Aiff, Alac, Flac, Mp3, Aac, MatchInput }
+enum FormatArg { Wav, Aiff, Alac, Flac, Mp3, Aac, Opus, MatchInput }
 impl From<FormatArg> for AudioFormat {
     fn from(format: FormatArg) -> Self {
         match format {
             FormatArg::Wav => Self::Wav, FormatArg::Aiff => Self::Aiff,
             FormatArg::Alac => Self::Alac, FormatArg::Flac => Self::Flac,
-            FormatArg::Mp3 => Self::Mp3, FormatArg::Aac => Self::Aac,
+            FormatArg::Mp3 => Self::Mp3, FormatArg::Aac => Self::Aac, FormatArg::Opus => Self::Opus,
             FormatArg::MatchInput => Self::MatchInput,
         }
     }
@@ -555,11 +555,11 @@ fn worker_count(requested: Option<NonZeroUsize>, settings: &Settings, cores: usi
     let max = settings.processor_max.clamp(1, cores.max(1));
     requested.map_or(max, |n| n.get().min(max))
 }
-fn discovery(inputs: &[PathBuf]) -> (Vec<DiscoveredFile>, Vec<ItemResult>) {
+fn discovery(inputs: &[PathBuf], admitted: file_workflow::AdmittedFormats) -> (Vec<DiscoveredFile>, Vec<ItemResult>) {
     let mut files = BTreeMap::new();
     let mut errors = Vec::new();
     for input in inputs {
-        match file_workflow::discover_inputs(std::slice::from_ref(input)) {
+        match file_workflow::discover_inputs_with(std::slice::from_ref(input), admitted) {
             Ok(found) if found.is_empty() => errors.push(ItemResult::failed(input, json!({"stage":"discovery", "code":ErrorCode::NoInputFiles, "message":"no admitted audio files found"}))),
             Ok(found) => for file in found { files.entry(file.path.clone()).or_insert(file); },
             Err(error) => errors.push(ItemResult::failed(input, workflow_error(error))),
@@ -592,6 +592,10 @@ fn apply_process_options(settings: &mut Settings, args: &ProcessArgs, cores: usi
     }
     if let Some(format) = args.format {
         let format = AudioFormat::from(format);
+        if format == AudioFormat::Opus && !settings.formats.opus {
+            return Err(AppError { kind: "usage", code: ErrorCode::OpusNotEnabled, publication: None, cleanup: None,
+                message: "Opus output requires the formats.opus setting (platinum config set formats.opus true)".into() });
+        }
         if args.replace_originals && format != AudioFormat::MatchInput {
             return Err(AppError::usage("replacement requires --format match-input"));
         }
@@ -616,7 +620,7 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
     apply_process_options(&mut settings, &args, cores)?;
     let template = settings.selected_template().map_err(AppError::settings)?;
     let jobs = worker_count(args.batch.jobs, &settings, cores);
-    let (files, mut errors) = discovery(&args.batch.inputs);
+    let (files, mut errors) = discovery(&args.batch.inputs, settings.admitted_formats());
     let mut details = json!({"jobs": jobs, "requested_jobs": args.batch.jobs.map(NonZeroUsize::get),
         "effective_config": settings.config_show().map_err(AppError::settings)?, "effective_template": effective_template(&template),
         "overwrite": args.overwrite, "allow_ambiguous_marker": args.allow_ambiguous_marker, "input_marker_overrides": [],
@@ -823,7 +827,7 @@ fn analyze(args: AnalyzeArgs, mut settings: Settings, cores: usize, cancel: &Can
     apply_run_template(&mut settings, &args.template)?;
     let jobs = worker_count(args.batch.jobs, &settings, cores);
     let template = settings.selected_template().map_err(AppError::settings)?;
-    let (files, mut errors) = discovery(&args.batch.inputs);
+    let (files, mut errors) = discovery(&args.batch.inputs, settings.admitted_formats());
     let indices: Vec<usize> = (0..files.len()).collect();
     let mut results: Vec<Option<ItemResult>> = (0..files.len()).map(|_| None).collect();
     for (index, result) in parallel_items(&indices, jobs, cancel, |index| {
@@ -1057,7 +1061,7 @@ mod statistics_outcome_tests {
             input_volume: 0.0, healed_volume: 0.0, output_volume: 0.6, input_pitch_hz: 440.0, output_pitch_hz: 440.0,
             tempo_factor: 1.0, clip_count: 3, applied_stages: Vec::new(),
             processing_marker_status: "present", input_marker_override: None, source_tags_unavailable: None, controlled_mp4_time_1904: None,
-            non_identical_paths: Vec::new(),
+            non_identical_paths: Vec::new(), no_platinum_notes_reference: None, opus_output: None,
         }
     }
 

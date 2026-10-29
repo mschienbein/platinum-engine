@@ -54,12 +54,12 @@ impl Cancellation {
 /// codec; a filename extension by itself is not a codec identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AudioFormat { Wav, Aiff, Alac, Flac, Mp3, Aac, MatchInput }
+pub enum AudioFormat { Wav, Aiff, Alac, Flac, Mp3, Aac, Opus, MatchInput }
 
 /// Actual source stream codec reported by the decoder. `Other` preserves an
 /// unrecognized four-character format code for a precise match-input error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceCodec { Lpcm, Mp3, Aac, Alac, Flac, Other(u32) }
+pub enum SourceCodec { Lpcm, Mp3, Aac, Alac, Flac, Opus, Other(u32) }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -77,7 +77,7 @@ pub struct OutputSettings { pub mode: OutputMode, pub format: AudioFormat }
 /// Path admission or an explicitly reported vendor-advertised Ogg type,
 /// not a detected audio codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceType { Mp3, M4a, Wav, Aiff, Flac, ProtectedM4p, ProtectedWlMp3, OggUnverified }
+pub enum SourceType { Mp3, M4a, Wav, Aiff, Flac, Opus, ProtectedM4p, ProtectedWlMp3, OggUnverified }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFile {
@@ -237,11 +237,31 @@ pub fn source_type(path: &Path) -> Option<SourceType> {
     else { None }
 }
 
+/// Formats beyond the reference application's extension table that the caller
+/// has opted into (`formats.*` settings). The default admits exactly what
+/// Platinum Notes admits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmittedFormats { pub opus: bool }
+
+/// As `source_type`, plus the opted-in formats. `.opus` is Opus only when
+/// `admitted.opus` is set; otherwise it is unclassified exactly as before.
+pub fn source_type_with(path: &Path, admitted: AdmittedFormats) -> Option<SourceType> {
+    if admitted.opus && path.extension().is_some_and(|e| e.as_bytes().eq_ignore_ascii_case(b"opus")) {
+        return Some(SourceType::Opus);
+    }
+    source_type(path)
+}
+
 /// Recursively discover regular admitted files and advertised-but-unsupported
 /// OGG files, without following symbolic links. Duplicates are suppressed by
 /// canonical absolute path, with the first selection retaining its relative
 /// path. Results are ordered by absolute path.
 pub fn discover_inputs(inputs: &[PathBuf]) -> Result<Vec<DiscoveredFile>, WorkflowError> {
+    discover_inputs_with(inputs, AdmittedFormats::default())
+}
+
+/// `discover_inputs` with opted-in formats.
+pub fn discover_inputs_with(inputs: &[PathBuf], admitted: AdmittedFormats) -> Result<Vec<DiscoveredFile>, WorkflowError> {
     let mut found = BTreeMap::<PathBuf, DiscoveredFile>::new();
     for input in inputs {
         let meta = fs::symlink_metadata(input).map_err(|e| io_error("inspect input", input, e))?;
@@ -249,20 +269,20 @@ pub fn discover_inputs(inputs: &[PathBuf]) -> Result<Vec<DiscoveredFile>, Workfl
         let absolute = fs::canonicalize(input).map_err(|e| io_error("resolve input", input, e))?;
         if meta.is_file() {
             let name = absolute.file_name().ok_or_else(|| invalid(&absolute, "missing filename"))?;
-            add_file(&mut found, &absolute, PathBuf::from(name));
+            add_file(&mut found, &absolute, PathBuf::from(name), admitted);
         } else if meta.is_dir() {
             let name = absolute.file_name().ok_or_else(|| invalid(&absolute, "selection has no folder name"))?;
-            walk_directory(&absolute, Path::new(name), &mut found)?;
+            walk_directory(&absolute, Path::new(name), &mut found, admitted)?;
         } else { return Err(invalid(input, "input is neither a regular file nor a directory")); }
     }
     Ok(found.into_values().collect())
 }
-fn add_file(found: &mut BTreeMap<PathBuf, DiscoveredFile>, path: &Path, relative: PathBuf) {
-    if let Some(kind) = source_type(path) {
+fn add_file(found: &mut BTreeMap<PathBuf, DiscoveredFile>, path: &Path, relative: PathBuf, admitted: AdmittedFormats) {
+    if let Some(kind) = source_type_with(path, admitted) {
         found.entry(path.to_owned()).or_insert_with(|| DiscoveredFile { path: path.to_owned(), relative_path: relative, source_type: kind });
     }
 }
-fn walk_directory(dir: &Path, relative: &Path, found: &mut BTreeMap<PathBuf, DiscoveredFile>) -> Result<(), WorkflowError> {
+fn walk_directory(dir: &Path, relative: &Path, found: &mut BTreeMap<PathBuf, DiscoveredFile>, admitted: AdmittedFormats) -> Result<(), WorkflowError> {
     let entries = fs::read_dir(dir).map_err(|e| io_error("read input directory", dir, e))?;
     for entry in entries {
         let entry = entry.map_err(|e| io_error("read input directory entry", dir, e))?;
@@ -270,8 +290,8 @@ fn walk_directory(dir: &Path, relative: &Path, found: &mut BTreeMap<PathBuf, Dis
         let meta = fs::symlink_metadata(&path).map_err(|e| io_error("inspect input entry", &path, e))?;
         if meta.file_type().is_symlink() { continue; }
         let child_relative = relative.join(entry.file_name());
-        if meta.is_dir() { walk_directory(&path, &child_relative, found)?; }
-        else if meta.is_file() { add_file(found, &path, child_relative); }
+        if meta.is_dir() { walk_directory(&path, &child_relative, found, admitted)?; }
+        else if meta.is_file() { add_file(found, &path, child_relative, admitted); }
     }
     Ok(())
 }
@@ -313,7 +333,7 @@ fn resolved_format(format: AudioFormat, codec: SourceCodec, path: &Path) -> Resu
     if format != AudioFormat::MatchInput { return Ok(format); }
     Ok(match codec {
         SourceCodec::Mp3 => AudioFormat::Mp3, SourceCodec::Aac => AudioFormat::Aac,
-        SourceCodec::Alac => AudioFormat::Alac, SourceCodec::Flac => AudioFormat::Flac,
+        SourceCodec::Alac => AudioFormat::Alac, SourceCodec::Flac => AudioFormat::Flac, SourceCodec::Opus => AudioFormat::Opus,
         SourceCodec::Lpcm => match path.extension().map(OsStr::as_bytes) {
             Some(e) if e.eq_ignore_ascii_case(b"flac") => AudioFormat::Flac,
             Some(e) if e.eq_ignore_ascii_case(b"aif") || e.eq_ignore_ascii_case(b"aiff") => AudioFormat::Aiff,
@@ -325,7 +345,7 @@ fn resolved_format(format: AudioFormat, codec: SourceCodec, path: &Path) -> Resu
 fn extension(format: AudioFormat, source: &Path, requested: AudioFormat) -> &'static str {
     match format {
         AudioFormat::Wav => "wav", AudioFormat::Mp3 => "mp3", AudioFormat::Alac | AudioFormat::Aac => "m4a",
-        AudioFormat::Flac => "flac",
+        AudioFormat::Flac => "flac", AudioFormat::Opus => "opus",
         AudioFormat::Aiff if requested == AudioFormat::MatchInput && source.extension().is_some_and(|e| e.as_bytes().eq_ignore_ascii_case(b"aif")) => "aif",
         AudioFormat::Aiff => "aiff", AudioFormat::MatchInput => unreachable!("format is resolved before extension selection"),
     }
@@ -361,7 +381,7 @@ impl OutputPlan {
         if !meta.file_type().is_file() { return Err(invalid(&file.path, "source must be a regular non-symlink file")); }
         let source = fs::canonicalize(&file.path).map_err(|e| io_error("resolve source", &file.path, e))?;
         if source.file_name() != file.relative_path.file_name() { return Err(invalid(&file.relative_path, "relative filename differs from source")); }
-        let kind = source_type(&source).ok_or_else(|| WorkflowError::UnsupportedSource(source.clone()))?;
+        let kind = source_type_with(&source, AdmittedFormats { opus: file.source_type == SourceType::Opus }).ok_or_else(|| WorkflowError::UnsupportedSource(source.clone()))?;
         if kind != file.source_type { return Err(invalid(&source, "source classification changed")); }
         if matches!(kind, SourceType::ProtectedM4p | SourceType::ProtectedWlMp3) { return Err(WorkflowError::ProtectedSource(source)); }
         if kind == SourceType::OggUnverified { return Err(WorkflowError::UnsupportedSource(source)); }
@@ -1086,8 +1106,9 @@ fn open_identity(path: &Path) -> Result<File, WorkflowError> {
     let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid(path, "path contains NUL"))?;
     #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | O_NOFOLLOW | libc::O_CLOEXEC;
+    // O_NONBLOCK keeps the open of a FIFO (an attacker-chosen path) from blocking; the type check below then refuses it.
     #[cfg(target_os = "macos")]
-    let flags = libc::O_EVTONLY | O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_EVTONLY | O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     #[cfg(target_os = "linux")]
     let fd = unsafe { libc::open(path_c.as_ptr(), flags) };
     #[cfg(target_os = "macos")]
@@ -1099,7 +1120,16 @@ fn open_identity(path: &Path) -> Result<File, WorkflowError> {
             unsafe { libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | O_NOFOLLOW | libc::O_CLOEXEC) }
         } else { fd }
     };
-    if fd < 0 { return Err(io_error("pin file identity", path, io::Error::last_os_error())); }
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        // O_EVTONLY|O_NOFOLLOW fails with ELOOP on a symbolic link, where Linux's O_PATH opens
+        // the link itself and the type check below rejects it. Both report the same refusal.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::ELOOP) && fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(invalid(path, "not a regular non-symlink file"));
+        }
+        return Err(io_error("pin file identity", path, error));
+    }
     let file = unsafe { File::from_raw_fd(fd) };
     let meta = file.metadata().map_err(|e| io_error("inspect pinned file identity", path, e))?;
     if !meta.file_type().is_file() { return Err(invalid(path, "not a regular non-symlink file")); }

@@ -13,7 +13,7 @@ fn pn_dispatch_distinguishes_same_format_and_mp4_to_mp3() {
         for destination in [Mp3, Mp4, Wav, Aiff, Flac] {
             let expected = match source {
                 Mp3 => DirectCopy::Id3, Mp4 => DirectCopy::Mp4, Wav => DirectCopy::Wav,
-                Aiff => DirectCopy::Aiff, Flac => DirectCopy::Flac,
+                Aiff => DirectCopy::Aiff, Flac => DirectCopy::Flac, Opus => unreachable!("Opus is handled in Rust and covered by tests/opus_cli.rs"),
             };
             assert_eq!(transfer_mode(source, destination, OutputChoice::MatchInput).unwrap(), TransferMode::Direct(expected));
             if source != destination && (source != Mp4 || destination != Mp3) {
@@ -541,12 +541,14 @@ mod candidate_bridge {
                 let body = flac(&comments, Some(GIF));
                 if flac_id3 { let mut out = id3; out.extend(body); out } else { body }
             }
+            Format::Opus => unreachable!("Opus never reaches the native bridge"),
         }
     }
     fn format_name(format: Format) -> (&'static str, &'static str) {
         match format {
             Format::Mp3 => ("mp3", "mp3"), Format::Mp4 => ("mp4", "m4a"),
             Format::Wav => ("wav", "wav"), Format::Aiff => ("aiff", "aiff"), Format::Flac => ("flac", "flac"),
+            Format::Opus => unreachable!("Opus never reaches the native bridge"),
         }
     }
     fn create_case() -> PathBuf {

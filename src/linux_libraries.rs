@@ -5,23 +5,25 @@ use std::fmt;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryKind { Flac, Lame, TagBridge }
+pub enum LibraryKind { Flac, Lame, TagBridge, Opus }
 impl LibraryKind {
     fn label(self) -> &'static str {
-        match self { Self::Flac => "libFLAC", Self::Lame => "LAME", Self::TagBridge => "TagLib bridge" }
+        match self { Self::Flac => "libFLAC", Self::Lame => "LAME", Self::TagBridge => "TagLib bridge", Self::Opus => "libopus" }
     }
     pub fn expected_sha256(self) -> &'static str {
         #[cfg(target_arch = "aarch64")]
         { match self {
             Self::Flac => "41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72",
             Self::Lame => "c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87",
-            Self::TagBridge => "8708af52d83fc7fdb6a487d72abc90ff4bd9f9b94e313436cc6fb68cc9db2aa0",
+            Self::TagBridge => "5c52c5f16da96177a98b3f7569257aeb33d7024b235903da7f0afaecccf73cde",
+            Self::Opus => "c09146de56e00143e350f3f988ce2e1e01048f58b6a159c93dc176f5899fc7c6",
         } }
         #[cfg(target_arch = "x86_64")]
         { match self {
             Self::Flac => "9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755",
             Self::Lame => "cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b",
-            Self::TagBridge => "ea86881cb6615d7cf8614dfb285e8670d978de621957b15611b8bd6d5b0e1ad5",
+            Self::TagBridge => "8c61f6bba22ad2e92bb1774e695c3a1cca5a1658e9ffc86e3ef65418550cefb9",
+            Self::Opus => "d09791af2f266f370537a0312490abf16cc882f2bd5cbc89b6f288522513b1f0",
         } }
     }
 }

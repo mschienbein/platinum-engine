@@ -1,389 +1,521 @@
-//! Portable (open-source, opt-in) MP3 decoder: accuracy against recorded AudioToolbox output,
-//! pinned deterministic output, the opt-in gate and the refusals.
+//! The portable MP3 reader against what AudioToolbox delivered, replayed from the golden fixtures.
 //!
-//! The fixtures in `tests/fixtures/mp3` are generated audio (see
-//! `tools/portable/mp3dec/make_fixtures.py`); the `.apple.s16` files are what AudioToolbox
-//! delivered for each of them on macOS arm64.
+//! `tests/fixtures/mp3-exact/` holds generated MP3 inputs and, for each, the macOS arm64 reference recorded
+//! through the engine's own `apple_codec::Reader` (see its README): whether `ExtAudioFileOpenURL` accepted the
+//! file and with which `OSStatus` it refused, the source description, the file-length and bitrate properties, and
+//! the SHA-256 of the float32 stream of 512-frame reads (planar stereo, and interleaved at the source channel
+//! count), including the frames delivered before a read failed and that failure's `OSStatus`. `readsizes.json` adds
+//! the same recordings at 100-, 513- and 4096-frame reads for the files whose result depends on the read size (every
+//! read failure, every stream change) and a sample of clean streams. Everything is compared bit for bit through the
+//! public `Reader`; no Apple component is needed at run time, so the same test runs unchanged on macOS
+//! (`--features portable`), Linux arm64 and Linux x86_64.
 
-use platinum_engine::portable::audio::mp3::{Mp3Error, Mp3Stream};
-use platinum_engine::portable::audio::{CodecError, Reader, ReaderOptions};
-use platinum_engine::portable::digest::Sha256;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+#[path = "support/mp3_exact.rs"]
+mod mp3_exact;
 
-const OPT_IN: ReaderOptions = ReaderOptions { non_identical_mp3: true };
+use mp3_exact::{BLOCK, Failure, Fixture, Fixtures, ReadSizes, Scratch, decode_interleaved, decode_interleaved_block, decode_planar, decode_planar_block, failure, hex, open};
+use platinum_engine::portable::audio::{CodecError, Reader};
+use platinum_engine::portable::digest::sha256;
+use serde_json::json;
+use std::fs;
 
-fn dir() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mp3") }
+const DTA: i32 = 0x6474_613f; // 'dta?'
+const WHT: i32 = 0x7768_743f; // 'wht?'
+const EOF: i32 = -39;
+const FMT: i32 = 0x666d_743f; // 'fmt?'
+const BADA: i32 = 0x6261_6461; // 'bada'
+const OPEN: &str = "ExtAudioFileOpenURL";
+const CLIENT: &str = "ExtAudioFileSetProperty(client format)";
 
-struct Fixture { name: String, rate: u32, channels: usize, length_property: i64, delivered: usize }
-
-fn fixtures() -> Vec<Fixture> {
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir().join("manifest.json")).unwrap()).unwrap();
-    manifest.as_array().unwrap().iter().map(|e| Fixture {
-        name: e["name"].as_str().unwrap().to_owned(),
-        rate: e["rate"].as_u64().unwrap() as u32,
-        channels: e["apple_channels"].as_u64().unwrap() as usize,
-        length_property: e["apple_length_property"].as_i64().unwrap(),
-        delivered: e["apple_frames_delivered"].as_u64().unwrap() as usize,
-    }).collect()
+/// Write the fixture to a scratch file and open it as the engine does.
+fn open_fixture(scratch: &Scratch, fixtures: &Fixtures, index: usize, fixture: &Fixture) -> Result<Reader, CodecError> {
+    open(&scratch.write(&format!("{index:04}.mp3"), fixtures.bytes(fixture)))
 }
-
-fn mp3_path(name: &str) -> PathBuf { dir().join(format!("{name}.mp3")) }
-
-/// Decode a whole fixture through the stream API with `chunk`-frame reads.
-fn decode(name: &str, chunk: usize) -> (Vec<f32>, Vec<f32>) { decode_path(&mp3_path(name), chunk) }
-
-fn decode_path(path: &Path, chunk: usize) -> (Vec<f32>, Vec<f32>) {
-    drain(&mut Mp3Stream::open(File::open(path).unwrap()).unwrap(), chunk)
-}
-
-fn drain(stream: &mut Mp3Stream, chunk: usize) -> (Vec<f32>, Vec<f32>) {
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    let (mut l, mut r) = (vec![0f32; chunk], vec![0f32; chunk]);
-    loop {
-        let n = stream.read_planar(&mut l, &mut r).unwrap();
-        if n == 0 { break; }
-        left.extend_from_slice(&l[..n]);
-        right.extend_from_slice(&r[..n]);
-    }
-    (left, right)
-}
-
-fn read_json(path: &Path) -> serde_json::Value { serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap() }
-
-fn read_s16(path: &Path) -> Vec<i16> {
-    std::fs::read(path).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
-}
-
-/// (identical samples, largest difference in 16-bit LSB, samples compared) against AudioToolbox's
-/// interleaved 16-bit capture.
-fn accuracy(name: &str, left: &[f32], right: &[f32], channels: usize, apple: &[i16]) -> (usize, i32, usize) {
-    assert_eq!(apple.len(), left.len() * channels, "{name}: capture size");
-    let (mut identical, mut max_lsb, mut total) = (0usize, 0i32, 0usize);
-    for (frame, pair) in left.iter().zip(right).enumerate() {
-        for (c, value) in [*pair.0, *pair.1].into_iter().take(channels).enumerate() {
-            let mine = (f64::from(value) * 32768.0).round() as i32;
-            assert_eq!(f64::from(value) * 32768.0, f64::from(mine), "{name}: output is not on the 16-bit grid");
-            let diff = (mine - i32::from(apple[frame * channels + c])).abs();
-            identical += usize::from(diff == 0);
-            max_lsb = max_lsb.max(diff);
-            total += 1;
-        }
-    }
-    (identical, max_lsb, total)
-}
-
-fn digest(left: &[f32], right: &[f32]) -> String {
-    let mut hash = Sha256::new();
-    let mut bytes = Vec::with_capacity(left.len() * 8);
-    for (l, r) in left.iter().zip(right) {
-        bytes.extend_from_slice(&l.to_bits().to_le_bytes());
-        bytes.extend_from_slice(&r.to_bits().to_le_bytes());
-    }
-    hash.update(&bytes);
-    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// SHA-256 of the decoded planar float bits (left, right per frame), identical on macOS
-/// `--features portable`, Linux arm64 and Linux x86_64 (see local-artifacts/portable-parity/mp3dec-01).
-const PINNED: [(&str, &str); 16] = [
-    ("ffmpeg_cbr128_44100", "a5238e12ac16976d317b1743778c0c7abb18d23870e8a1525585b5a4c819ba14"),
-    ("lame_abr96_32000_js", "0ad476bad52a5fa05f7239dd430f0762de4d0238524cacad7d3b8b7d16375800"),
-    ("lame_cbr128_44100_crc", "3cce68e374a84e182a7222dfddc9ee8fd774d9ea19521a8ed01352ea97d5c486"),
-    ("lame_cbr128_44100_js", "c98bf5f7fec9dc7f03fba3085525872c09dd6659c8fb86ab5bacb3275489cbd4"),
-    ("lame_cbr128_44100_mono", "72731c587176f325b45a8a9d941ae4c560bf4ad6b4207ee62219ba22c5ef0e95"),
-    ("lame_cbr192_48000_stereo", "17ac499d285168997c8f173f3a29364c1d456b1d13cfd7cf5ccdbf418f9b61e3"),
-    ("lame_cbr32_11025_mono", "728c0c8cbde03ef7cc11cb7b3dac4ce698ab4ecaaef0669955b62de4af4e18c0"),
-    ("lame_loud_cbr128", "86465707a28f69782bdbed667e52b5be09de83838a3e59b6c13a6f58e8c8ec9b"),
-    ("lame_vbrV2_22050_js", "d57c7665a163dff5dc6bdb7263046aa332c4511559afa25824eb20ed772e5ab4"),
-    ("tagless_cbr128_44100", "b8735fb44f5a2807f5dd81d240e66d11db6c416216ecc89a9bd114fbf4783e8c"),
-    // One per VBRI layout: every variant of a layout decodes to the same samples.
-    ("vbri/payload_vbrV2_44100", "ddfabf44c4da918f505b313df48f63fed567ff78344a23383f9cdba9e388c7b4"),
-    ("vbri/vbri_v1m_normal", "3176259de8c4ac8644d92655c7f0b67a485c692779cb810968be1e909d70ba97"),
-    ("vbri/vbri_v1s_normal", "2f3396ad8fac128df43de19ec8d3cefb40d3d237174641bb64ab17d5d137b27c"),
-    ("vbri/vbri_v1vbr_normal", "86427f969ba12da2d403aa0e808fcc4a96c0edc34b9ea0b39f2a7945bb37fefd"),
-    ("vbri/vbri_v25m_normal", "351f13618b6bccd9b0fcf8bf800db3f5d252af941dd1e575b81f4dabee14101f"),
-    ("vbri/vbri_v2svbr_normal", "c552bbd5b45b91b026906b47348ad4ac4cc3ab3add2f02fc8dc0e41f9fd7529b"),
-];
 
 #[test]
-fn length_alignment_and_samples_match_recorded_audiotoolbox_output() {
-    for fixture in fixtures() {
-        let stream = Mp3Stream::open(File::open(mp3_path(&fixture.name)).unwrap()).unwrap();
-        let info = stream.info();
-        assert_eq!((info.sample_rate, info.channels as usize, info.length_frames), (fixture.rate, fixture.channels, fixture.length_property), "{}", fixture.name);
-        let (left, right) = decode(&fixture.name, 4096);
-        assert_eq!(left.len(), fixture.delivered, "{}: decoded frame count", fixture.name);
-        let apple: Vec<i16> = std::fs::read(dir().join(format!("{}.apple.s16", fixture.name))).unwrap()
-            .chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-        assert_eq!(apple.len(), fixture.delivered * fixture.channels, "{}: reference size", fixture.name);
-        let (mut identical, mut max_lsb, mut total) = (0usize, 0i32, 0usize);
-        for (frame, pair) in left.iter().zip(&right).enumerate() {
-            for (c, value) in [*pair.0, *pair.1].into_iter().take(fixture.channels).enumerate() {
-                let mine = (f64::from(value) * 32768.0).round() as i32;
-                assert_eq!(f64::from(value) * 32768.0, f64::from(mine), "{}: output is not on the 16-bit grid", fixture.name);
-                let diff = (mine - i32::from(apple[frame * fixture.channels + c])).abs();
-                identical += usize::from(diff == 0);
-                max_lsb = max_lsb.max(diff);
-                total += 1;
+fn the_fixture_pack_is_intact_and_covers_what_it_claims() {
+    let fixtures = Fixtures::load();
+    let manifest = &fixtures.manifest;
+    assert_eq!(hex(&sha256(&fixtures.pack)), manifest["pack"]["sha256"].as_str().unwrap(), "pack.bin does not match the manifest");
+    assert_eq!(fixtures.pack.len() as u64, manifest["pack"]["bytes"].as_u64().unwrap());
+    let mut end = 0usize;
+    for fixture in &fixtures.files {
+        assert_eq!(fixture.offset, end, "{}: the pack is not contiguous", fixture.id);
+        end += fixture.length;
+        assert!(fixture.length <= 40_000, "{}: fixtures are small", fixture.id);
+        assert_eq!(hex(&sha256(fixtures.bytes(fixture))), fixture.sha256, "{}: input bytes", fixture.id);
+    }
+    assert_eq!(end, fixtures.pack.len());
+    assert!(fixtures.files.windows(2).all(|pair| pair[0].id < pair[1].id), "manifest is sorted by id");
+    assert!(fixtures.pack.len() <= 5_000_000, "the fixture pack stays small");
+
+    assert!(fixtures.files.len() >= 280, "{} fixtures", fixtures.files.len());
+    let refused: Vec<i32> = fixtures.files.iter().filter_map(|f| f.open_error.as_ref().map(|e| e.status)).collect();
+    for status in [DTA, WHT, EOF, FMT] { assert!(refused.contains(&status), "no fixture refused with {status:#x}"); }
+    let failed: Vec<i32> = fixtures.files.iter().filter_map(|f| f.planar512.as_ref()?.error.as_ref().map(|e| e.status)).collect();
+    for status in [DTA, BADA] { assert!(failed.contains(&status), "no fixture whose read fails with {status:#x}"); }
+    let mut rates: Vec<u32> = fixtures.files.iter().filter_map(|f| f.info.as_ref().map(|i| i.sample_rate)).collect();
+    rates.sort_unstable();
+    rates.dedup();
+    assert_eq!(rates, [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000]);
+    let formats: Vec<u32> = { let mut f: Vec<u32> = fixtures.files.iter().filter_map(|f| f.info.as_ref().map(|i| i.format_id)).collect(); f.sort_unstable(); f.dedup(); f };
+    assert_eq!(formats, [0x2e6d_7031, 0x2e6d_7032, 0x2e6d_7033], "MP1, MP2 and MP3 all open");
+    assert!(fixtures.files.iter().any(|f| f.info.as_ref().is_some_and(|i| i.channels == 1)));
+    assert!(fixtures.files.iter().any(|f| f.info.as_ref().is_some_and(|i| i.channels == 2)));
+}
+
+#[test]
+fn every_fixture_is_bit_exact_with_the_apple_reference() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("golden");
+    let mut mismatches = Vec::new();
+    let (mut opened, mut refused, mut failed_reads, mut frames) = (0usize, 0usize, 0usize, 0u64);
+    for (index, fixture) in fixtures.files.iter().enumerate() {
+        let path = scratch.write(&format!("{index:04}.mp3"), fixtures.bytes(fixture));
+        let mut bad = |what: &str, expected: String, actual: String| mismatches.push(format!("{}: {what}: expected {expected}, got {actual}", fixture.id));
+        let reader = match open(&path) {
+            Ok(reader) => {
+                if let Some(expected) = &fixture.open_error { bad("open", format!("{expected:?}"), "opened".into()); continue; }
+                reader
+            }
+            Err(error) => {
+                let actual = failure(error);
+                if fixture.open_error.as_ref() != Some(&actual) { bad("open", format!("{:?}", fixture.open_error), format!("{actual:?}")); }
+                refused += 1;
+                continue;
+            }
+        };
+        opened += 1;
+        let info = fixture.info.as_ref().unwrap();
+        let source = reader.source_format();
+        let got = (source.sample_rate, source.format_id, source.format_flags, source.bytes_per_packet, source.frames_per_packet,
+            source.bytes_per_frame, source.channels_per_frame, source.bits_per_channel);
+        let want = (f64::from(info.sample_rate), info.format_id, 0, 0, info.frames_per_packet, 0, info.channels, 0);
+        if got != want { bad("source format", format!("{want:?}"), format!("{got:?}")); }
+        let length = reader.file_length_frames().unwrap();
+        if length != info.length_frames { bad("file length", info.length_frames.to_string(), length.to_string()); }
+        let bitrate = reader.bitrate().unwrap();
+        if bitrate != info.bitrate { bad("bitrate", info.bitrate.to_string(), bitrate.to_string()); }
+        let client = reader.client_format();
+        if (client.sample_rate, client.channels_per_frame, client.format_flags, client.bits_per_channel)
+            != (f64::from(info.sample_rate), info.channels, 9, 32) {
+            bad("client format", format!("{} Hz {} ch float", info.sample_rate, info.channels), format!("{client:?}"));
+        }
+        reader.close().unwrap();
+
+        let mut planar_reader = open(&path).unwrap();
+        let planar = decode_planar(&mut planar_reader);
+        if Some(&planar) != fixture.planar512.as_ref() { bad("planar 512 stream", format!("{:?}", fixture.planar512), format!("{planar:?}")); }
+        let mut inter_reader = open(&path).unwrap();
+        let inter = decode_interleaved(&mut inter_reader);
+        if Some(&inter) != fixture.inter512.as_ref() { bad("interleaved 512 stream", format!("{:?}", fixture.inter512), format!("{inter:?}")); }
+        failed_reads += usize::from(planar.error.is_some());
+        frames += planar.frames;
+    }
+    println!("{} fixtures: {opened} opened, {refused} refused at open, {failed_reads} with a read failure, {frames} frames compared", fixtures.files.len());
+    assert!(mismatches.is_empty(), "{} mismatches against the Apple reference:\n{}", mismatches.len(), mismatches.iter().take(25).cloned().collect::<Vec<_>>().join("\n"));
+    assert!(opened > 150 && refused > 15 && failed_reads > 10 && frames > 1_000_000, "the fixtures must exercise open, refusal and read failure");
+}
+
+/// Apple's result depends on the read size when a read fails (the frames the failed read had gathered are lost, and the
+/// packet groups the converter asks for shift): 254 of the 7,100 + 2,300 + 6,440 corpus files differ between 512 and 4096 frames.
+/// The recordings below are `apple_probe dump ... planar|inter BLOCK` of the engine's own macOS reader, and the reader
+/// reproduces all of them: delivered frames, the failing call and its `OSStatus`, and every sample.
+#[test]
+fn read_sizes_other_than_512_match_the_apple_recordings() {
+    let fixtures = Fixtures::load();
+    let sizes = ReadSizes::load();
+    assert_eq!(sizes.document["pack_sha256"], fixtures.manifest["pack"]["sha256"], "recorded against another pack");
+    assert_eq!(sizes.document["block_sizes"], json!([100, 513, 4096]));
+    assert_eq!(sizes.document["apple"]["probe_sha256"], fixtures.manifest["apple"]["probe_sha256"]);
+    let scratch = Scratch::new("readsizes");
+    let (mut records, mut differing, mut with_error, mut mismatches) = (0usize, 0usize, 0usize, Vec::new());
+    for file in &sizes.files {
+        let (index, fixture) = fixtures.files.iter().enumerate().find(|(_, f)| f.id == file.id).unwrap_or_else(|| panic!("no fixture {}", file.id));
+        assert_eq!(file.sha256, fixture.sha256, "{}", file.id);
+        let at_512 = (fixture.planar512.as_ref().unwrap(), fixture.inter512.as_ref().unwrap());
+        let path = scratch.write(&format!("{index:04}.mp3"), fixtures.bytes(fixture));
+        for (shape, rows, reference) in [("planar", &file.planar, at_512.0), ("interleaved", &file.inter, at_512.1)] {
+            assert_eq!(rows.len(), 3, "{}: {shape} sizes", file.id);
+            for (block, expected) in rows {
+                let mut reader = open(&path).unwrap();
+                let actual = if shape == "planar" { decode_planar_block(&mut reader, *block) } else { decode_interleaved_block(&mut reader, *block) };
+                records += 1;
+                differing += usize::from(expected != reference);
+                with_error += usize::from(expected.error.is_some());
+                if &actual != expected {
+                    mismatches.push(format!("{} {shape} {block}: expected {expected:?}, got {actual:?}", file.id));
+                }
             }
         }
-        assert!(max_lsb <= 2, "{}: max difference {max_lsb} LSB", fixture.name);
-        assert!(identical * 100 >= total * 80, "{}: only {identical}/{total} samples identical", fixture.name);
-        if fixture.channels == 1 { assert_eq!(left, right, "{}: mono must be duplicated into the second plane", fixture.name); }
     }
+    println!("{} files, {records} recordings ({differing} differ from the 512-frame result, {with_error} end in a read failure)", sizes.files.len());
+    assert!(mismatches.is_empty(), "{} mismatches against the Apple recordings:\n{}", mismatches.len(), mismatches.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
+    assert!(sizes.files.len() >= 50 && records >= 300, "{} files, {records} recordings", sizes.files.len());
+    assert!(differing >= 60, "only {differing} recordings differ from the 512-frame ones: the test would not detect a size-independent decoder");
 }
 
 #[test]
-fn output_is_pinned_and_independent_of_the_read_size() {
-    for (name, expected) in PINNED {
-        let (left, right) = decode(name, 4096);
-        assert_eq!(digest(&left, &right), expected, "{name}");
-    }
-    for name in ["lame_cbr128_44100_js", "lame_vbrV2_22050_js", "lame_cbr32_11025_mono"] {
-        let reference = decode(name, 4096);
-        for chunk in [1, 7, 576, 1152, 1153, 100_000] {
-            assert!(decode(name, chunk) == reference, "{name}: read size {chunk} changes the output");
+fn files_apple_refuses_are_refused_with_apples_status_whatever_the_client_rate() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("refused");
+    let mut checked = 0;
+    for (index, fixture) in fixtures.files.iter().enumerate().filter(|(_, f)| !f.opens()) {
+        let expected = fixture.open_error.as_ref().unwrap();
+        assert!(expected.operation == OPEN || expected.operation == CLIENT, "{}: {expected:?}", fixture.id);
+        let path = scratch.write(&format!("{index:04}.mp3"), fixtures.bytes(fixture));
+        for rate in [None, Some(44_100.0), Some(48_000.0), Some(8_000.0)] {
+            let actual = Reader::open(&path, rate).map(|_| ()).map_err(failure);
+            assert_eq!(actual, Err(expected.clone()), "{} at {rate:?}", fixture.id);
         }
+        checked += 1;
     }
+    assert!(checked >= 20, "{checked} refused fixtures");
 }
 
 #[test]
-fn reader_refuses_mp3_without_the_opt_in_and_decodes_with_it() {
-    let path = mp3_path("lame_cbr128_44100_js");
-    match Reader::open(&path, None) {
-        Err(CodecError::UnsupportedCodec { codec: "MP3", .. }) => {}
-        other => panic!("default open must refuse MP3, got {:?}", other.map(|_| ())),
+fn short_and_non_mp3_files_are_refused_as_an_mp3_open_not_as_an_io_failure() {
+    let scratch = Scratch::new("short");
+    let empty = scratch.write("empty.mp3", b"");
+    assert_eq!(open(&empty).map(|_| ()).map_err(failure), Err(Failure { operation: OPEN.into(), status: WHT }));
+    for (name, bytes) in [("one", &b"\xff"[..]), ("sync", b"\xff\xfb"), ("text", b"not audio at all, just text"), ("zeros", &[0u8; 64])] {
+        let path = scratch.write(&format!("{name}.mp3"), bytes);
+        let error = open(&path).map(|_| ()).map_err(failure).expect_err(name);
+        assert_eq!(error.operation, OPEN, "{name}");
+        assert!([DTA, EOF, WHT].contains(&error.status), "{name}: {error:?}");
     }
-    let mut reader = Reader::open_with(&path, None, OPT_IN).unwrap();
-    assert!(reader.non_identical());
-    assert_eq!(reader.source_format().sample_rate, 44100.0);
-    assert_eq!(reader.source_format().channels_per_frame, 2);
-    assert_eq!(reader.source_format().frames_per_packet, 1152);
-    assert_eq!(reader.file_length_frames().unwrap(), 13230);
-    assert_eq!(reader.bitrate().unwrap(), 128_000);
-    reader.set_stereo_planar(44100.0).unwrap();
-    let (expected_left, expected_right) = decode("lame_cbr128_44100_js", 4096);
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    let (mut l, mut r) = (vec![0f32; 1000], vec![0f32; 1000]);
-    loop {
-        let n = reader.read_stereo_planar(&mut l, &mut r).unwrap();
-        if n == 0 { break; }
-        left.extend_from_slice(&l[..n]);
-        right.extend_from_slice(&r[..n]);
+    // The file name decides which reader looks. An ADTS stream named .mp3 is MPEG data with no frame header in it (Apple: 'dta?');
+    // under any other name AudioFile recognises ADTS, which it decodes and this port refuses.
+    let adts_bytes = [0xff, 0xf9, 0x50, 0xa0, 0x01, 0xa0, 0x00, 0x21, 0x20, 0x03, 0x40, 0x68];
+    let adts = scratch.write("adts.mp3", &adts_bytes);
+    assert_eq!(open(&adts).map(|_| ()).map_err(failure), Err(Failure { operation: OPEN.into(), status: DTA }));
+    let adts = scratch.write("adts.bin", &adts_bytes);
+    assert!(matches!(open(&adts), Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })));
+    let mut wav = b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0".to_vec();
+    wav.extend_from_slice(&[0x55, 0, 2, 0, 0x44, 0xac, 0, 0, 0x10, 0xb1, 2, 0, 1, 0, 0, 0]); // tag 0x55: MPEG layer III in WAVE
+    wav.extend_from_slice(b"data\0\0\0\0");
+    let in_wave = scratch.write("in-wave.wav", &wav);
+    match open(&in_wave) {
+        Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason }) => assert!(reason.contains("WAVE"), "{reason}"),
+        other => panic!("MP3 in a WAVE container must stay refused: {:?}", other.map(|_| ())),
     }
-    assert!(left == expected_left && right == expected_right);
+    let flac_named = scratch.write("song.flac", b"fLaC");
+    assert!(matches!(open(&flac_named), Err(CodecError::UnsupportedFormat(_))), "the FLAC path suffix keeps its refusal");
 }
 
 #[test]
-fn reader_interleaved_read_matches_the_stream_for_stereo_and_mono() {
-    for (name, channels) in [("lame_cbr128_44100_js", 2usize), ("lame_cbr128_44100_mono", 1)] {
-        let (left, right) = decode(name, 4096);
-        let mut reader = Reader::open_with(mp3_path(name), None, OPT_IN).unwrap();
-        let mut all = Vec::new();
-        let mut buffer = vec![0f32; 512 * channels];
-        loop {
-            let n = reader.read(&mut buffer).unwrap();
-            if n == 0 { break; }
-            all.extend_from_slice(&buffer[..n * channels]);
-        }
-        assert_eq!(all.len(), left.len() * channels, "{name}");
-        for (frame, chunk) in all.chunks_exact(channels).enumerate() {
-            assert_eq!(chunk[0], left[frame], "{name} frame {frame}");
-            if channels == 2 { assert_eq!(chunk[1], right[frame], "{name} frame {frame}"); }
-        }
-    }
-}
-
-#[test]
-fn sample_rate_conversion_is_refused_not_approximated() {
-    let path = mp3_path("lame_cbr128_44100_js");
-    for rate in [48000.0, 22050.0, 96000.0] {
-        match Reader::open_with(&path, Some(rate), OPT_IN) {
-            Err(CodecError::UnsupportedSampleRateConversion { source_rate, client_rate }) => assert_eq!((source_rate, client_rate), (44100.0, rate)),
+fn a_client_rate_that_differs_from_the_file_is_refused_never_resampled() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("rates");
+    let (index, fixture) = fixtures.files.iter().enumerate()
+        .find(|(_, f)| f.info.as_ref().is_some_and(|i| i.sample_rate == 44_100 && i.channels == 2 && i.format_id == 0x2e6d_7033) && f.planar512.as_ref().is_some_and(|s| s.error.is_none()))
+        .expect("a 44.1 kHz stereo fixture");
+    let path = scratch.write("a.mp3", fixtures.bytes(fixture));
+    let _ = index;
+    for rate in [48_000.0, 22_050.0, 96_000.0] {
+        match Reader::open(&path, Some(rate)) {
+            Err(CodecError::UnsupportedSampleRateConversion { source_rate, client_rate }) => assert_eq!((source_rate, client_rate), (44_100.0, rate)),
             other => panic!("rate {rate}: expected a refusal, got {:?}", other.map(|_| ())),
         }
     }
-    assert!(Reader::open_with(&path, Some(44100.0), OPT_IN).is_ok());
-}
-
-fn write_temp(tag: &str, bytes: &[u8]) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("platinum-mp3-{}-{tag}.mp3", std::process::id()));
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
-#[test]
-fn unmatched_variants_are_refused_with_typed_errors() {
-    let good = std::fs::read(mp3_path("tagless_cbr128_44100")).unwrap();
-    let frame = 417usize;
-    // Layer II header (MPEG-1, layer II, 128 kbit/s, 44.1 kHz): 144 * 128000 / 44100 = 417 bytes.
-    let mut layer2 = vec![0xff, 0xfd, 0x80, 0x00];
-    layer2.resize(417, 0);
-    let mut data = layer2.repeat(4);
-    let path = write_temp("layer2", &data);
-    assert!(matches!(Mp3Stream::open(File::open(&path).unwrap()), Err(Mp3Error::Unsupported(_))), "layer II");
-    // Free-format header (bitrate index 0).
-    data = vec![0xff, 0xfb, 0x00, 0x00];
-    data.resize(417, 0);
-    let path = write_temp("free", &data.repeat(4));
-    assert!(matches!(Mp3Stream::open(File::open(&path).unwrap()), Err(Mp3Error::Unsupported("free-format MPEG audio"))), "free format");
-    // A file that is only a truncated first frame.
-    let path = write_temp("truncated", &good[..frame / 2]);
-    assert!(Mp3Stream::open(File::open(&path).unwrap()).is_err(), "half a frame");
-    // Not an MP3 at all.
-    let path = write_temp("text", b"this is not audio data, just text".repeat(40).as_slice());
-    assert!(matches!(Mp3Stream::open(File::open(&path).unwrap()), Err(Mp3Error::NotMp3)));
-    // Through the Reader the same inputs surface as typed CodecError values.
-    let path = write_temp("layer2b", &layer2.repeat(4));
-    assert!(matches!(Reader::open_with(&path, None, OPT_IN), Err(CodecError::UnsupportedCodec { codec: "MP3", .. })));
-    for tag in ["layer2", "free", "truncated", "text", "layer2b"] {
-        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("platinum-mp3-{}-{tag}.mp3", std::process::id())));
+    for rate in [f64::NAN, 0.0, -44_100.0, f64::INFINITY] {
+        assert!(matches!(Reader::open(&path, Some(rate)), Err(CodecError::InvalidInput(_))), "{rate}");
     }
+    let mut reader = Reader::open(&path, Some(44_100.0)).unwrap();
+    assert!(matches!(reader.set_stereo_planar(48_000.0), Err(CodecError::UnsupportedSampleRateConversion { source_rate: 44_100.0, client_rate: 48_000.0 })));
+    assert_eq!(reader.client_format().format_flags, 9, "a refused setter leaves the client format alone");
+    reader.set_stereo_planar(44_100.0).unwrap();
+    let client = reader.client_format();
+    assert_eq!((client.format_flags, client.channels_per_frame, client.bytes_per_frame), (0x29, 2, 4));
 }
 
 #[test]
-fn mixed_blocks_and_mpeg2_intensity_stereo_are_refused() {
-    // One MPEG-1 stereo frame whose side information marks channel 0 of granule 0 as a mixed block.
-    let mut frame = vec![0u8; 417];
-    frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
-    // side info starts at byte 4: 9 bits main_data_begin + 3 private + 8 scfsi bits = 20 bits, then
-    // granule 0 channel 0: 12+9+8+4 bits, window_switching_flag, block_type (2), mixed_block_flag.
-    let set_bit = |frame: &mut Vec<u8>, bit: usize| frame[4 + bit / 8] |= 0x80 >> (bit % 8);
-    let base = 20 + 12 + 9 + 8 + 4;
-    set_bit(&mut frame, base);          // window_switching_flag
-    set_bit(&mut frame, base + 1);      // block_type = 2 (binary 10)
-    set_bit(&mut frame, base + 3);      // mixed_block_flag
-    let path = write_temp("mixed", &frame.repeat(4));
-    assert!(matches!(Mp3Stream::open(File::open(&path).unwrap()), Err(Mp3Error::Unsupported("mixed long/short blocks"))));
-    // MPEG-2 (LSF) joint stereo with the intensity bit set.
-    let mut lsf = vec![0u8; 313];
-    lsf[..4].copy_from_slice(&[0xff, 0xf3, 0xa0, 0x50]); // MPEG-2, 96 kbit/s, 22.05 kHz, joint stereo, mode_extension 1
-    let path2 = write_temp("lsfis", &lsf.repeat(4));
-    let lsf_result = Mp3Stream::open(File::open(&path2).unwrap());
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&path2);
-    assert!(matches!(lsf_result, Err(Mp3Error::Unsupported("MPEG-2 intensity stereo"))), "{:?}", lsf_result.map(|_| ()));
+fn a_failed_read_poisons_the_reader_and_loses_its_frames() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("poison");
+    let mut cases = 0;
+    for (index, fixture) in fixtures.files.iter().enumerate() {
+        let (Some(planar), Some(inter)) = (&fixture.planar512, &fixture.inter512) else { continue };
+        for (is_planar, expected) in [(true, planar), (false, inter)] {
+            let Some(error) = &expected.error else { continue };
+            let mut reader = open_fixture(&scratch, fixtures, index, fixture).unwrap();
+            let actual = if is_planar { decode_planar(&mut reader) } else { decode_interleaved(&mut reader) };
+            assert_eq!(actual.error.as_ref(), Some(error), "{}", fixture.id);
+            assert_eq!(actual.frames % BLOCK as u64, 0, "{}: the frames of the failed read are not delivered", fixture.id);
+            let (mut left, mut right) = ([7.0f32; 4], [7.0f32; 4]);
+            for _ in 0..2 {
+                assert!(matches!(reader.read_stereo_planar(&mut left, &mut right), Err(CodecError::Poisoned)), "{}", fixture.id);
+                assert!(matches!(reader.read(&mut [0.0; 4]), Err(CodecError::Poisoned)), "{}", fixture.id);
+                assert!(matches!(reader.read(&mut []), Err(CodecError::Poisoned)), "{}", fixture.id);
+                assert!(matches!(reader.set_stereo_planar(reader.source_format().sample_rate), Err(CodecError::Poisoned)), "{}", fixture.id);
+            }
+            assert_eq!((left, right), ([7.0; 4], [7.0; 4]), "a poisoned read writes nothing");
+            cases += 1;
+        }
+    }
+    assert!(cases >= 20, "{cases} failing reads");
+}
+
+#[test]
+fn reads_of_any_size_deliver_the_same_stream_when_nothing_fails() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("chunks");
+    let mut checked = 0;
+    for (index, fixture) in fixtures.files.iter().enumerate() {
+        let (Some(planar), Some(inter)) = (&fixture.planar512, &fixture.inter512) else { continue };
+        if planar.error.is_some() || inter.error.is_some() || planar.frames == 0 { continue; }
+        if checked >= 40 { break; }
+        let channels = fixture.info.as_ref().unwrap().channels as usize;
+        for chunk in [1usize, 7, 576, 1152, 1153, 4096, 100_000] {
+            let mut reader = open_fixture(&scratch, fixtures, index, fixture).unwrap();
+            let rate = reader.source_format().sample_rate;
+            reader.set_stereo_planar(rate).unwrap();
+            let (mut left, mut right) = (vec![0f32; chunk], vec![0f32; chunk]);
+            let mut hash = platinum_engine::portable::digest::Sha256::new();
+            loop {
+                let n = reader.read_stereo_planar(&mut left, &mut right).unwrap();
+                if n == 0 { break; }
+                let mut bytes = Vec::with_capacity(n * 8);
+                for i in 0..n { bytes.extend_from_slice(&left[i].to_le_bytes()); bytes.extend_from_slice(&right[i].to_le_bytes()); }
+                hash.update(&bytes);
+            }
+            assert_eq!(hex(&hash.finalize()), planar.sha256, "{}: planar reads of {chunk} frames", fixture.id);
+
+            let mut reader = open_fixture(&scratch, fixtures, index, fixture).unwrap();
+            let mut buffer = vec![0f32; chunk * channels];
+            let mut hash = platinum_engine::portable::digest::Sha256::new();
+            loop {
+                let n = reader.read(&mut buffer).unwrap();
+                if n == 0 { break; }
+                let mut bytes = Vec::with_capacity(n * channels * 4);
+                for sample in &buffer[..n * channels] { bytes.extend_from_slice(&sample.to_le_bytes()); }
+                hash.update(&bytes);
+            }
+            assert_eq!(hex(&hash.finalize()), inter.sha256, "{}: interleaved reads of {chunk} frames", fixture.id);
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 40);
+}
+
+#[test]
+fn misuse_is_reported_like_the_other_readers_do() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("misuse");
+    let (index, fixture) = fixtures.files.iter().enumerate()
+        .find(|(_, f)| f.info.as_ref().is_some_and(|i| i.channels == 2) && f.planar512.as_ref().is_some_and(|s| s.frames > 2048 && s.error.is_none()))
+        .expect("a stereo fixture");
+    let mut reader = open_fixture(&scratch, fixtures, index, fixture).unwrap();
+    assert_eq!(reader.read(&mut []).unwrap(), 0, "an empty buffer reads nothing");
+    assert!(matches!(reader.read(&mut [0.0; 3]), Err(CodecError::InvalidInput(_))), "interleaved buffers hold whole frames");
+    assert!(matches!(reader.read_stereo_planar(&mut [0.0; 4], &mut [0.0; 4]), Err(CodecError::InvalidInput(_))), "planar reads need the planar client format");
+    reader.set_stereo_planar(reader.source_format().sample_rate).unwrap();
+    assert!(matches!(reader.read(&mut [0.0; 4]), Err(CodecError::InvalidInput(_))), "interleaved reads are refused once planar");
+    assert!(matches!(reader.read_stereo_planar(&mut [0.0; 4], &mut [0.0; 5]), Err(CodecError::InvalidInput(_))), "planes of different length");
+    assert_eq!(reader.read_stereo_planar(&mut [], &mut []).unwrap(), 0);
+    let (mut left, mut right) = ([9.0f32; 600], [9.0f32; 600]);
+    let n = reader.read_stereo_planar(&mut left[..10], &mut right[..10]).unwrap();
+    assert_eq!(n, 10);
+    assert!(left[10..].iter().chain(&right[10..]).all(|v| *v == 9.0), "the tail beyond the returned frames is untouched");
+    reader.close().unwrap();
+}
+
+#[test]
+fn an_input_larger_than_2_gib_is_refused_before_it_is_read() {
+    let scratch = Scratch::new("huge");
+    let path = scratch.0.join("huge.mp3");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len((1 << 31) + 1).unwrap(); // sparse: nothing is written
+    match Reader::open(&path, None) {
+        Err(CodecError::UnsupportedFormat(message)) => assert!(message.contains("2 GiB"), "{message}"),
+        other => panic!("expected the size refusal, got {:?}", other.map(|_| ())),
+    }
 }
 
 #[test]
 fn decode_ignores_the_ambient_flush_to_zero_mode() {
-    for name in ["lame_cbr128_44100_js", "lame_loud_cbr128", "lame_cbr32_11025_mono"] {
-        let normal = decode(name, 4096);
-        let flushed = platinum_engine::fp_mode::with_flush_to_zero(|| decode(name, 4096));
-        assert!(normal == flushed, "{name}: flush-to-zero changes the decode");
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("fz");
+    let mut checked = 0;
+    for (index, fixture) in fixtures.files.iter().enumerate()
+        .filter(|(_, f)| f.features.iter().any(|t| t.starts_with("block:short") || t == "family:loud_overs" || t == "family:p_loud" || t == "family:p_overflow")).take(8) {
+        let Some(expected) = &fixture.planar512 else { continue };
+        let path = scratch.write(&format!("{index}.mp3"), fixtures.bytes(fixture));
+        let flushed = platinum_engine::fp_mode::with_flush_to_zero(|| decode_planar(&mut open(&path).unwrap()));
+        assert_eq!(&flushed, expected, "{}: flush-to-zero changes the decode", fixture.id);
+        checked += 1;
     }
+    assert!(checked >= 4, "{checked} fixtures with loud or short-block content");
 }
 
+/// Decode speed on the fixtures, for the integration notes: `cargo test --release --test portable_mp3 -- --ignored --nocapture`.
 #[test]
-fn vbri_fixtures_match_recorded_audiotoolbox_properties_and_samples() {
-    let vbri = dir().join("vbri");
-    let manifest = read_json(&vbri.join("manifest.json"));
-    let entries = manifest.as_array().unwrap();
-    assert!(entries.len() >= 18, "VBRI fixture set shrank");
-    for e in entries {
-        let name = e["name"].as_str().unwrap();
-        let path = vbri.join(format!("{name}.mp3"));
-        let channels = e["channels"].as_u64().unwrap() as usize;
-        let stream = Mp3Stream::open(File::open(&path).unwrap()).unwrap_or_else(|err| panic!("{name}: {err:?}"));
-        let info = stream.info();
-        assert_eq!(info.length_frames, e["apple_length_property"].as_i64().unwrap(), "{name}: length property");
-        assert_eq!(i64::from(info.bitrate), e["apple_bitrate"].as_i64().unwrap(), "{name}: bitrate property");
-        assert_eq!(info.channels as usize, channels, "{name}: channels");
-        let (left, right) = decode_path(&path, 4096);
-        let delivered = e["apple_frames_delivered"].as_u64().unwrap() as usize;
-        assert_eq!(left.len(), delivered, "{name}: frames delivered");
-        let apple = read_s16(&vbri.join(e["samples_file"].as_str().unwrap()));
-        let (identical, max_lsb, total) = accuracy(name, &left, &right, channels, &apple);
-        assert!(max_lsb <= 2, "{name}: max difference {max_lsb} LSB");
-        assert!(identical * 100 >= total * 80, "{name}: only {identical}/{total} samples identical");
+#[ignore = "timing report, run with --release"]
+fn decode_speed_report() {
+    let fixtures = Fixtures::load();
+    let scratch = Scratch::new("speed");
+    let mut paths = Vec::new();
+    let mut seconds_of_audio = 0.0f64;
+    for (index, fixture) in fixtures.files.iter().enumerate() {
+        let Some(planar) = &fixture.planar512 else { continue };
+        if planar.error.is_some() { continue; }
+        paths.push(scratch.write(&format!("{index}.mp3"), fixtures.bytes(fixture)));
+        seconds_of_audio += planar.frames as f64 / f64::from(fixture.info.as_ref().unwrap().sample_rate);
     }
-}
-
-#[test]
-fn truncated_final_frame_is_accepted_at_every_byte_offset_like_audiotoolbox() {
-    let truncation = dir().join("truncation");
-    let manifest = read_json(&truncation.join("manifest.json"));
-    let temp = std::env::temp_dir().join(format!("platinum-mp3-truncated-{}.mp3", std::process::id()));
-    for e in manifest.as_array().unwrap() {
-        let name = e["name"].as_str().unwrap();
-        let size = e["last_frame_bytes"].as_u64().unwrap() as usize;
-        let channels = e["channels"].as_u64().unwrap() as usize;
-        let data = std::fs::read(mp3_path(name)).unwrap();
-        let start = data.len() - size;
-        let apple = read_s16(&truncation.join(e["samples_file"].as_str().unwrap()));
-        for cut in 0..size {
-            std::fs::write(&temp, &data[..start + cut]).unwrap();
-            let mut stream = Mp3Stream::open(File::open(&temp).unwrap()).unwrap_or_else(|err| panic!("{name} cut at {cut}: {err:?}"));
-            let info = stream.info();
-            assert_eq!(info.length_frames, e["apple_length_property"].as_i64().unwrap(), "{name} cut at {cut}: length property");
-            assert_eq!(i64::from(info.bitrate), e["apple_bitrate"].as_i64().unwrap(), "{name} cut at {cut}: bitrate property");
-            assert_eq!(info.channels as usize, channels);
-            // Full decodes are slow in debug builds: all the header-cut offsets, then a sample of the rest.
-            if cut < 6 || cut % 37 == 0 || cut + 1 == size {
-                let (left, right) = drain(&mut stream, 4096);
-                assert_eq!(left.len(), e["apple_frames_delivered"].as_u64().unwrap() as usize, "{name} cut at {cut}: frames delivered");
-                let (identical, max_lsb, total) = accuracy(name, &left, &right, channels, &apple);
-                assert!(max_lsb <= 2 && identical * 100 >= total * 80, "{name} cut at {cut}: {identical}/{total} identical, max {max_lsb} LSB");
+    // Open (which reads the file and scans its packets), decode every planar 512-frame block and fold the samples; no hashing.
+    let start = std::time::Instant::now();
+    let mut fold = 0u32;
+    for _ in 0..5 {
+        for path in &paths {
+            let mut reader = open(path).unwrap();
+            let rate = reader.source_format().sample_rate;
+            reader.set_stereo_planar(rate).unwrap();
+            let (mut left, mut right) = (vec![0f32; BLOCK], vec![0f32; BLOCK]);
+            while reader.read_stereo_planar(&mut left, &mut right).unwrap() == BLOCK {
+                fold ^= left[0].to_bits() ^ right[BLOCK - 1].to_bits();
             }
         }
     }
-    let _ = std::fs::remove_file(&temp);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("{} files, {:.1} s of audio x5 in {:.3} s: {:.0}x real time on one core (fold {fold:08x})", paths.len(), seconds_of_audio, elapsed, seconds_of_audio * 5.0 / elapsed);
 }
 
-#[test]
-fn inputs_that_are_not_mp3_keep_their_classification_under_the_opt_in() {
-    let adts = [vec![0xff, 0xf1, 0x50, 0x80, 0x1c, 0x1f, 0xfc], vec![0u8; 600]].concat();
-    let mut flac = b"fLaC".to_vec();
-    for _ in 0..1000 { flac.extend([0xff, 0xf8, 0xc9, 0x18, 0x00, 0x01, 0x02]); } // FLAC frame syncs
-    // Pseudo-random bytes with many valid MPEG headers scattered through them (and a few at the start).
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; (state >> 24) as u8 };
-    let mut noise: Vec<u8> = (0..9000).map(|_| next()).collect();
-    for at in (0..8000).step_by(97) { noise[at..at + 4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]); }
-    let mut noise_from_sync = noise.clone();
-    noise_from_sync[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
-    let mut id3_noise = b"ID3\x03\x00\x00\x00\x00\x00\x10".to_vec();
-    id3_noise.extend(&noise);
-    let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("empty", Vec::new()), ("text", b"This is plain text, not audio. ".repeat(40)), ("zeros", vec![0u8; 5000]),
-        ("adts aac", adts), ("ogg", [b"OggS".to_vec(), vec![0u8; 400]].concat()), ("flac", flac),
-        ("truncated wave", b"RIFF\x24\x00\x00\x00WAVE".to_vec()), ("sync bytes after text", [b"abcdef".to_vec(), vec![0xff; 100]].concat()),
-        ("noise with frame headers", noise), ("noise starting with a frame header", noise_from_sync), ("id3 then noise", id3_noise),
-        ("late lookalikes", [vec![b'x'; 40], vec![0xff, 0xe3, 0x90, 0x00, 0xff, 0xfb]].concat()),
-    ];
-    for (name, bytes) in cases {
-        let path = write_temp("classify", &bytes);
-        let plain = Reader::open(&path, None).err().map(|e| format!("{e:?}"));
-        let opted_in = Reader::open_with(&path, None, OPT_IN).err().map(|e| format!("{e:?}"));
-        let _ = std::fs::remove_file(&path);
-        assert!(plain.is_some(), "{name}: expected the default reader to refuse");
-        assert_eq!(plain, opted_in, "{name}: the opt-in changed the error");
+// ---- which reader opens a file: AudioFile's type selection, recorded on macOS ------------------------------------------------
+
+#[path = "support/admission.rs"]
+mod admission;
+
+/// `describe_open`'s grammar is the recording's: `ok/<rate>/<format id>/<channels>/<frames per packet>/<length>/<bitrate>` or
+/// `err/<open|client>/<OSStatus>` (the failing call), anything else is `other/<message>`.
+fn describe_open(result: &Result<Reader, CodecError>) -> String {
+    match result {
+        Ok(reader) => {
+            let s = reader.source_format();
+            format!("ok/{}/{}/{}/{}/{}/{}", s.sample_rate as u64, s.format_id, s.channels_per_frame, s.frames_per_packet,
+                reader.file_length_frames().unwrap(), reader.bitrate().unwrap())
+        }
+        Err(CodecError::Native { operation, status }) => {
+            let call = match *operation { OPEN => "open", CLIENT => "client", other => other };
+            format!("err/{call}/{status}")
+        }
+        Err(other) => format!("other/{other}"),
     }
 }
 
 #[test]
-fn junk_prefixed_mp3_decodes_with_the_opt_in_and_is_refused_without() {
-    let good = std::fs::read(mp3_path("lame_cbr128_44100_js")).unwrap();
-    // 3000 bytes that contain no sync byte at all.
-    let junk: Vec<u8> = (0..3000u32).map(|i| ((i * 37 + 11) % 251) as u8).collect();
-    let prefixed = write_temp("junk-prefixed", &[junk.clone(), good.clone()].concat());
-    assert!(matches!(Reader::open(&prefixed, None), Err(CodecError::UnsupportedFormat(_))), "default classification");
-    let reference = decode("lame_cbr128_44100_js", 4096);
-    let mut stream = Mp3Stream::open(File::open(&prefixed).unwrap()).unwrap();
-    assert_eq!(drain(&mut stream, 4096), reference);
-    let reader = Reader::open_with(&prefixed, None, OPT_IN).unwrap();
-    assert_eq!(reader.file_length_frames().unwrap(), 13230);
-    let _ = std::fs::remove_file(&prefixed);
-    // A header-like pattern inside the junk is ambiguous: refused with a typed error, never guessed.
-    let mut ambiguous = junk[..100].to_vec();
-    ambiguous.extend([0xff, 0xfb, 0x90, 0x00]);
-    ambiguous.extend(&junk[100..]);
-    ambiguous.extend(&good);
-    let path = write_temp("junk-ambiguous", &ambiguous);
-    match Reader::open_with(&path, None, OPT_IN) {
-        Err(CodecError::UnsupportedCodec { codec: "MP3", reason: "ambiguous data before the first MP3 frame", .. }) => {}
-        other => panic!("expected the ambiguity refusal, got {:?}", other.map(|_| ())),
+fn file_type_admission_follows_audiofile_for_every_recorded_name_and_content() {
+    let fixtures = Fixtures::load();
+    let document = admission::load("admission.json", "platinum-mp3-admission-v1");
+    let scratch = Scratch::new("admission");
+    let contents = document["contents"].as_object().unwrap();
+    let cases = document["cases"].as_array().unwrap();
+    assert!(cases.len() >= 450, "{} recorded cases", cases.len());
+    let mut bytes_of = std::collections::HashMap::new();
+    let (mut mismatches, mut kinds) = (Vec::new(), std::collections::BTreeMap::<String, usize>::new());
+    for case in cases {
+        let (content, extension, apple, kind) = (case[0].as_str().unwrap(), case[1].as_str().unwrap(), case[2].as_str().unwrap(), case[3].as_str().unwrap());
+        let bytes = bytes_of.entry(content).or_insert_with(|| admission::build(&contents[content], &document, fixtures));
+        let name = if extension.is_empty() { "case".to_owned() } else { format!("case.{extension}") };
+        let result = Reader::open(scratch.write(&name, bytes), None);
+        // What AudioToolbox answered for the file, without the outcome of the second open the recording also made.
+        let apple_open: String = apple.splitn(8, '/').take(7).collect::<Vec<_>>().join("/");
+        let ok = match kind {
+            "same" => describe_open(&result) == apple_open,
+            "aac" => matches!(&result, Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })),
+            "flac" => matches!(&result, Err(CodecError::UnsupportedCodec { codec: "FLAC", operation: "decoding", .. })),
+            "ogg" => matches!(&result, Err(CodecError::UnsupportedFormat(m)) if m.contains("Ogg")),
+            "wave-behind-tag" => matches!(&result, Err(CodecError::UnsupportedFormat(m)) if m.contains("behind a leading ID3 tag")),
+            // The malformed container is refused with `InvalidInput`, which the engine reports like AudioToolbox's `'dta?'`.
+            "invalid-input" => matches!(&result, Err(CodecError::InvalidInput(_))) && apple == "err/open/1685348671",
+            other => panic!("unknown kind {other}"),
+        };
+        *kinds.entry(kind.to_owned()).or_default() += 1;
+        if !ok { mismatches.push(format!("{content}.{extension}: Apple {apple}; expected {kind}; got {}", describe_open(&result))); }
     }
-    let _ = std::fs::remove_file(&path);
+    assert!(mismatches.is_empty(), "{} of {} cases differ:\n{}", mismatches.len(), cases.len(), mismatches.join("\n"));
+    assert!(kinds["same"] >= 400, "{kinds:?}");
+}
+
+#[test]
+fn an_mpeg_extension_commits_to_the_mpeg_reader_whatever_the_content() {
+    let scratch = Scratch::new("hint");
+    let wav = {
+        let document = admission::load("admission.json", "platinum-mp3-admission-v1");
+        admission::build(&json!({"wav": [44100, 2, 16, 300]}), &document, Fixtures::load())
+    };
+    for name in ["a.mp3", "a.MP3", "a.Mp3", "a.mp2", "a.mp1", "a.mpa", "a.mpeg"] {
+        // Not MPEG: no frame header anywhere, the MPEG reader's own refusal and nothing else looks at the data.
+        match Reader::open(scratch.write(name, &wav), None) {
+            Err(CodecError::Native { operation: OPEN, status: DTA }) => {}
+            other => panic!("{name}: {:?}", other.err()),
+        }
+    }
+    for name in ["a.wav", "a.aif", "a.aiff", "a.m4a", "a.bin", "a"] {
+        assert!(Reader::open(scratch.write(name, &wav), None).is_ok(), "{name}: a WAVE is still a WAVE under any other name");
+    }
+    // The same stream is an MPEG stream under every name its first frame header lets AudioFile sniff.
+    let fixtures = Fixtures::load();
+    let stream = fixtures.bytes(fixtures.get("corpus/quality_q/q2_abr128"));
+    let expected = describe_open(&Reader::open(scratch.write("s.mp3", stream), None));
+    assert!(expected.starts_with("ok/44100/"), "{expected}");
+    for name in ["s.wav", "s.aif", "s.aiff", "s.m4a", "s.bin", "s"] {
+        assert_eq!(describe_open(&Reader::open(scratch.write(name, stream), None)), expected, "{name}");
+    }
+}
+
+/// Every read of `block` frames that returned fewer, as the recording describes it: the sentinel-filled buffer is searched
+/// for what the reader wrote behind the returned frames. `(frames returned in total, [(returned, written behind, hash)], error)`.
+fn tail_probe(path: &std::path::Path, block: usize, planar: bool) -> (u64, Vec<(usize, usize, String)>, Option<String>) {
+    use admission::{FNV_START, SENTINEL, fold};
+    let rate = Reader::open(path, None).unwrap().source_format().sample_rate;
+    let mut reader = Reader::open(path, Some(rate)).unwrap();
+    let channels = reader.source_format().channels_per_frame as usize;
+    if planar { reader.set_stereo_planar(rate).unwrap(); }
+    let (mut left, mut right, mut inter) = (vec![SENTINEL; block], vec![SENTINEL; block], vec![SENTINEL; block * channels]);
+    let (mut total, mut shorts, mut error) = (0u64, Vec::new(), None);
+    for _ in 0..100_000 {
+        left.fill(SENTINEL);
+        right.fill(SENTINEL);
+        inter.fill(SENTINEL);
+        let read = if planar { reader.read_stereo_planar(&mut left, &mut right) } else { reader.read(&mut inter) };
+        let n = match read { Ok(n) => n, Err(e) => { error = Some(e.to_string()); break; } };
+        total += n as u64;
+        if n < block {
+            let (mut written, mut hash) = (0usize, FNV_START);
+            if planar {
+                for i in n..block { if left[i] != SENTINEL || right[i] != SENTINEL { written = i + 1 - n; } }
+                for i in n..n + written { hash = fold(hash, left[i].to_bits()); hash = fold(hash, right[i].to_bits()); }
+            } else {
+                for i in n * channels..block * channels { if inter[i] != SENTINEL { written = (i + channels) / channels - n; } }
+                for v in &inter[n * channels..(n + written) * channels] { hash = fold(hash, v.to_bits()); }
+            }
+            shorts.push((n, written, format!("{hash:016x}")));
+            if n == 0 { break; }
+        }
+    }
+    (total, shorts, error)
+}
+
+#[test]
+fn the_decoders_padding_behind_the_valid_frames_lands_in_the_callers_buffer_like_on_macos() {
+    let fixtures = Fixtures::load();
+    let document = admission::load("tails.json", "platinum-mp3-tails-v1");
+    let scratch = Scratch::new("tails");
+    let records = document["records"].as_array().unwrap();
+    let (mut mismatches, mut with_tail, mut zero_reads_with_tail) = (Vec::new(), 0usize, 0usize);
+    for record in records {
+        let (id, cut, block, shape) = (record[0].as_str().unwrap(), record[1].as_u64(), record[2].as_u64().unwrap() as usize, record[3].as_str().unwrap());
+        let mut bytes = fixtures.bytes(fixtures.get(id)).to_vec();
+        if let Some(cut) = cut { bytes.truncate(cut as usize); }
+        let (total, shorts, error) = tail_probe(&scratch.write("tail.mp3", &bytes), block, shape == "p");
+        let expected: Vec<(usize, usize, String)> = record[5].as_array().unwrap().iter()
+            .map(|s| (s[0].as_u64().unwrap() as usize, s[1].as_u64().unwrap() as usize, s[2].as_str().unwrap().to_owned())).collect();
+        if total != record[4].as_u64().unwrap() || shorts != expected || error.as_deref() != record[6].as_str() {
+            mismatches.push(format!("{id} prefix {cut:?} block {block} {shape}: expected {} frames {expected:?}, got {total} {shorts:?} {error:?}", record[4]));
+        }
+        with_tail += usize::from(expected.iter().any(|s| s.1 > 0));
+        zero_reads_with_tail += usize::from(expected.iter().any(|s| s.0 == 0 && s.1 > 0));
+    }
+    assert!(mismatches.is_empty(), "{} of {} records differ:\n{}", mismatches.len(), records.len(), mismatches.join("\n"));
+    assert!(with_tail >= 100 && zero_reads_with_tail >= 50, "{with_tail} records with a written tail, {zero_reads_with_tail} behind a read that returned 0");
 }

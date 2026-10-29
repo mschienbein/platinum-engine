@@ -11,6 +11,7 @@ RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported architecture: $TA
  && test -f /opt/platinum-engine/lib/libpn-tag-bridge.so \
  && test -e /opt/platinum-engine/lib/libFLAC.so.12 \
  && test -e /opt/platinum-engine/lib/libmp3lame.so.0 \
+ && test -e /opt/platinum-engine/lib/libopus.so.0 \
  && cd /opt/platinum-engine && sha256sum -c SHA256SUMS \
  && mkdir -p /state /music /output && chown 65532:65532 /state /music /output
 ENV HOME=/state \

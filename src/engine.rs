@@ -136,6 +136,13 @@ pub struct ProcessReport {
     pub tempo_factor: f64,
     pub clip_count: u64,
     pub applied_stages: Vec<String>,
+    /// Present on every item that reads or writes Opus: there is no Platinum
+    /// Notes reference to compare such an item against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_platinum_notes_reference: Option<&'static str>,
+    /// Opus outputs only: the encoder and what was left out of the tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opus_output: Option<OpusOutputReport>,
     /// `present`, `nil_payload_absent`, or `nil_payload_empty_wav_chunk`.
     pub processing_marker_status: &'static str,
     /// An explicitly authorized ambiguous input marker, if one was used.
@@ -147,9 +154,10 @@ pub struct ProcessReport {
     /// creation/modification header field instead of the AudioToolbox clock.
     pub controlled_mp4_time_1904: Option<u32>,
     /// Paths used for this item that are not proven byte-identical to the macOS
-    /// reference: `mp3_decode` (open-source MP3 decoder), `artwork_copy` (embedded cover art copied unchanged)
-    /// and `wav_tag_preservation` (WAV tag chunks kept). Always present; empty when every path used is an
-    /// identical one (always the case on macOS default builds).
+    /// reference: `artwork_copy` (embedded cover art copied unchanged) and `wav_tag_preservation`
+    /// (WAV tag chunks kept), both only with `parity.allow_non_identical`. Always present; empty when every
+    /// path used is an identical one (always the case on macOS default builds). Decoding, including MP3, is
+    /// identical to macOS and is never listed.
     pub non_identical_paths: Vec<&'static str>,
 }
 
@@ -178,9 +186,11 @@ pub struct AnalysisReport {
     /// Present when the current file's marker names a readable original.
     pub original_waveform: Option<Waveform>,
     pub original_waveform_unavailable: Option<String>,
-    /// Non-identical paths whose output feeds these measurements (`mp3_decode`);
-    /// always present, empty when none was used.
+    /// Always present and always empty: analysis only decodes, and every decoder
+    /// is identical to the macOS reference. Kept so the JSON shape is stable.
     pub non_identical_paths: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_platinum_notes_reference: Option<&'static str>,
 }
 #[derive(Debug, Serialize)]
 pub struct ReportedDynamics {
@@ -232,29 +242,46 @@ pub struct InspectionReport {
     pub backup_exists: Option<bool>,
     pub backup_error: Option<String>,
     pub marker_json: Option<serde_json::Value>,
-    /// Non-identical paths that produced these decoder-derived properties
-    /// (`mp3_decode`); always present, empty when none was used.
+    /// Always present and always empty: inspection only reads container
+    /// properties, which are identical to the macOS reference. Kept so the JSON
+    /// shape is stable.
     pub non_identical_paths: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_platinum_notes_reference: Option<&'static str>,
     #[serde(skip)]
     pub marker: Option<Marker>,
     #[serde(skip)]
     pub source_codec: SourceCodec,
 }
 
-/// Names listed in `non_identical_paths`.
-pub const NON_IDENTICAL_MP3_DECODE: &str = "mp3_decode";
-pub const NON_IDENTICAL_ARTWORK_COPY: &str = "artwork_copy";
-
-fn non_identical_paths(mp3_decode: bool, artwork_copy: bool) -> Vec<&'static str> {
-    let mut paths = Vec::new();
-    if mp3_decode { paths.push(NON_IDENTICAL_MP3_DECODE); }
-    if artwork_copy { paths.push(NON_IDENTICAL_ARTWORK_COPY); }
-    paths
+/// How an Opus output was produced (`libopus` is fixed-point 24-bit, so these
+/// values fully determine the stream for a given processed signal).
+#[derive(Debug, Serialize)]
+pub struct OpusOutputReport {
+    pub encoder: String,
+    pub library_sha256: String,
+    pub target_bitrate_bps: u32,
+    pub vbr: bool,
+    pub complexity: i32,
+    pub frame_ms: u32,
+    /// Loudness tags of the source that were not carried over (R128_TRACK_GAIN, R128_ALBUM_GAIN).
+    pub dropped_tags: Vec<String>,
 }
 
+/// Name listed in `non_identical_paths` when embedded artwork was copied unchanged.
+pub const NON_IDENTICAL_ARTWORK_COPY: &str = "artwork_copy";
+
+fn non_identical_paths(artwork_copy: bool) -> Vec<&'static str> {
+    if artwork_copy { vec![NON_IDENTICAL_ARTWORK_COPY] } else { Vec::new() }
+}
+
+/// libopus is handed to a reader only while `formats.opus` is on: a path that reaches the
+/// reader by another route (for example the original recorded in a processed file's marker)
+/// must not make a disabled format decodable.
 fn input_libraries(settings: &Settings) -> InputLibraries {
+    let opus = settings.formats.opus;
     InputLibraries { flac: settings.libraries.flac.clone(), flac_sha256: settings.libraries.flac_sha256.clone(),
-        allow_non_identical: settings.non_identical_enabled() }
+        opus: settings.libraries.opus.clone().filter(|_| opus), opus_sha256: settings.libraries.opus_sha256.clone().filter(|_| opus) }
 }
 fn bridge(settings: &Settings) -> Result<TagBridge, EngineError> {
     let path = settings.libraries.tag_bridge.as_ref().ok_or_else(|| EngineError::coded("tags", ErrorCode::LibraryNotConfigured, "a trusted TagLib bridge path is required"))?;
@@ -262,13 +289,14 @@ fn bridge(settings: &Settings) -> Result<TagBridge, EngineError> {
     // caller is responsible for its provenance and executable initializers.
     unsafe { TagBridge::load(path) }.map_err(|e| EngineError::library_load("tags", e))
 }
-fn source_tag_format(path: &Path) -> Result<tags::Format, EngineError> {
-    match file_workflow::source_type(path) {
+fn source_tag_format(path: &Path, settings: &Settings) -> Result<tags::Format, EngineError> {
+    match file_workflow::source_type_with(path, settings.admitted_formats()) {
         Some(SourceType::Mp3) => Ok(tags::Format::Mp3),
         Some(SourceType::M4a) => Ok(tags::Format::Mp4),
         Some(SourceType::Wav) => Ok(tags::Format::Wav),
         Some(SourceType::Aiff) => Ok(tags::Format::Aiff),
         Some(SourceType::Flac) => Ok(tags::Format::Flac),
+        Some(SourceType::Opus) => Ok(tags::Format::Opus),
         Some(SourceType::ProtectedM4p | SourceType::ProtectedWlMp3) => Err(EngineError::coded("input", ErrorCode::ProtectedSource, "protected source is not admitted")),
         _ => Err(EngineError::new("input", format!("unsupported source {}", path.display()))),
     }
@@ -519,17 +547,18 @@ fn source_codec(path: &Path, stream: StreamDescription) -> SourceCodec {
         n if n == u32::from_be_bytes(*b"aac ") => SourceCodec::Aac,
         n if n == u32::from_be_bytes(*b"alac") => SourceCodec::Alac,
         n if n == u32::from_be_bytes(*b"flac") => SourceCodec::Flac,
+        n if n == u32::from_be_bytes(*b"opus") => SourceCodec::Opus,
         n => SourceCodec::Other(n),
     }
 }
 fn format_label(path: &Path, codec: SourceCodec) -> String {
-    let container = match file_workflow::source_type(path) {
+    let container = match file_workflow::source_type_with(path, file_workflow::AdmittedFormats { opus: true }) {
         Some(SourceType::Mp3) => "mp3", Some(SourceType::M4a) => "m4a", Some(SourceType::Wav) => "wav",
-        Some(SourceType::Aiff) => "aiff", Some(SourceType::Flac) => "flac", _ => "unknown",
+        Some(SourceType::Aiff) => "aiff", Some(SourceType::Flac) => "flac", Some(SourceType::Opus) => "opus", _ => "unknown",
     };
     let codec = match codec {
         SourceCodec::Lpcm => "pcm".to_owned(), SourceCodec::Mp3 => "mp3".to_owned(), SourceCodec::Aac => "aac".to_owned(),
-        SourceCodec::Alac => "alac".to_owned(), SourceCodec::Flac => "flac".to_owned(), SourceCodec::Other(n) => format!("0x{n:08x}"),
+        SourceCodec::Alac => "alac".to_owned(), SourceCodec::Flac => "flac".to_owned(), SourceCodec::Opus => "opus".to_owned(), SourceCodec::Other(n) => format!("0x{n:08x}"),
     };
     format!("{container}/{codec}")
 }
@@ -660,7 +689,7 @@ fn decode_process_marker(payload: Option<&[u8]>, format: tags::Format, allow: bo
 pub fn read_restore_marker(path: &Path, settings: &Settings) -> Result<(FileIdentity, Option<Marker>), EngineError> {
     require_reportable_path(path, "inspect input")?;
     let identity = FileIdentity::capture(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let family = source_tag_format(path)?;
+    let family = source_tag_format(path, settings)?;
     let marker = read_marker(&bridge(settings)?, path, family)?;
     identity.verify(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
     Ok((identity, marker))
@@ -688,7 +717,7 @@ enum InspectionOutcome {
 fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: Option<bool>) -> Result<InspectionOutcome, EngineError> {
     require_reportable_path(path, "inspect input")?;
     let identity = file_workflow::FileIdentity::capture(path).map_err(|e| EngineError::workflow("inspect source identity", e))?;
-    let family = source_tag_format(path)?;
+    let family = source_tag_format(path, settings)?;
     let bridge = bridge(settings)?;
     let (detected, id3_count, additional_id3_nonempty) = sniff_container(path, family)?;
     if detected == SniffedContainer::Unknown {
@@ -751,7 +780,6 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
     let reader = AudioReader::open(path, None, &input_libraries(settings)).map_err(|e| EngineError::new("open input", e))?;
     let source = reader.source_format();
     let codec = source_codec(path, source);
-    let non_identical = reader.non_identical();
     let frames = reader.file_length_frames().map_err(|e| EngineError::new("inspect length", e))?;
     if frames < 0 { return Err(EngineError::new("inspect length", "decoder returned a negative frame count")); }
     let (bitrate, bitrate_error) = match reader.bitrate() { Ok(b) => (Some(b), None), Err(e) => (None, Some(e.to_string())) };
@@ -765,7 +793,8 @@ fn inspect_file_with_policy(path: &Path, settings: &Settings, process_override: 
             let processed = Some(state != ProcessingState::Unprocessed);
             Ok(InspectionOutcome::Known(InspectionReport { path: path.to_owned(), input_format, sample_rate: source.sample_rate,
                 channels: source.channels_per_frame, bit_depth: source.bits_per_channel, frames: frames as u64,
-                bitrate, bitrate_error, processed, non_identical_paths: non_identical_paths(non_identical, false),
+                bitrate, bitrate_error, processed, non_identical_paths: Vec::new(),
+                no_platinum_notes_reference: (codec == SourceCodec::Opus).then_some(crate::opus::NO_REFERENCE_NOTE),
                 processing_state: processing_state.expect("known marker has a processing state"),
                 backup_path, backup_exists, backup_error, marker_json, tags: tag_inspection, tags_unavailable, marker, source_codec: codec }))
         }
@@ -844,8 +873,6 @@ struct Measured {
     processing_rate: f64,
     source: StreamDescription,
     codec: SourceCodec,
-    /// The open-source MP3 decoder produced the samples.
-    non_identical: bool,
     waveform: Option<Waveform>,
     waveform_unavailable: Option<String>,
 }
@@ -926,7 +953,6 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     let original = AudioReader::open(path, None, &libraries).map_err(|e| EngineError::new("open analysis input", e))?;
     let source = original.source_format();
     let codec = source_codec(path, source);
-    let non_identical = original.non_identical();
     let rate = controller::processing_sample_rate(source.sample_rate, codec == SourceCodec::Mp3);
     original.close().map_err(|e| EngineError::new("close analysis input", e))?;
     #[cfg(any(target_os = "linux", feature = "portable"))]
@@ -958,7 +984,11 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
     reader.close().map_err(|e| EngineError::new("close analysis input", e))?;
     converter.dispose()?;
     check_cancel(cancel, "analysis")?;
-    let waveform_unavailable = if capture_waveform && cfg!(any(target_os = "linux", feature = "portable"))
+    // Opus is decoded at 48 kHz without sample-rate conversion on every build, so the
+    // 44.1 kHz waveform view is not offered for it (as for non-44.1 kHz portable input).
+    let waveform_unavailable = if capture_waveform && codec == SourceCodec::Opus {
+        Some("waveform conversion is unavailable for Opus input (48 kHz, no sample-rate conversion)".to_owned())
+    } else if capture_waveform && cfg!(any(target_os = "linux", feature = "portable"))
         && source.sample_rate != 44_100.0 {
         Some("portable waveform conversion is unavailable for non-44.1 kHz input".to_owned())
     } else { None };
@@ -966,7 +996,7 @@ fn analyze(path: &Path, settings: &Settings, cancel: &Cancellation, capture_wave
         Some(analyze_waveform(path, settings, cancel)?)
     } else { None };
     Ok(Measured { values: AnalysisValues::from_measurements(meter.integrated_loudness(), detector.tuning_hz()),
-        frames: accounting.actual_input_frames, processing_rate: rate, source, codec, non_identical, waveform, waveform_unavailable })
+        frames: accounting.actual_input_frames, processing_rate: rate, source, codec, waveform, waveform_unavailable })
 }
 
 pub fn analyze_file(path: &Path, settings: &Settings, cancel: &Cancellation) -> Result<AnalysisReport, EngineError> {
@@ -986,7 +1016,7 @@ fn analyze_file_with(
         expansion_applied: m.applied_expansion, compression_applied: m.applied_compression });
     let mut measured = analyze(path, settings, cancel, true)?;
     identity.verify(path).map_err(|e| EngineError::workflow("analyze source identity", e))?;
-    let (original_waveform, original_waveform_unavailable, original_non_identical) = match state {
+    let (original_waveform, original_waveform_unavailable) = match state {
         ProcessingState::Marked { backup: Some(path) } => match require_reportable_path(&path, "analyze original")
             .and_then(|()| {
                 let identity = file_workflow::FileIdentity::capture(&path).map_err(|e| EngineError::workflow("inspect original identity", e))?;
@@ -994,15 +1024,13 @@ fn analyze_file_with(
                 identity.verify(&path).map_err(|e| EngineError::workflow("analyze original identity", e))?;
                 Ok(original)
             }) {
-                // Only the backup's waveform reaches the report: an unavailable waveform means its decode produced nothing.
-                Ok(original) => { let produced = original.non_identical && original.waveform.is_some();
-                                  (original.waveform, original.waveform_unavailable, produced) }
+                Ok(original) => (original.waveform, original.waveform_unavailable),
                 Err(error) if error.cancelled => return Err(error),
-                Err(error) => (None, Some(error.to_string()), false),
+                Err(error) => (None, Some(error.to_string())),
             },
-        ProcessingState::Marked { backup: None } => (None, Some("processing marker does not record a backup path".to_owned()), false),
-        ProcessingState::Suffixed => (None, Some("suffix-only processed state does not identify an original".to_owned()), false),
-        ProcessingState::Unprocessed => (None, None, false),
+        ProcessingState::Marked { backup: None } => (None, Some("processing marker does not record a backup path".to_owned())),
+        ProcessingState::Suffixed => (None, Some("suffix-only processed state does not identify an original".to_owned())),
+        ProcessingState::Unprocessed => (None, None),
     };
     let unavailable = if marked.is_some() { vec!["new clip and dynamics measurements require the healing pass".to_owned()] }
         else { vec!["clip-repair count and dynamics adjustments require the healing pass".to_owned()] };
@@ -1014,7 +1042,8 @@ fn analyze_file_with(
         unavailable,
         waveform: measured.waveform.take(), waveform_unavailable: measured.waveform_unavailable.take(),
         original_waveform, original_waveform_unavailable,
-        non_identical_paths: non_identical_paths(measured.non_identical || original_non_identical, false) })
+        no_platinum_notes_reference: (measured.codec == SourceCodec::Opus).then_some(crate::opus::NO_REFERENCE_NOTE),
+        non_identical_paths: Vec::new() })
 }
 
 /// One wrapper: model writes precede the first callback. The native 50 ms
@@ -1397,7 +1426,7 @@ fn output_tag_format(format: AudioFormat) -> tags::Format {
     match format {
         AudioFormat::Wav => tags::Format::Wav, AudioFormat::Aiff => tags::Format::Aiff,
         AudioFormat::Alac | AudioFormat::Aac => tags::Format::Mp4,
-        AudioFormat::Flac => tags::Format::Flac, AudioFormat::Mp3 => tags::Format::Mp3,
+        AudioFormat::Flac => tags::Format::Flac, AudioFormat::Mp3 => tags::Format::Mp3, AudioFormat::Opus => tags::Format::Opus,
         AudioFormat::MatchInput => unreachable!("output plan resolves match input"),
     }
 }
@@ -1405,10 +1434,11 @@ fn output_tag_format(format: AudioFormat) -> tags::Format {
 struct EncodingLibraries {
     flac: Option<crate::flac::FlacLibrary>,
     lame: Option<crate::mp3::LameLibrary>,
+    opus: Option<crate::opus::OpusLibrary>,
 }
 impl EncodingLibraries {
     fn load(format: AudioFormat, settings: &Settings) -> Result<Self, EngineError> {
-        let mut result = Self { flac: None, lame: None };
+        let mut result = Self { flac: None, lame: None, opus: None };
         if format == AudioFormat::Flac {
             let path = settings.libraries.flac.as_ref().ok_or_else(|| EngineError::coded("load FLAC encoder", ErrorCode::LibraryNotConfigured, "trusted libFLAC path is required"))?;
             let expected = settings.libraries.flac_sha256.as_ref().ok_or_else(|| EngineError::coded("load FLAC encoder", ErrorCode::LibraryNotConfigured, "libFLAC SHA-256 pin is required"))?;
@@ -1419,6 +1449,14 @@ impl EncodingLibraries {
             let digest = settings.libraries.lame_sha256.as_deref().ok_or_else(|| EngineError::coded("load MP3 encoder", ErrorCode::LibraryNotConfigured, "LAME SHA-256 pin is required"))?;
             result.lame = Some(crate::mp3::LameLibrary::load(path, digest).map_err(|e| EngineError::library_load("load MP3 encoder", e))?);
         }
+        if format == AudioFormat::Opus {
+            if !settings.formats.opus {
+                return Err(EngineError::coded("load Opus encoder", ErrorCode::OpusNotEnabled, "Opus output requires formats.opus"));
+            }
+            let path = settings.libraries.opus.as_ref().ok_or_else(|| EngineError::coded("load Opus encoder", ErrorCode::LibraryNotConfigured, "trusted libopus path (libraries.opus) is required"))?;
+            let digest = settings.libraries.opus_sha256.as_deref().ok_or_else(|| EngineError::coded("load Opus encoder", ErrorCode::LibraryNotConfigured, "libopus SHA-256 pin (libraries.opus_sha256) is required"))?;
+            result.opus = Some(crate::opus::OpusLibrary::load(path, digest).map_err(|e| EngineError::new("load Opus encoder", e))?);
+        }
         Ok(result)
     }
 }
@@ -1426,6 +1464,7 @@ enum Encoder<'a> {
     Apple(apple_codec::Writer),
     Flac(crate::flac::FlacEncoder<'a>),
     Mp3 { encoder: crate::mp3::Mp3Encoder<'a>, converter: apple_codec::Pcm16StereoConverter, scratch: [i16; BLOCK * 2] },
+    Opus(crate::opus::OpusWriter),
 }
 
 #[cfg(all(target_os = "macos", not(feature = "portable")))]
@@ -1455,6 +1494,15 @@ impl<'a> Encoder<'a> {
                     .map_err(|e| EngineError::new("create FLAC encoder", e))?;
                 Ok(Self::Flac(encoder))
             }
+            AudioFormat::Opus => {
+                if rate != f64::from(crate::opus::SAMPLE_RATE) {
+                    return Err(EngineError::new("create Opus encoder", crate::opus::OpusError::SampleRate { source: rate, requested: f64::from(crate::opus::SAMPLE_RATE) }));
+                }
+                let file = staged.create_stage().map_err(|e| EngineError::workflow("create Opus staging file", e))?;
+                let writer = crate::opus::OpusWriter::create(libraries.opus.as_ref().expect("loaded libopus"), file, channels as usize)
+                    .map_err(|e| EngineError::new("create Opus encoder", e))?;
+                Ok(Self::Opus(writer))
+            }
             format => {
                 let format = match format {
                     AudioFormat::Wav => apple_codec::OutputFormat::Wav, AudioFormat::Aiff => apple_codec::OutputFormat::Aiff,
@@ -1476,6 +1524,7 @@ impl<'a> Encoder<'a> {
         match self {
             Self::Apple(writer) => writer.abort().map_err(|e| EngineError::new("abort Apple output", e)),
             Self::Flac(writer) => { drop(writer); Ok(()) }
+            Self::Opus(writer) => { drop(writer); Ok(()) }
             Self::Mp3 { encoder, converter, .. } => {
                 drop(encoder);
                 converter.close().map_err(|e| EngineError::new("abort MP3 PCM converter", e))
@@ -1486,6 +1535,7 @@ impl<'a> Encoder<'a> {
         match self {
             Self::Apple(w) => w.write(samples).map_err(|e| EngineError::new("encode Apple output", e)),
             Self::Flac(w) => w.process_interleaved(samples).map_err(|e| EngineError::new("encode FLAC output", e)),
+            Self::Opus(w) => w.write(samples).map_err(|e| EngineError::new("encode Opus output", e)),
             Self::Mp3 { encoder, converter, scratch } => {
                 let frames = converter.convert(samples, scratch).map_err(|e| EngineError::new("convert MP3 PCM", e))?;
                 encoder.write_converted_stereo(&mut scratch[..frames * 2]).map_err(|e| EngineError::new("encode MP3 output", e))
@@ -1507,6 +1557,8 @@ impl<'a> Encoder<'a> {
             }
             Self::Flac(w) => { let file = w.finish().map_err(|e| EngineError::new("finish FLAC output", e))?;
                 file.sync_all().map_err(|e| EngineError::new("sync FLAC output", e)) },
+            Self::Opus(w) => { let file = w.finish().map_err(|e| EngineError::new("finish Opus output", e))?;
+                file.sync_all().map_err(|e| EngineError::new("sync Opus output", e)) },
             Self::Mp3 { encoder, converter, .. } => {
                 converter.close().map_err(|e| EngineError::new("close MP3 PCM converter", e))?;
                 encoder.finish().map_err(|e| EngineError::new("finish MP3 output", e))?;
@@ -1640,7 +1692,7 @@ fn inspect_encoded(path: &Path, format: AudioFormat, settings: &Settings) -> Res
     let expected = match format {
         AudioFormat::Wav | AudioFormat::Aiff => SourceCodec::Lpcm,
         AudioFormat::Alac => SourceCodec::Alac, AudioFormat::Aac => SourceCodec::Aac,
-        AudioFormat::Flac => SourceCodec::Flac, AudioFormat::Mp3 => SourceCodec::Mp3,
+        AudioFormat::Flac => SourceCodec::Flac, AudioFormat::Mp3 => SourceCodec::Mp3, AudioFormat::Opus => SourceCodec::Opus,
         AudioFormat::MatchInput => return Err(EngineError::new("inspect encoded output", "unresolved output format")),
     };
     if codec != expected {
@@ -1652,6 +1704,19 @@ fn inspect_encoded(path: &Path, format: AudioFormat, settings: &Settings) -> Res
     Ok(EncodedInfo { format: format_label(path, codec), stream, frames: frames as u64 })
 }
 struct FinalResult { frames: u64, output_volume: f32 }
+/// Opus is produced at exactly 48 kHz with one or two channels and without any
+/// sample-rate conversion; refuse anything else before the expensive passes.
+fn opus_output_preflight(measured: &Measured) -> Result<(), EngineError> {
+    let rate = f64::from(crate::opus::SAMPLE_RATE);
+    if measured.processing_rate != rate {
+        return Err(EngineError::new("output sample-rate conversion",
+            crate::opus::OpusError::SampleRate { source: measured.processing_rate, requested: rate }));
+    }
+    if !(1..=2).contains(&measured.source.channels_per_frame) {
+        return Err(EngineError::new("create Opus encoder", crate::opus::OpusError::Unsupported("Opus output supports mono and stereo only")));
+    }
+    Ok(())
+}
 fn final_pass(temp: &TempCaf, staged: &file_workflow::StagedOutput, measured: &Measured, healed: &HealingResult, template: &Template,
               format: AudioFormat, source_header: crate::mp3::SourceHeader, settings: &Settings,
               libraries: &EncodingLibraries, cancel: &Cancellation) -> Result<FinalResult, EngineError> {
@@ -1775,12 +1840,13 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         AudioFormat::Aac | AudioFormat::Alac => prepared.controlled_mp4_time_1904,
         _ => None,
     }; #[cfg(any(target_os = "linux", feature = "portable"))] let mut wav_tags_preserved = false;
-    let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str, bool), EngineError> {
+    let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str, bool, Vec<String>), EngineError> {
         let measured = analyze(input, settings, cancel, false)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after analysis", e))?;
         if measured.codec != prepared.source_codec {
             return Err(EngineError::coded("analysis input", ErrorCode::SourceChanged, "source codec changed since inspection"));
         }
+        if plan.format() == AudioFormat::Opus { opus_output_preflight(&measured)?; }
         let plan_healing = HealingPlan::from_analysis(template, measured.values);
         let healed = healing_pass(input, &temp, &measured, &plan_healing, plan.is_replacement(), settings, cancel)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after healing", e))?;
@@ -1814,9 +1880,10 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         staged.remember_staging_file().map_err(|e| EngineError::workflow("verify output stage", e))?;
         // Embedded artwork is copied unchanged only under the explicit opt-in; otherwise the reference policy applies.
         let options = tags::TransferOptions { copy_artwork: settings.non_identical_enabled(), #[cfg(any(target_os = "linux", feature = "portable"))] preserve_wav_chunks: settings.non_identical_enabled() };
-        let report = bridge.transfer_with_options(tag_source, staged.staging_path(), source_tag_format(input)?,
+        let report = bridge.transfer_with_options(tag_source, staged.staging_path(), source_tag_format(input, settings)?,
             output_tag_format(plan.format()), choice, &marker, options).map_err(|e| EngineError::new("copy source tags", e))?;
         let artwork_copied = report.artwork_copied; #[cfg(any(target_os = "linux", feature = "portable"))] { wav_tags_preserved = report.wav_tags_preserved; }
+        let dropped_tags = report.dropped_tags.clone();
         if !report.is_success() {
             return Err(EngineError::new("copy source tags", format!("copy error: {:?}; marker error: {:?}", report.copy_error, report.marker_error)));
         }
@@ -1840,10 +1907,10 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         };
         let encoded = inspect_encoded(staged.staging_path(), plan.format(), settings)?;
         check_cancel(cancel, "publication")?;
-        Ok((measured, healed, final_result, encoded, marker_status, artwork_copied))
+        Ok((measured, healed, final_result, encoded, marker_status, artwork_copied, dropped_tags))
     })();
     let cleanup = temp.cleanup();
-    let (measured, healed, output, encoded, marker_status, artwork_copied) = match (run, cleanup) {
+    let (measured, healed, output, encoded, marker_status, artwork_copied, dropped_tags) = match (run, cleanup) {
         (Ok(result), Ok(())) => result,
         (Err(mut error), Err(cleanup)) => {
             error.no_longer_a_clean_cancel();
@@ -1856,7 +1923,7 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
     let publication = staged.finish(cancel).map_err(|e| EngineError::workflow("publish output", e))?;
     let output_pitch = if healed.stages.iter().any(|stage| stage == "pitch") { 440.0 } else { measured.values.input_tuning_hz };
     let mut stages = healed.stages;
-    stages.push("limiter".to_owned()); #[cfg(any(target_os = "linux", feature = "portable"))] let non_identical_paths = |mp3_decode: bool, artwork_copy: bool| crate::wav_preserve::with_member(non_identical_paths(mp3_decode, artwork_copy), wav_tags_preserved);
+    stages.push("limiter".to_owned()); #[cfg(any(target_os = "linux", feature = "portable"))] let non_identical_paths = |artwork_copy: bool| crate::wav_preserve::with_member(non_identical_paths(artwork_copy), wav_tags_preserved);
     Ok(ProcessReport { input_path: input.to_owned(), output_path: publication.destination, backup_path: publication.backup,
         replaced_existing_output: publication.replaced_existing_output, input_format: prepared.input_format.clone(), output_format: encoded.format,
         input_sample_rate: measured.source.sample_rate, processing_sample_rate: measured.processing_rate, sample_rate: encoded.stream.sample_rate,
@@ -1868,7 +1935,12 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         tempo_factor: healed.tempo_factor, clip_count: healed.clip_count, applied_stages: stages, processing_marker_status: marker_status,
         input_marker_override: prepared.input_marker_override, source_tags_unavailable: prepared.source_tags_unavailable.clone(),
         controlled_mp4_time_1904: controlled_mp4_time,
-        non_identical_paths: non_identical_paths(measured.non_identical, artwork_copied) })
+        no_platinum_notes_reference: (measured.codec == SourceCodec::Opus || plan.format() == AudioFormat::Opus).then_some(crate::opus::NO_REFERENCE_NOTE),
+        opus_output: libraries.opus.as_ref().map(|lib| OpusOutputReport {
+            encoder: lib.identity().version.clone(), library_sha256: lib.identity().sha256.clone(),
+            target_bitrate_bps: (crate::opus::BITRATE_PER_CHANNEL as u32) * encoded.stream.channels_per_frame,
+            vbr: true, complexity: crate::opus::COMPLEXITY, frame_ms: 20, dropped_tags }),
+        non_identical_paths: non_identical_paths(artwork_copied) })
 }
 
 #[cfg(test)]

@@ -488,6 +488,8 @@ fn parity_opt_in_defaults_off_persists_validates_resets_and_keeps_old_state_file
     assert_eq!(view["parity"], json!({"allow_non_identical": false}));
     assert_eq!(view["parity_effect"]["effective"], false);
     assert!(view["parity_effect"]["note"].as_str().unwrap().starts_with("disabled") || !NON_IDENTICAL_PATHS_AVAILABLE);
+    // MP3 input is decoded exactly and is no longer gated: no note may talk about it.
+    assert!(!view["parity_effect"]["note"].as_str().unwrap().contains("MP3"));
 
     loaded.settings.config_set("parity.allow_non_identical", json!(true), 4).unwrap();
     store.save(&mut loaded).unwrap();
@@ -500,8 +502,9 @@ fn parity_opt_in_defaults_off_persists_validates_resets_and_keeps_old_state_file
     assert_eq!(view["parity"], json!({"allow_non_identical": true}));
     assert_eq!(view["parity_effect"]["effective"], NON_IDENTICAL_PATHS_AVAILABLE);
     let note = view["parity_effect"]["note"].as_str().unwrap();
+    assert!(!note.contains("MP3"), "{note}");
     if NON_IDENTICAL_PATHS_AVAILABLE {
-        assert!(note.starts_with("enabled") && note.contains("non_identical_paths"), "{note}");
+        assert!(note.starts_with("enabled") && note.contains("artwork_copy") && note.contains("non_identical_paths"), "{note}");
     } else {
         assert!(note.starts_with("no effect in this macOS default build"), "{note}");
     }

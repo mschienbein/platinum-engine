@@ -1,4 +1,4 @@
-Platinum Engine v0.2.0 — third-party notices
+Platinum Engine v0.3.0 — third-party notices
 ===========================================
 
 Project-owned contributions are under LICENSE (MIT), subject to third-party
@@ -44,6 +44,20 @@ the source archive, patches and build instructions accompany release payloads.
 Source: https://github.com/xiph/flac/releases/download/1.4.2/flac-1.4.2.tar.xz
 SHA-256: e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4
 
+libopus 1.6.1
+-------------
+A separately loaded, fixed-point shared libopus is used only by the opt-in Opus
+input and output (setting formats.opus). It is distributed under the BSD-3-Clause
+terms of its COPYING file, reproduced in NOTICE, and is subject to the royalty-free
+patent licenses it names (Xiph.Org Foundation, Microsoft Corporation, Broadcom
+Corporation; https://datatracker.ietf.org/ipr/1524/, /1914/ and /1526/). It is built
+unmodified from the release archive with the fixed-point, no-SIMD, no-float
+configuration in tools/linux/build-libopus.sh; the source archive and that recipe
+accompany release payloads. The Ogg and RFC 7845 (Ogg Opus) code is project-owned
+Rust written from the published specifications; no libopus source is included.
+Source: https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+SHA-256: 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+
 Apple ALAC reference
 --------------------
 The portable Rust ALAC implementation was independently written after studying
@@ -53,20 +67,31 @@ Inc. All rights reserved. Its Apache-2.0 license text is reproduced in NOTICE.
 Derivative status and any applicable attribution requirements need maintainer
 review. Source: https://github.com/macosforge/alac/tree/c38887c5c5e64a4b31108733bd79ca9b2496d987
 
-Open-source MP3 decoder (opt-in, Linux and portable builds)
------------------------------------------------------------
-With `parity.allow_non_identical` enabled, Linux and `--features portable`
-builds decode MP3 input with src/portable/audio/mp3*.rs, a project-owned
-Layer III decoder written in safe Rust from ISO/IEC 11172-3 and 13818-3. It
-links no decoder library and contains no code from LAME, mpglib, mpg123,
-libmad, minimp3 or FFmpeg. Its Huffman code and length tables and its synthesis
-window are standard data (ISO/IEC 11172-3 Annex B); the generator
-tools/portable/mp3dec/gen_tables.py transcribes those numbers, not code, from
-the LAME 3.100 source archive listed above (libmp3lame/tables.c and
-mpglib/tabinit.c, LGPL-2.0-or-later) and checks each Huffman table as a prefix
-code. Whether numeric standard data taken from that source needs attribution
-beyond this notice needs maintainer review. The macOS default build does not
-use this decoder.
+Exact MP3 reader (Linux and portable builds)
+--------------------------------------------
+Linux and `--features portable` builds decode MP3 input with
+src/portable/audio/mp3/, a project-written Rust implementation (no `unsafe`
+code, standard library only, integer arithmetic only) that needs no setting. It
+is a compatibility implementation: its purpose is to produce what Apple's
+AudioToolbox produces for an MP3 file, and its behavior was recovered from
+Apple's own binaries by static analysis, instruction-level transcription and
+recorded runtime states of the AudioCodecs component and AudioToolboxCore on
+macOS 27.2 (build 26B123) on one reference machine. It therefore contains
+numeric constants and algorithms that reproduce Apple's behavior, among them 33
+constant tables that are bit-exact copies of data read from the arm64e slice of
+AudioCodecs (SHA-256 70e5d4a56b24d037b940328916df496a20267eb206f8e316216ae7bef69a1626);
+the table files (tables.rs, back_tables.rs) and the module header (mod.rs) name
+the binary and the addresses each table was read from. No Apple binary and no
+Apple source code is included, and the reader calls no Apple API. The scripts
+that generated and verified the tables, the research corpora and the recorded
+Apple results are not part of the public source; the checked-in test fixtures
+under tests/fixtures/mp3-exact/ are generated audio with recorded results. This
+is a statement of provenance, not a legal opinion, and no legal clearance of
+the reader, its constants or its algorithms is claimed. The macOS default build
+uses AudioToolbox itself and does not use this reader. An earlier open-source
+MP3 decoder written from ISO/IEC 11172-3 and 13818-3 (shipped opt-in in v0.2.0,
+with Huffman and window numbers transcribed from the LAME 3.100 archive) was
+replaced by this reader and is no longer part of the source.
 
 Rust dependencies and standard library
 --------------------------------------

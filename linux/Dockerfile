@@ -26,6 +26,8 @@ RUN curl -fL https://github.com/taglib/taglib/archive/e36a9cabb9882e61276161c238
  && echo 'e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4  flac.tar.xz' | sha256sum -c - \
  && curl -fL https://ftp.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz -o lame.tar.gz \
  && echo 'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e  lame.tar.gz' | sha256sum -c - \
+ && curl -fL https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz -o opus.tar.gz \
+ && echo '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  opus.tar.gz' | sha256sum -c - \
  && tar --no-same-owner -xzf taglib.tar.gz && tar --no-same-owner -xf flac.tar.xz && tar --no-same-owner -xzf lame.tar.gz
 COPY linux/patches/ /build/patches/
 COPY src/portable/math.rs /build/src/portable/math.rs
@@ -65,19 +67,28 @@ RUN echo '0f4570fddb684f87b04ae6e36a7919d9c6928423d2a761d53a90cd21edb76ecd  lame
       python3 -c 'from pathlib import Path; p=Path("config.h"); b=p.read_text(); names=("HAVE_XMMINTRIN_H","TAKEHIRO_IEEE754_HACK","USE_FAST_LOG"); [(exec("global b; b=b.replace(\"#define "+n+" 1\", \"/* #undef "+n+" */\")")) for n in names]; p.write_text(b)'; \
     elif [ "$LAME_PROFILE" != system ]; then echo 'unknown LAME_PROFILE' >&2; exit 1; fi \
  && make -j4 && make install
+# libopus for the opt-in Opus input and output: unmodified source, fixed point, no SIMD, no float, no runtime CPU
+# detection (see tools/linux/build-libopus.sh). It is built into its own prefix; only the shared library is kept.
+COPY tools/linux/build-libopus.sh /build/tools/linux/build-libopus.sh
+RUN sh /build/tools/linux/build-libopus.sh /build/opus.tar.gz 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1 /build/opus-work /build/opus-install "$CC" \
+ && cp -P /build/opus-install/lib/libopus.so* /opt/platinum-native/lib/
 RUN mkdir -p /opt/platinum-native/receipt \
  && cp /build/flac-build/CMakeCache.txt /build/flac-build/config.h /opt/platinum-native/receipt/ \
  && cp /build/lame-3.100/config.log /opt/platinum-native/receipt/lame-config.log \
  && cp /build/lame-3.100/config.h /opt/platinum-native/receipt/lame-config.h \
- && sha256sum /build/patches/codec-math.sha256 /build/patches/flac/0001-apple-arm64-fp-order.patch /build/patches/flac/0002-apple-fixed-predictor.patch /build/patches/flac/codec-math.h /build/src/portable/math.rs /build/tools/portable/math/shim/Cargo.toml /build/tools/portable/math/shim/Cargo.lock /build/tools/portable/math/shim/src/lib.rs /build/tools/portable/math/shim/pn_codec_math.h /build/patches/lame/0001-remove-obsolete-export.patch /build/patches/lame/0002-apple-builtin-calls.patch /build/patches/lame/0003-apple-intrinsic-order.patch /build/patches/lame/codec-math.h > /opt/platinum-native/receipt/codec-input-sha256.txt \
+ && mkdir -p /opt/platinum-native/receipt/libopus && cp -R /build/opus-work/receipt/. /opt/platinum-native/receipt/libopus/ \
+ && sha256sum /build/patches/codec-math.sha256 /build/patches/flac/0001-apple-arm64-fp-order.patch /build/patches/flac/0002-apple-fixed-predictor.patch /build/patches/flac/codec-math.h /build/src/portable/math.rs /build/tools/portable/math/shim/Cargo.toml /build/tools/portable/math/shim/Cargo.lock /build/tools/portable/math/shim/src/lib.rs /build/tools/portable/math/shim/pn_codec_math.h /build/patches/lame/0001-remove-obsolete-export.patch /build/patches/lame/0002-apple-builtin-calls.patch /build/patches/lame/0003-apple-intrinsic-order.patch /build/patches/lame/codec-math.h /build/tools/linux/build-libopus.sh > /opt/platinum-native/receipt/codec-input-sha256.txt \
  && { printf 'CC=%s\nCXX=%s\nFLAC_FLAGS=%s\nFLAC_ASM=%s\nLAME_FLAGS=%s\nLAME_PROFILE=%s\n' "$CC" "$CXX" "$FLAC_FLAGS" "$FLAC_ASM" "$LAME_FLAGS" "$LAME_PROFILE"; "$CC" --version; cmake --version; rustc --version; } > /opt/platinum-native/receipt/build.txt
 ENV LD_LIBRARY_PATH=/opt/platinum-native/lib
 
 # Build this target only after a real portable ABI-5 source exists. Never fall
 # back to the macOS Objective-C++ bridge or a stub.
+# The bridge parses hostile tags in process: stack protector, _FORTIFY_SOURCE=2 (needs -O2) and
+# immediate binding with a read-only relocation segment (-z relro,now) are on; -fvisibility=hidden, the
+# version script and --exclude-libs keep the exported surface to the ABI. The pinned libtag.a is unchanged.
 FROM deps AS bridge
 COPY native/taglib_bridge_portable.cpp native/taglib_bridge.h /build/native/
 COPY tools/portable/bridge/bridge.map /build/native/bridge.map
-RUN "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -shared -DTAGLIB_STATIC \
+RUN "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2 -shared -DTAGLIB_STATIC \
       -I/opt/platinum-native/include/taglib /build/native/taglib_bridge_portable.cpp \
-      /opt/platinum-native/lib/libtag.a -Wl,--exclude-libs,ALL -Wl,--version-script=/build/native/bridge.map -lz -o /opt/platinum-native/lib/libpn-tag-bridge.so
+      /opt/platinum-native/lib/libtag.a -Wl,--exclude-libs,ALL -Wl,-z,relro,-z,now -Wl,--version-script=/build/native/bridge.map -lz -o /opt/platinum-native/lib/libpn-tag-bridge.so

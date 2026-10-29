@@ -16,22 +16,24 @@ mkdir -p "$out/archives" "$out/lib" "$out/relink" "$out/receipt" \
 # Freeze the repository-owned inputs before they are used.
 cp "$root/native/taglib_bridge.cpp" "$root/native/taglib_bridge.h" "$out/source/native/"
 cp "$root/linux/patches/lame/0001-remove-obsolete-export.patch" "$out/source/linux/patches/lame/"
-cp "$root/tools/linux/build-macos-libs.sh" "$out/source/tools/linux/"
+cp "$root/tools/linux/build-macos-libs.sh" "$root/tools/linux/build-libopus.sh" "$out/source/tools/linux/"
 
 if [ -n "${PN_NATIVE_ARCHIVES_DIR:-}" ]; then
   cp "$PN_NATIVE_ARCHIVES_DIR/taglib.tar.gz" "$PN_NATIVE_ARCHIVES_DIR/flac.tar.xz" \
-    "$PN_NATIVE_ARCHIVES_DIR/lame.tar.gz" "$out/archives/"
+    "$PN_NATIVE_ARCHIVES_DIR/lame.tar.gz" "$PN_NATIVE_ARCHIVES_DIR/opus.tar.gz" "$out/archives/"
 else
   curl -fLsS https://github.com/taglib/taglib/archive/e36a9cabb9882e61276161c23834d966d62073b7.tar.gz -o "$out/archives/taglib.tar.gz"
   curl -fLsS https://github.com/xiph/flac/releases/download/1.4.2/flac-1.4.2.tar.xz -o "$out/archives/flac.tar.xz"
   curl -fLsS https://ftp.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz -o "$out/archives/lame.tar.gz"
+  curl -fLsS https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz -o "$out/archives/opus.tar.gz"
 fi
 (
   cd "$out/archives"
   printf '%s\n' \
     '5c80b1e5273849122ef11b5a9116e4b7f182b899cfdb28aefb704087216e1360  taglib.tar.gz' \
     'e322d58a1f48d23d9dd38f432672865f6f79e73a6f9cc5a5f57fcaa83eb5a8e4  flac.tar.xz' \
-    'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e  lame.tar.gz' | shasum -a 256 -c -
+    'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e  lame.tar.gz' \
+    '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  opus.tar.gz' | shasum -a 256 -c -
 )
 tar -xzf "$out/archives/taglib.tar.gz" -C "$out/work"
 tar -xf "$out/archives/flac.tar.xz" -C "$out/work"
@@ -76,13 +78,18 @@ printf '%s  %s\n' 0f4570fddb684f87b04ae6e36a7919d9c6928423d2a761d53a90cd21edb76e
 )
 cp -P "$out/work/lame-3.100/libmp3lame/.libs/libmp3lame.0.dylib" \
   "$out/work/lame-3.100/libmp3lame/.libs/libmp3lame.dylib" "$out/lib/"
+# libopus (opt-in Opus): the same fixed-point, no-SIMD, no-float recipe as the Linux image.
+sh "$root/tools/linux/build-libopus.sh" "$out/archives/opus.tar.gz" \
+  6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1 "$out/work/opus" "$out/work/opus-install"
+cp -P "$out/work/opus-install/lib/libopus.0.dylib" "$out/work/opus-install/lib/libopus.dylib" "$out/lib/"
+mkdir -p "$out/receipt/libopus" && cp -R "$out/work/opus/receipt/." "$out/receipt/libopus/"
 cp "$out/work/build-taglib/CMakeCache.txt" "$out/receipt/taglib-CMakeCache.txt"
 cp "$out/work/build-flac/CMakeCache.txt" "$out/receipt/flac-CMakeCache.txt"
 cp "$out/work/build-flac/config.h" "$out/receipt/flac-config.h"
 cp "$out/work/lame-3.100/config.h" "$out/receipt/lame-config.h"
 cp "$out/work/lame-3.100/config.log" "$out/receipt/lame-config.log"
 {
-  printf '%s\n' 'macOS arm64; public TagLib 1.11.1, FLAC 1.4.2 and LAME 3.100' \
+  printf '%s\n' 'macOS arm64; public TagLib 1.11.1, FLAC 1.4.2, LAME 3.100 and libopus 1.6.1' \
     'Settings and source URLs: source/tools/linux/build-macos-libs.sh and docs/BUILD.md' \
     'Bridge compilation and linkage use the object in relink/taglib_bridge.o.'
   sw_vers

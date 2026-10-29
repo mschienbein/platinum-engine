@@ -710,9 +710,11 @@ fn portable_codec_refusals() {
     assert_eq!(reader.client_format().format_flags, 9);
     let mp3 = dir.join("mp3-header");
     write_new(&mp3, b"ID3\0\0\0\0\0\0\0\0\0");
-    assert!(matches!(PReader::open(&mp3, None), Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", .. })));
+    // An ID3-only file is an MP3 open: refused by the exact reader with AudioFile's status, not by a codec gate.
+    assert!(matches!(PReader::open(&mp3, None), Err(CodecError::Native { operation: "ExtAudioFileOpenURL", .. })));
     let aac = dir.join("aac-header");
-    write_new(&aac, &[0xff, 0xf1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // A header AudioFile sniffs as ADTS (frame length 13, sampling index 4); a name without an extension leaves the choice to the content.
+    write_new(&aac, &[0xff, 0xf1, 0x50, 0x80, 0x01, 0xa0, 0, 0, 0, 0, 0, 0]);
     assert!(matches!(PReader::open(&aac, None), Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })));
     let aac_m4a = root.parent().unwrap().parent().unwrap().join("apple-codecs/aac-writer-warning-matrix-01/aac-44100-2.m4a");
     assert!(matches!(PReader::open(&aac_m4a, None), Err(CodecError::UnsupportedCodec { codec: "AAC/MP4A", operation: "decoding", .. })));
