@@ -96,7 +96,12 @@ With it on (Linux and `--features portable` builds only):
   copies, refused by default on Linux) or drop it (FLAC to FLAC). Same-family
   ID3, MP4 and AIFF copies already preserved the picture and are unchanged. A
   picture in a WAV's `ID3 ` chunk follows the WAV tag chunk rule below, not this
-  one.
+  one. With the setting on, pictures are preserved for same-format processing
+  (`match-input`: FLAC, MP3, AIFF, M4A, and WAV to WAV through
+  `wav_tag_preservation`). Cross-format copies into or out of a WAV (for example
+  MP3 or FLAC to WAV, WAV to FLAC) still carry no picture, because the portable
+  bridge excludes WAV from image handling, as the macOS reference does; handling
+  them is planned for v0.3.0.
   The item is refused with `artwork_conversion_unavailable`, before anything is
   written, when a picture is not a structurally complete JPEG, PNG, GIF, BMP or
   WebP, when MP4 `covr` would have to hold WebP, or when a FLAC block would

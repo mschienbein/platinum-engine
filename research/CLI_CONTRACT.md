@@ -89,7 +89,12 @@ What it enables, on Linux and on `--features portable` builds only:
   Same-family ID3, MP4 and AIFF direct copies already moved the picture
   unchanged and are untouched. A picture in a WAV's `ID3 ` chunk follows the WAV
   tag chunks rule below instead (the next bullet; see also the WAV tag-chunk
-  paragraph in the processed-marker section). Stored MIME is the canonical type of the
+  paragraph in the processed-marker section). With the setting on, pictures are
+  preserved for same-format processing (`match-input`: FLAC, MP3, AIFF, M4A, and
+  WAV to WAV through `wav_tag_preservation`); cross-format copies into or out of
+  a WAV (for example MP3 or FLAC to WAV, WAV to FLAC) still carry no picture,
+  because the portable bridge excludes WAV from image handling, as the macOS
+  reference does, and are planned for v0.3.0. Stored MIME is the canonical type of the
   validated bytes; MP4 `covr` has no type or description. On this generic path,
   pictures read from MP4 become front covers in ID3 and FLAC. The direct
   M4A-to-MP3 path keeps the reference behaviour instead and is not reported as
