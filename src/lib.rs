@@ -40,3 +40,5 @@ pub mod statistics;
 pub mod tags;
 pub mod templates;
 pub mod transient;
+#[cfg(any(target_os = "linux", feature = "portable"))]
+pub(crate) mod wav_preserve;

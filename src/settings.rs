@@ -219,7 +219,7 @@ impl Settings {
             (true, false) => ParityEffect { effective: false,
                 note: "disabled: identical-or-refuse behaviour; MP3 input is refused and artwork that would need Apple image conversion is refused, each with a typed error code" },
             (true, true) => ParityEffect { effective: true,
-                note: "enabled: MP3 input is decoded with the open-source decoder and embedded cover art is copied unchanged; items using these paths list them in report.non_identical_paths and are not guaranteed byte-identical to macOS" },
+                note: "enabled: MP3 input is decoded with the open-source decoder, embedded cover art is copied unchanged and the tag chunks of a WAV source are kept; items using these paths list them in report.non_identical_paths and are not guaranteed byte-identical to macOS" },
         }
     }
 

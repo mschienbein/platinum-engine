@@ -102,10 +102,11 @@ int pn_tag_save_marker(int destination_format, const char *destination,
  * JPEG/PNG/GIF/BMP/WebP image, or the destination cannot store it as-is
  * (MP4 covr holds only JPEG/PNG/GIF/BMP; a FLAC metadata block holds at most
  * 16 MiB - 1). The refusal happens before any destination write or callback.
- * WAV destinations are unchanged and behave as in the reference: a picture
- * reaches a WAV only inside an ID3 chunk that the marker rewrite does not
- * discard (the chunk TagLib saved last is lost when the file is rewritten
- * while the stream is still open).
+ * WAV destinations are unchanged by the flag and behave as in the reference:
+ * a picture reaches a WAV only inside an ID3 chunk that the marker rewrite
+ * does not discard (the chunk TagLib saved last is lost when the file is
+ * rewritten while the stream is still open). The engine's opt-in keeps that
+ * chunk in its Rust marker rewrite (rewrite_wav callback); the bridge does not.
  * flags with unknown bits fail with status 1. result_flags may be NULL; it is
  * set to 0 on entry and to the OR of PN_TAG_RESULT_* only when the call
  * returns 0. */

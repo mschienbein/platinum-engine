@@ -27,11 +27,16 @@ call context; it changes no processing numerics.
 
 - **Opt-in non-identical paths.** `parity.allow_non_identical` (default off)
   enables, on Linux and `portable` builds only, an open-source deterministic
-  MP3 decoder and the byte-for-byte copy of embedded cover art. These two paths
+  MP3 decoder, the byte-for-byte copy of embedded cover art and the keeping of
+  the WAV tag chunks the reference marker writer drops (a source's `ID3 ` chunk
+  and INFO `LIST` survive WAV output). These three paths
   are **not** claimed to match the macOS reference: the decoder equals
   AudioToolbox on 95.08 % of 46.1 million samples of a 389-file generated corpus
   with a 4-LSB maximum difference (identical on macOS arm64, Linux aarch64 and
-  Linux x86_64), and a copied picture is not what the macOS bridge writes. Each
+  Linux x86_64), a copied picture is not what the macOS bridge writes, and the
+  kept WAV chunks are chunks the native application and macOS drop. The WAV rule
+  is Rust-only (`src/wav_preserve.rs`, no bridge change); the macOS default
+  executable is byte-identical with and without it. Each
   affected item lists the path in `report.non_identical_paths`. With the setting
   off, Linux behavior is the v0.1.0 identical-or-refuse behavior; on a macOS
   default build it has no effect.
@@ -81,33 +86,47 @@ never counted as passes:
 
 ## v0.2.0 release evidence
 
-Source freeze `freeze-02` has source-manifest SHA-256
-`f6ff459965e75967095c9ccd9bfa05f8e73f0e8fdcbd6ed176d8731e1fdf3483`. Its
+Source freeze `freeze-03b` has source-manifest SHA-256
+`18acb54e10561200d15b18865bc0131894e7fc354003b9f913bc38bfd9428b94`. Its
 executables, all built from that source, are:
 
 | Platform | Executable SHA-256 |
 | --- | --- |
 | macOS arm64 (privacy-remapped release build) | `75c2ac875f39bacac357544a704b821a489bc306935da85c0c5feff478d39260` |
-| Linux aarch64 | `7f2fea4fd1fee5ee265fc63f809c868cea6179f3293ace4faaa1ac69b1e4a56d` |
-| Linux x86_64 | `eb62ec42c73f233c94dd1e855655c1cc4548756acab743fe3b37abecf02275d0` |
+| Linux aarch64 | `881ee9093922181040126f75f9bc8508decb633c6cc43121db32019d85800454` |
+| Linux x86_64 | `25a409193ac0674438b3b6e719a3d14d79353a35794d2c5f1a4c0208f62f6033` |
 
-The macOS executable was rebuilt independently from the exported public tree with
-the recipe in [BUILD.md](BUILD.md) and matched byte for byte; both Linux
+The macOS executable is byte-identical to the one built from the earlier
+freeze `freeze-02` (`f6ff4599…`): the WAV tag rule is cfg-gated to Linux and
+`portable` builds and every edit to code compiled on macOS keeps its panic-site
+line and column numbers, so the macOS battery recorded for `freeze-02` applies.
+The macOS executable was rebuilt independently from the exported public tree
+with the recipe in [BUILD.md](BUILD.md) and matched byte for byte; both Linux
 executables were likewise rebuilt from the public export in the native-library
 images and matched. These are the executables in the release archives.
 
 **Source-freeze tests** (offline, locked, all targets; ignored tests are never
-counted as passes):
+counted as passes). The frozen development tree contains two private,
+fixture-dependent ignored diagnostics that the public export omits, so its macOS
+ignored count is two higher than the export's:
 
-- macOS default build: **512** passed, **0** failed, **190** ignored across 49
-  suites (516 passed if every `test result` line is counted). The opt-in lanes
-  passed 38/38 public-dependency tests, 1/1 waveform native replay, 1/1 Xing
-  unknown-byte oracle and 8/8 `error_codes` tests that need the macOS bridge.
-- Linux aarch64: **469** passed, **0** failed, **126** ignored (49 suites), plus
-  the library-gated lane (`error_codes`, `linux_opt_in`, `portable_art_copy`
-  with `--ignored`) **28** passed, 0 failed (3 suites).
-- Linux x86_64: **467** passed, **0** failed, **124** ignored (49 suites), plus
-  the library-gated lane **28** passed, 0 failed (3 suites).
+- macOS default build: **516** passed, **0** failed, **190** ignored in the
+  frozen tree (every `test result` line counted; the `freeze-02` battery receipt
+  counts the same suites as **512** passed across 49 suites by its
+  nested-summary rule) and **516** passed, **0** failed, **188** ignored when the
+  public export itself is tested. The opt-in lanes passed 38/38
+  public-dependency tests, 1/1 waveform native replay, 1/1 Xing unknown-byte
+  oracle, 8/8 `error_codes` tests that need the macOS bridge, and the
+  portable-mode WAV tag tests (3/3 bridge tests with the v0.1.0 macOS bridge, 8/8
+  unit tests).
+- Linux aarch64: **477** passed, **0** failed, **130** ignored, plus the
+  library-gated lane (`error_codes`, `linux_opt_in`, `portable_art_copy` and the
+  three WAV tag-chunk tests of `tags_reference`, with `--ignored`) **33** passed,
+  0 failed (4 suites). The same counts were obtained building and testing the
+  public export.
+- Linux x86_64: **475** passed, **0** failed, **128** ignored, plus the
+  library-gated lane **33** passed, 0 failed (4 suites); likewise reproduced on
+  the public export.
 
 **macOS battery for `75c2ac87…`** (receipt `release-final-75c2ac87.json`, overall
 status bounded-complete-file-match-with-documented-context-limits, 0 failures):
@@ -121,13 +140,16 @@ sides); 4/4 failure inputs (f01; two matching native failures with no output);
 the W04 exact-path workflow, the CLI workflow smoke, gauge and waveform
 checks. The 13 synthetic AAC outputs equal v0.1.0's, and 120/120 output
 digests and 131/131 statuses are identical to v0.1.0. Default-off comparisons
-against the v0.1.0 macOS executable: 212 records, 0 stable differences.
+against the v0.1.0 macOS executable (the 12 earlier inputs plus four generated
+WAVs carrying `ID3 `, `id3 `, INFO and combined tag chunks): 276 records, 0
+stable differences; with the setting on nothing differs and nothing is listed.
 
-**Linux battery** (receipt `battery-linux/receipt.json`; per architecture;
-native libraries hashed before and after every run and matched by device and
-inode in `/proc/<pid>/maps`: of 10,606 observed child processes, 8,488 mapped a
-native library, every mapped file matched its pinned digest and none mapped an
-unexpected one). With the setting **off**:
+**Linux battery** (receipt `battery-linux/receipt-freeze-03b.json`, acceptance
+pass with no unexplained or failed items; per architecture; native libraries
+hashed before and after every run and matched by device and inode in
+`/proc/<pid>/maps`: of 11,276 observed child processes, 8,992 mapped a native
+library, every mapped file matched its pinned digest and none mapped an
+unexpected one). With the setting **off**, byte-identical to the v0.1.0 receipts:
 
 | Corpus | aarch64 | x86_64 |
 | --- | --- | --- |
@@ -138,11 +160,13 @@ unexpected one). With the setting **off**:
 | Docker Desktop bind-mount subset (separate from the tmpfs main run) | 44 exact, 2 refusals, 1 native match, plus 16 workflows | not part of the x86_64 battery |
 
 Every output hash is identical to the v0.1.0 receipts (0 differences in each
-corpus). Default-off comparisons against the v0.1.0 Linux executables: 188
-records on each architecture, 0 stable differences. With the setting **on**,
-aarch64 and x86_64 agree on every scenario: MP3 160/160, cover art 157/157
-(854 cells), error codes 165/165 covering 37/37 codes (31 observed through the
-CLI, five not reachable from it, and cancellation exercised with SIGINT).
+corpus). Default-off comparisons against the v0.1.0 Linux executables on the
+same 16 inputs: 248 records on each architecture, 0 stable differences, tagged
+WAVs included. With the setting **on**, aarch64 and x86_64 agree on every step:
+MP3 175/175 scenarios, cover art 184/184 scenarios (896/896 cells) and error
+codes 174/174 scenarios covering the 37/37-code ledger. `wav_tag_preservation`
+is declared on 53 items and never in a setting-off step; against v0.1.0 only the
+cross-format WAV outputs (AIFF, ALAC and FLAC to WAV) differ and each lists it.
 
 **Known differences and limits** (none changes a default-path result):
 
@@ -161,9 +185,16 @@ CLI, five not reachable from it, and cancellation exercised with SIGINT).
 - The direct M4A-to-MP3 picture path is the reference path (not the opt-in
   copy); its ID3 picture has type 0, no description, and `image/png` for GIF,
   BMP and WebP bytes, as on macOS.
-- AAC input and output stay refused on Linux; WAV to WAV drops the last-saved
-  tag chunk, as the native application does; the x86_64 floating-point
+- AAC input and output stay refused on Linux. The x86_64 floating-point
   residual classes described in [LINUX.md](LINUX.md) are unchanged.
+- By default (setting off) a WAV written from a WAV source drops the last-saved
+  tag chunk, as the native application does; with the setting on the source's
+  tag chunks are kept and the item lists `wav_tag_preservation`. A cross-format
+  copy into a WAV always writes tempo and key through TagLib, so with the setting
+  on even a source without tags gains an `ID3 ` chunk (`TBPM` "0", empty `TKEY`)
+  and lists `wav_tag_preservation`; a v0.3.0 follow-up will consider keeping only
+  chunks that carry source data. An MP3-to-WAV copy carries the text tags but
+  never a picture.
 - Follow-ups for v0.3.0 include a stricter preflight for very large pictures
   converted to ID3 (about sixteen 16 MiB FLAC pictures can pass the current
   check and still exceed the ID3 size limit; the likely effect is a failed item,

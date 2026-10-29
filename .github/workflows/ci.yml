@@ -153,6 +153,8 @@ jobs:
           cargo test --locked --test flac_reference --features portable -- --ignored
           # Library-gated end-to-end suites: error codes, opt-in MP3 input and cover-art copy.
           cargo test --locked --test error_codes --test linux_opt_in --test portable_art_copy -- --ignored
+          # Tag-bridge tests that pin the default WAV marker policy and the opt-in that keeps the chunks TagLib wrote.
+          cargo test --locked --test tags_reference -- --ignored wav_direct_copy_loses preserve_wav_chunks
           for name in \
             candidate_bridge::unreadable_source_copies_no_tags_but_still_writes_marker \
             candidate_bridge::portable_artwork_refusal_does_not_save_a_marker_fallback

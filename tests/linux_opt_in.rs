@@ -34,6 +34,8 @@
 //! | G3 `artwork_flac_webp_to_alac_is_refused_but_png_is_copied` | art bridge (MP4 `covr` rules), libFLAC |
 //! | G4 `artwork_mp3_apic_is_moved_unchanged_and_reports_only_mp3_decode` | decoder, the bridge's ID3 direct copy, LAME |
 //! | G5 `sources_without_artwork_report_no_artwork_copy` | engine reporting, art bridge accepting pictureless sources |
+//! | G6 `wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without` | `src/wav_preserve.rs` (Rust marker rewrite), engine `TransferOptions` and `non_identical_paths`; works with any bridge |
+//! | G7 `cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote` | the same rewrite for generic copies into a WAV (tempo and key are always written) |
 //! | H `failed_items_have_no_report` | engine/CLI JSON assembly |
 #![cfg(any(target_os = "linux", feature = "portable"))]
 
@@ -578,7 +580,8 @@ fn mp3_with_opt_in() {
 
     let wav_out = sandbox.dir("wav-out");
     let as_wav = sandbox.ok(&["process", text(&input), "--format", "wav", "--output-dir", text(&wav_out)]);
-    assert_eq!(paths(report(&as_wav, 0)), ["mp3_decode"], "{as_wav}");
+    // The generic copy into a WAV writes an `ID3 ` chunk (tempo and key) that the default policy drops; the opt-in keeps it.
+    assert_eq!(paths(report(&as_wav, 0)), ["mp3_decode", "wav_tag_preservation"], "{as_wav}");
     assert_eq!(Path::new(report(&as_wav, 0)["output_path"].as_str().unwrap()).extension().and_then(|e| e.to_str()), Some("wav"));
 
     assert_eq!(fs::read(&input).unwrap(), before, "the input is never modified");
@@ -866,6 +869,156 @@ fn sources_without_artwork_report_no_artwork_copy() {
         let processed = sandbox.ok(&["process", text(source), "--format", format, "--output-dir", text(&out)]);
         assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "{} -> {format}: {processed}", source.display());
     }
+}
+
+// --- G6: a WAV source's tag chunks survive WAV output only with the opt-in -----------------------------
+
+fn riff_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut chunk = id.to_vec();
+    chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(body);
+    if body.len() % 2 == 1 { chunk.push(0); }
+    chunk
+}
+
+/// `generated_wav` with extra chunks after `data` and a consistent RIFF size.
+fn wav_with_chunks(extra: &[Vec<u8>]) -> Vec<u8> {
+    let mut wav = generated_wav(RATE, SECONDS, false);
+    for chunk in extra { wav.extend_from_slice(chunk); }
+    let size = (wav.len() - 8) as u32;
+    wav[4..8].copy_from_slice(&size.to_le_bytes());
+    wav
+}
+
+/// Top-level chunks of a WAV, in file order, checking that the RIFF size matches the file.
+fn wav_chunks(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    assert_eq!((&data[..4], &data[8..12]), (&b"RIFF"[..], &b"WAVE"[..]));
+    assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize + 8, data.len(), "RIFF size must match the file");
+    let (mut position, mut chunks) = (12, Vec::new());
+    while position + 8 <= data.len() {
+        let length = u32::from_le_bytes(data[position + 4..position + 8].try_into().unwrap()) as usize;
+        assert!(position + 8 + length <= data.len());
+        chunks.push((data[position..position + 4].try_into().unwrap(), data[position + 8..position + 8 + length].to_vec()));
+        position += 8 + length + (length & 1);
+    }
+    assert_eq!(position, data.len());
+    chunks
+}
+
+fn id3v23_frame(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut frame = id.to_vec();
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(body);
+    frame
+}
+
+/// An ID3v2.3 tag with a title, an artist and one PNG picture.
+fn id3v23_tag_with_picture(png: &[u8]) -> Vec<u8> {
+    let text = |value: &str| { let mut body = vec![0]; body.extend_from_slice(value.as_bytes()); body };
+    let mut apic = vec![0];
+    apic.extend_from_slice(b"image/png\0");
+    apic.push(3);
+    apic.extend_from_slice(b"front\0");
+    apic.extend_from_slice(png);
+    let frames = [id3v23_frame(b"TIT2", &text("Wav title")), id3v23_frame(b"TPE1", &text("Wav artist")), id3v23_frame(b"APIC", &apic)].concat();
+    let size = frames.len();
+    let mut tag = vec![b'I', b'D', b'3', 3, 0, 0, (size >> 21) as u8 & 0x7f, (size >> 14) as u8 & 0x7f, (size >> 7) as u8 & 0x7f, size as u8 & 0x7f];
+    tag.extend(frames);
+    tag
+}
+
+/// The reference marker writer drops the chunk TagLib saves last (see CLI_CONTRACT.md, WAV tag chunks); with
+/// `parity.allow_non_identical` the engine keeps every chunk TagLib wrote and says so in `non_identical_paths`.
+/// Nothing else about the output changes, and the default policy is exactly what it was.
+#[test]
+#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
+fn wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without() {
+    let sandbox = Sandbox::configured();
+    let png = generated_png(8, 8);
+    let id3 = id3v23_tag_with_picture(&png);
+    let info = [b"INFO".to_vec(), riff_chunk(b"INAM", b"Info title\0"), riff_chunk(b"IART", b"Info artist\0")].concat();
+    // (label, chunks after data, chunk ids the default policy keeps of them, ids the opt-in keeps, the opt-in changes the output)
+    let cases: [(&str, Vec<Vec<u8>>, &[&str], &[&str], bool); 5] = [
+        ("ID3 chunk only", vec![riff_chunk(b"ID3 ", &id3)], &[], &["ID3 "], true),
+        ("lowercase id3 chunk only", vec![riff_chunk(b"id3 ", &id3)], &[], &["ID3 "], true),
+        ("INFO LIST only", vec![riff_chunk(b"LIST", &info)], &[], &["LIST"], true),
+        ("ID3 chunk and INFO LIST", vec![riff_chunk(b"ID3 ", &id3), riff_chunk(b"LIST", &info)], &["ID3 "], &["ID3 ", "LIST"], true),
+        ("no tag chunks", Vec::new(), &[], &[], false),
+    ];
+    let plain = {
+        let wav = sandbox.file("plain.wav", &wav_with_chunks(&[]));
+        let out = sandbox.dir("plain-out");
+        let processed = sandbox.ok(&["process", text(&wav), "--format", "wav", "--output-dir", text(&out)]);
+        wav_chunks(&fs::read(report(&processed, 0)["output_path"].as_str().unwrap()).unwrap())
+    };
+    let plain_ids: Vec<String> = plain.iter().map(|(id, _)| String::from_utf8_lossy(id).into_owned()).collect();
+    assert_eq!(plain_ids.last().map(String::as_str), Some("PLTN"), "the marker is the last chunk: {plain_ids:?}");
+    // The chunk ids of an output: the plain layout with the kept tag chunks before the marker.
+    let layout = |kept: &[&str]| -> Vec<String> {
+        let mut ids = plain_ids[..plain_ids.len() - 1].to_vec();
+        ids.extend(kept.iter().map(|id| id.to_string()));
+        ids.push("PLTN".to_owned());
+        ids
+    };
+    for (case, (label, extra, default_kept, opt_in_kept, preserved)) in cases.into_iter().enumerate() {
+        let wav = sandbox.file(&format!("case-{case}.wav"), &wav_with_chunks(&extra));
+        for format in ["wav", "match-input"] {
+            let mut outputs = Vec::new();
+            for (round, on) in [false, true].into_iter().enumerate() {
+                sandbox.set_opt_in(on);
+                let out = sandbox.dir(&format!("out-{case}-{format}-{round}"));
+                let processed = sandbox.ok(&["process", text(&wav), "--format", format, "--output-dir", text(&out)]);
+                let chunks = wav_chunks(&fs::read(report(&processed, 0)["output_path"].as_str().unwrap()).unwrap());
+                let ids: Vec<String> = chunks.iter().map(|(id, _)| String::from_utf8_lossy(id).to_ascii_uppercase()).collect();
+                let expected = layout(if on { opt_in_kept } else { default_kept });
+                assert_eq!(ids, expected.iter().map(|id| id.to_ascii_uppercase()).collect::<Vec<_>>(), "{label}, {format}, opt-in {on}: {processed}");
+                let expected_paths: &[&str] = if on && preserved { &["wav_tag_preservation"] } else { &[] };
+                assert_eq!(paths(report(&processed, 0)), expected_paths, "{label}, {format}, opt-in {on}: {processed}");
+                if on {
+                    if let Some((_, body)) = chunks.iter().find(|(id, _)| id.eq_ignore_ascii_case(b"ID3 ")) {
+                        let pictures = id3_pictures(body);
+                        assert_eq!(pictures.len(), 1, "{label}, {format}: {processed}");
+                        assert_eq!(pictures[0].data, png, "{label}, {format}: the picture survives byte for byte");
+                        assert!(body.windows(9).any(|window| window == b"Wav title") && body.windows(10).any(|window| window == b"Wav artist"), "{label}, {format}");
+                    }
+                    if let Some((_, body)) = chunks.iter().find(|(id, _)| id == b"LIST") {
+                        assert!(body.starts_with(b"INFO") && body.windows(10).any(|window| window == b"Info title"), "{label}, {format}");
+                    }
+                }
+                outputs.push(chunks);
+            }
+            // Only chunks are added: everything the default policy writes is byte-identical under the opt-in.
+            for (id, body) in &outputs[0] {
+                let kept = outputs[1].iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("{label}, {format}: {id:?} missing under the opt-in"));
+                assert_eq!(&kept.1, body, "{label}, {format}: {id:?}");
+            }
+        }
+    }
+}
+
+/// A cross-format copy into a WAV always writes tempo and key through TagLib, so even a source without tags gains an
+/// `ID3 ` chunk (an empty key and a zero tempo) under the opt-in, and the item says so.
+#[test]
+#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
+fn cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote() {
+    let sandbox = Sandbox::configured();
+    let flac = sandbox.flac("plain", None);
+    let mut outputs = Vec::new();
+    for (round, on) in [false, true].into_iter().enumerate() {
+        sandbox.set_opt_in(on);
+        let out = sandbox.dir(&format!("out-{round}"));
+        let processed = sandbox.ok(&["process", text(&flac), "--format", "wav", "--output-dir", text(&out)]);
+        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
+        assert_eq!(paths(report(&processed, 0)), expected, "opt-in {on}: {processed}");
+        outputs.push(wav_chunks(&fs::read(report(&processed, 0)["output_path"].as_str().unwrap()).unwrap()));
+    }
+    for (id, body) in &outputs[0] {
+        let kept = outputs[1].iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("{id:?} missing under the opt-in"));
+        assert_eq!(&kept.1, body, "{id:?}");
+    }
+    let added: Vec<&[u8; 4]> = outputs[1].iter().map(|(id, _)| id).filter(|id| !outputs[0].iter().any(|(other, _)| other == *id)).collect();
+    assert_eq!(added, [b"ID3 "], "the opt-in only adds the chunk TagLib wrote");
 }
 
 // --- H: failed items carry a code and no report -------------------------------------------------------

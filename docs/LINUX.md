@@ -7,7 +7,7 @@ marker; known unsupported operations are refused or reported unavailable
 instead of being approximated. The evidence is finite and there are known x86
 arithmetic residuals, so this is not a guarantee that every mismatch can be
 detected at runtime. Linux aarch64 is the stricter parity build. One explicit
-opt-in, [described below](#opt-in-mp3-input-and-cover-art), allows two paths
+opt-in, [described below](#opt-in-mp3-input-and-cover-art), allows three paths
 that cannot be proven identical. See [VERIFICATION.md](VERIFICATION.md) for the
 individual evidence and limits.
 
@@ -94,10 +94,9 @@ With it on (Linux and `--features portable` builds only):
 - **Embedded cover art** (FLAC `PICTURE`, ID3 `APIC`, MP4 `covr`) is stored in the
   output byte for byte where macOS would re-encode it as PNG (cross-format
   copies, refused by default on Linux) or drop it (FLAC to FLAC). Same-family
-  ID3, MP4 and AIFF copies already preserved the picture and are unchanged. WAV
-  destinations are unchanged as well: as on macOS, a picture survives in a WAV
-  only when the ID3 chunk that carries it is not the chunk the marker rewrite
-  discards.
+  ID3, MP4 and AIFF copies already preserved the picture and are unchanged. A
+  picture in a WAV's `ID3 ` chunk follows the WAV tag chunk rule below, not this
+  one.
   The item is refused with `artwork_conversion_unavailable`, before anything is
   written, when a picture is not a structurally complete JPEG, PNG, GIF, BMP or
   WebP, when MP4 `covr` would have to hold WebP, or when a FLAC block would
@@ -105,9 +104,19 @@ With it on (Linux and `--features portable` builds only):
   in v0.1.0) a FLAC cover that is not a complete image is dropped and the item
   succeeds, while with the setting on the same file fails instead of losing the
   picture silently. Leave the setting off for such sources.
+- **WAV tag chunks** (`ID3 `/`id3 ` and INFO `LIST`) that TagLib writes into a WAV
+  output are all kept. macOS and the original application lose the chunk TagLib
+  saves last (the `ID3 ` chunk, or the `LIST` when both exist) because their
+  marker rewrite runs while TagLib's RIFF size update is still buffered; with the
+  setting on, a WAV source's tags and artwork survive WAV-to-WAV and
+  `match-input`, and the output is the default output plus those chunks. A
+  cross-format copy into a WAV always writes tempo and key, so with the setting
+  on even a source without tags gains an `ID3 ` chunk (an empty key, a zero
+  tempo) and the item lists `wav_tag_preservation`. Without
+  the setting the original behavior is kept byte for byte.
 
 Each item that took one of these paths says so: `report.non_identical_paths` is
-`["mp3_decode"]`, `["artwork_copy"]` or both (always present, `[]` otherwise).
+`["mp3_decode"]`, `["artwork_copy"]`, `["wav_tag_preservation"]` or several of them (always present, `[]` otherwise).
 Without the setting Linux behaves exactly as in v0.1.0. On a macOS default build
 the setting is stored but has no effect, and `config show` says so. AAC stays
 refused either way. The setting and the item list are specified in
@@ -244,7 +253,8 @@ output directory. By default the CLI build can fetch locked dependencies. Set
 `PN_LINUX_VENDOR_DIR` or `PN_LINUX_REGISTRY_DIR` to a prepared dependency cache
 for a network-disabled offline build; `PN_LINUX_RUN_TESTS=1` additionally runs
 the regular all-target test suite and then a library-gated lane: the
-`error_codes`, `linux_opt_in` and `portable_art_copy` suites with `--ignored`,
+`error_codes`, `linux_opt_in` and `portable_art_copy` suites with `--ignored`
+(plus the WAV tag-chunk bridge tests of `tags_reference`),
 which need the approved bridge, FLAC and LAME in the image and are ignored
 (never counted as passes) in the regular suite. The dual-host `full-build-test.py` helper
 is the recorded developer harness: it defaults to the `ns2` SSH host and

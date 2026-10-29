@@ -20,10 +20,10 @@ refused before publication; analysis of non-MP3 inputs at or below 22,050 Hz is
 refused. A non-44.1 kHz waveform is unavailable rather than approximated; an
 otherwise supported analysis can still succeed.
 
-One opt-in, `parity.allow_non_identical` (below), relaxes exactly two of those
-refusals on Linux and `portable` builds: MP3 input decoding and the unchanged
-copy of embedded cover art. AAC stays refused. Without the opt-in Linux
-behaves exactly as v0.1.0 did.
+One opt-in, `parity.allow_non_identical` (below), relaxes two of those refusals
+on Linux and `portable` builds, MP3 input decoding and the unchanged copy of
+embedded cover art, and keeps the WAV tag chunks the reference marker writer
+drops. AAC stays refused. Without the opt-in Linux behaves exactly as v0.1.0 did.
 
 The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
 `UnsupportedSampleRateConversion` variants; artwork uses
@@ -87,10 +87,9 @@ What it enables, on Linux and on `--features portable` builds only:
   through Apple's image stack (generic cross-format copies, which the default
   Linux bridge refuses) or silently drop it (FLAC-to-FLAC direct copies).
   Same-family ID3, MP4 and AIFF direct copies already moved the picture
-  unchanged and are untouched. WAV destinations are untouched too: as on
-  macOS, a picture reaches a WAV only inside an ID3 chunk that survives the
-  marker rewrite (see the WAV tag-chunk paragraph in the processed-marker
-  section). Stored MIME is the canonical type of the
+  unchanged and are untouched. A picture in a WAV's `ID3 ` chunk follows the WAV
+  tag chunks rule below instead (the next bullet; see also the WAV tag-chunk
+  paragraph in the processed-marker section). Stored MIME is the canonical type of the
   validated bytes; MP4 `covr` has no type or description. On this generic path,
   pictures read from MP4 become front covers in ID3 and FLAC. The direct
   M4A-to-MP3 path keeps the reference behaviour instead and is not reported as
@@ -100,6 +99,19 @@ What it enables, on Linux and on `--features portable` builds only:
   is not a structurally complete JPEG, PNG, GIF, BMP or WebP, when MP4 `covr`
   would have to hold WebP, or when a FLAC metadata block would exceed
   16 MiB − 1.
+- **WAV tag chunks** (`ID3 `/`id3 ` and INFO `LIST`) that TagLib writes into a
+  WAV output are all kept, instead of losing the one TagLib saved last (see the
+  WAV tag-chunk paragraph under the processed-marker rules). The marker
+  rewrite, which stays in Rust, trusts the physical chunk sequence when the RIFF
+  size is stale because TagLib's size update is still buffered, but only when
+  everything after the declared end is a run of at most 64 well-formed chunks
+  ending exactly at the end of the file; anything else after the declared end is
+  dropped as before. Every other rule of the rewrite is unchanged, so the output
+  differs from the default only by the added chunks, and an output that kept at
+  least one lists `wav_tag_preservation`. A cross-format copy into a WAV always
+  writes tempo and key, so even a source without tags then gains an `ID3 ` chunk
+  holding an empty key and a zero tempo. With the setting off the behavior is the
+  reference's, byte for byte.
 
 It never enables AAC decoding or encoding, sample-rate conversion, or any other
 refused path; those keep their codes. On a macOS default build the setting is
@@ -131,12 +143,13 @@ actually produced something in that item's result. It is **always present** on
 successful reports on every platform and is `[]` whenever every path used is an
 identical one, which is always the case on macOS default builds and on Linux
 without the opt-in. Failed items have no report and therefore no list. The
-defined members, in this order when both apply, are:
+defined members, in this order when several apply, are:
 
 | Member | Meaning |
 | --- | --- |
 | `mp3_decode` | The input MP3 was decoded by the open-source decoder and the result depends on it: for `process` and `analyze` the measurements and audio derive from it, and `analyze` also lists it when the waveform of the recorded original backup (an MP3) is reported, but not when that waveform is unavailable; for `inspect` the open-source MP3 model supplied the reported length and bitrate. |
 | `artwork_copy` | At least one embedded picture was stored byte for byte where the macOS bridge would have transcoded or dropped it (only `process`). It is absent when the source had no artwork or every picture moved through a path identical to macOS. |
+| `wav_tag_preservation` | A WAV output kept at least one tag chunk (`ID3 `, INFO `LIST`) that TagLib wrote and the reference marker writer drops (only `process`, WAV destinations). It is listed for a WAV source whose tag chunks TagLib copied, and for every cross-format copy into a WAV: that copy always writes tempo and key, so even a source without tags gains an `ID3 ` chunk holding an empty key and a zero tempo. It is absent for a WAV source without tag chunks and whenever TagLib wrote no chunk after the declared RIFF end. |
 
 New members may be added in later releases; consumers must treat an unknown
 member as non-identical and must not require an exact array.
@@ -479,6 +492,13 @@ identical bytes for generated ID3-only WAV inputs (explicit WAV output;
 the same rule: ID3 is kept when an INFO tag is also written, and lost for a
 source whose only copied fields are tempo and key. This is parity behavior, not a
 defect.
+
+With `parity.allow_non_identical` on (Linux and `portable` builds) the marker
+rewrite keeps every chunk TagLib wrote: an `ID3 `/`id3 ` chunk (text and
+artwork) and an INFO `LIST` both survive WAV-to-WAV, `match-input` and
+cross-format copies to WAV, the output is the default one plus those chunks, and
+`non_identical_paths` lists `wav_tag_preservation`. This is deliberately not
+parity with the reference, which is why it sits behind the opt-in.
 
 For a first run, use a disposable copy of an input and an existing separate
 output directory. After following the build guide, set `INPUT` and `OUTPUT_DIR`

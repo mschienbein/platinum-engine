@@ -32,16 +32,16 @@ jobs:
           - arch: amd64
             machine: x86_64
             runner: ubuntu-24.04
-            archive_sha256: afe09e3dab51aacd02e279c93c82698631ff9005855598a8037962c5898c6985
-            binary_sha256: eb62ec42c73f233c94dd1e855655c1cc4548756acab743fe3b37abecf02275d0
+            archive_sha256: 84386c9d33635dba21643db952a6cc08ce5133dd04640bedccd3b4961212e8f6
+            binary_sha256: 25a409193ac0674438b3b6e719a3d14d79353a35794d2c5f1a4c0208f62f6033
             bridge_sha256: ea86881cb6615d7cf8614dfb285e8670d978de621957b15611b8bd6d5b0e1ad5
             flac_sha256: 9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755
             lame_sha256: cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b
           - arch: arm64
             machine: aarch64
             runner: ubuntu-24.04-arm
-            archive_sha256: bb0c753ec216088a4ca8b9002f153f05192dc66359609fd19152c1bc01f4cf00
-            binary_sha256: 7f2fea4fd1fee5ee265fc63f809c868cea6179f3293ace4faaa1ac69b1e4a56d
+            archive_sha256: d74bafdd9d50eae6f03efe176df6c6373c2675ca313dceffa34dc54088262e18
+            binary_sha256: 881ee9093922181040126f75f9bc8508decb633c6cc43121db32019d85800454
             bridge_sha256: 8708af52d83fc7fdb6a487d72abc90ff4bd9f9b94e313436cc6fb68cc9db2aa0
             flac_sha256: 41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72
             lame_sha256: c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87
@@ -82,7 +82,7 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern SHA256SUMS --pattern "$asset" --dir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          printf '%s  %s\n' d043b6da14ed916f5fa0d29534a19b01460601ef6dd8fcab10182b05c7e81595 SHA256SUMS | sha256sum -c -
+          printf '%s  %s\n' 6464430ab27c5ef606d26ef30ad04189f710b1f9672ed6eac9c4aca503d12539 SHA256SUMS | sha256sum -c -
           grep -Fx -- "$ARCHIVE_SHA256  $asset" SHA256SUMS
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$asset" | sha256sum -c -
           tar -xzf "$asset" -C "$RUNNER_TEMP/runtime-context/linux-$ARCH"

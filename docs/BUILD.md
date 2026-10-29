@@ -231,8 +231,10 @@ PN_LINUX_REGISTRY_DIR="$REGISTRY" PN_LINUX_RUN_TESTS=1 PN_LINUX_TMP_TARGET=1 \
 
 `PN_LINUX_RUN_TESTS=1` runs the regular all-target suite and then a
 library-gated lane: the `error_codes`, `linux_opt_in` and `portable_art_copy`
-suites with `--ignored`. Those tests need the approved bridge, libFLAC and LAME
-in the image, so the regular suite ignores them and never counts them as passes.
+suites with `--ignored`, plus the three WAV tag-chunk bridge tests of
+`tags_reference` (the default policy and the opt-in that keeps the chunks). Those
+tests need the approved bridge, libFLAC and LAME in the image, so the regular
+suite ignores them and never counts them as passes.
 
 The v0.2.0 image IDs of the recorded build were arm64
 `sha256:352618c7e4e953d2883f3de95c3cb222dbe5fc55e81bc9426738e75ed988b070`

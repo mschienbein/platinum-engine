@@ -73,6 +73,11 @@ exec "$@" "$image" sh -c '
     PN_LAME_LIB=$lib/libmp3lame.so PN_LAME_SHA256=$(sha256sum $lib/libmp3lame.so | cut -d" " -f1) \
     cargo test "$@" --locked --test error_codes --test linux_opt_in --test portable_art_copy -- --ignored > /out/ignored.stdout 2> /out/ignored.stderr
   gated=$?
+  # The tag bridge tests that pin the default WAV marker policy and the opt-in that keeps the chunks TagLib wrote.
+  PN_TAG_BRIDGE=$lib/libpn-tag-bridge.so \
+    cargo test "$@" --locked --test tags_reference -- --ignored wav_direct_copy_loses preserve_wav_chunks >> /out/ignored.stdout 2>> /out/ignored.stderr
+  second=$?
+  [ "$gated" -ne 0 ] || gated=$second
   printf "%s\n" "$build" > /out/build.status
   printf "%s\n" "$test" > /out/test.status
   printf "%s\n" "$gated" > /out/ignored.status

@@ -309,6 +309,93 @@ mod candidate_bridge {
         }
     }
 
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    fn apic(picture: &[u8]) -> Vec<u8> {
+        let mut body = vec![3]; body.extend_from_slice(b"image/png\0"); body.push(3); body.push(0); body.extend_from_slice(picture);
+        frame(b"APIC", &body)
+    }
+
+    /// `TransferOptions::preserve_wav_chunks` (Linux and `portable` builds, the v0.2.0 opt-in): the marker rewrite keeps
+    /// every chunk TagLib wrote, so a WAV source's `ID3 ` chunk (tags and APIC) and INFO `LIST` survive, and nothing
+    /// else about the output changes. The test above pins the default policy these cases deviate from.
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
+    fn preserve_wav_chunks_keeps_every_chunk_taglib_wrote_and_changes_nothing_else() {
+        use platinum_engine::tags::TransferOptions;
+        let bridge = library(); let marker = marker();
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0,
+            0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0, 0, 0, 2, 0, 1, 0xe2, 0x21, 0xbc, 0x33,
+            0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let id3 = tag(&[text(b"TIT2", "Title"), text(b"TPE1", "Artist"), text(b"TALB", "Album"), apic(&png)]);
+        let info = { let mut v = b"INFO".to_vec(); v.extend(riff_chunk(b"INAM", b"Info title\0")); v.extend(riff_chunk(b"IART", b"Info artist\0")); v };
+        let cases: [(&str, Vec<Vec<u8>>, &[&str], bool); 5] = [
+            ("ID3 chunk only", vec![riff_chunk(b"ID3 ", &id3)], &["fmt ", "data", "ID3 ", "PLTN"], true),
+            ("lowercase id3 chunk only", vec![riff_chunk(b"id3 ", &id3)], &["fmt ", "data", "ID3 ", "PLTN"], true),
+            ("INFO LIST only", vec![riff_chunk(b"LIST", &info)], &["fmt ", "data", "LIST", "PLTN"], true),
+            ("ID3 chunk and INFO LIST", vec![riff_chunk(b"ID3 ", &id3), riff_chunk(b"LIST", &info)], &["fmt ", "data", "ID3 ", "LIST", "PLTN"], true),
+            ("no tag chunks", Vec::new(), &["fmt ", "data", "PLTN"], false),
+        ];
+        let preserve = TransferOptions { preserve_wav_chunks: true, ..TransferOptions::default() };
+        for (label, extra, expected, preserved) in cases {
+            for choice in [OutputChoice::Explicit, OutputChoice::MatchInput] {
+                let original = base_wav(&extra);
+                let src = Temp::new("wav", &original);
+                let off = Temp::new("wav", &base_wav(&[])); let on = Temp::new("wav", &base_wav(&[]));
+                let off_report = bridge.transfer(src.path(), off.path(), Format::Wav, Format::Wav, choice, &marker).unwrap();
+                let on_report = bridge.transfer_with_options(src.path(), on.path(), Format::Wav, Format::Wav, choice, &marker, preserve).unwrap();
+                assert!(off_report.is_success() && on_report.is_success(), "{label} {choice:?}: {off_report:?} {on_report:?}");
+                assert!(!off_report.wav_tags_preserved, "{label} {choice:?}: the default policy never reports preservation");
+                assert_eq!(on_report.wav_tags_preserved, preserved, "{label} {choice:?}");
+                assert_eq!(src.bytes(), original);
+                let (off_chunks, on_chunks) = (chunks(&off.bytes()), chunks(&on.bytes()));
+                let ids: Vec<String> = on_chunks.iter().map(|(id, _)| String::from_utf8_lossy(id).to_ascii_uppercase()).collect();
+                assert_eq!(ids, expected.iter().map(|id| id.to_ascii_uppercase()).collect::<Vec<_>>(), "{label} {choice:?}");
+                // Only chunks are added: every chunk the default policy writes is byte-identical.
+                for (id, body) in &off_chunks {
+                    let kept = on_chunks.iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("{label} {choice:?}: {id:?} missing"));
+                    assert_eq!(&kept.1, body, "{label} {choice:?}: {id:?}");
+                }
+                if let Some((_, body)) = on_chunks.iter().find(|(id, _)| id.eq_ignore_ascii_case(b"ID3 ")) {
+                    let f = frames(body);
+                    assert!(has_id(&f, b"TIT2") && has_id(&f, b"TPE1") && has_id(&f, b"TALB"), "{label} {choice:?}");
+                    assert!(f.iter().any(|(k, b)| k == b"APIC" && contains(b, &png)), "{label} {choice:?}: the picture survives byte for byte");
+                }
+                if let Some((_, body)) = on_chunks.iter().find(|(id, _)| id == b"LIST") {
+                    assert!(&body[..4] == b"INFO" && contains(body, b"Info title") && contains(body, b"Info artist"), "{label} {choice:?}");
+                }
+                if !preserved { assert_eq!(off.bytes(), on.bytes(), "{label} {choice:?}: nothing to keep, nothing changes"); }
+            }
+        }
+    }
+
+    /// The generic (cross-format) copy into a WAV goes through the same marker rewrite, so the option keeps the chunks
+    /// TagLib wrote there too, and only adds them.
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
+    fn preserve_wav_chunks_applies_to_cross_format_copies_into_a_wav() {
+        use platinum_engine::tags::TransferOptions;
+        let bridge = library(); let marker = marker();
+        let source = mp3(&tag(&[text(b"TIT2", "Title"), text(b"TPE1", "Artist"), text(b"TBPM", "123"), text(b"TKEY", "Am")]));
+        let preserve = TransferOptions { preserve_wav_chunks: true, ..TransferOptions::default() };
+        let src = Temp::new("mp3", &source);
+        let off = Temp::new("wav", &base_wav(&[])); let on = Temp::new("wav", &base_wav(&[]));
+        let off_report = bridge.transfer(src.path(), off.path(), Format::Mp3, Format::Wav, OutputChoice::Explicit, &marker).unwrap();
+        let on_report = bridge.transfer_with_options(src.path(), on.path(), Format::Mp3, Format::Wav, OutputChoice::Explicit, &marker, preserve).unwrap();
+        assert!(off_report.is_success() && on_report.is_success(), "{off_report:?} {on_report:?}");
+        assert_eq!(off_report.mode, TransferMode::Generic);
+        let (off_chunks, on_chunks) = (chunks(&off.bytes()), chunks(&on.bytes()));
+        for (id, body) in &off_chunks {
+            assert_eq!(on_chunks.iter().find(|(other, _)| other == id).map(|(_, kept)| kept), Some(body), "{id:?}");
+        }
+        assert_eq!(on_report.wav_tags_preserved, on_chunks.len() > off_chunks.len(), "off {:?} on {:?}", off_chunks.iter().map(|(id, _)| *id).collect::<Vec<_>>(), on_chunks.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        assert!(on_report.wav_tags_preserved, "the generic copy writes tag chunks, and the last one is lost by the default policy");
+        assert!(!off_report.wav_tags_preserved);
+    }
+
     #[test]
     #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
     fn nil_marker_removes_existing_first_geob_and_same_file_is_rejected() {

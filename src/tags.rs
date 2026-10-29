@@ -6,7 +6,7 @@
 //! Source files are opened read-only; destination must be an already encoded,
 //! caller-owned staging file. After any reported error it must not be published.
 
-use crate::metadata::{self, Marker, MarkerError};
+use crate::metadata::{Marker, MarkerError};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -166,7 +166,7 @@ pub struct TransferReport {
     /// would have transcoded it to PNG (generic copies) or dropped it (FLAC
     /// direct copies). Such an output is not byte-identical to macOS. Only set when
     /// the whole transfer succeeded (`is_success`).
-    pub artwork_copied: bool,
+    pub artwork_copied: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "True when, under `TransferOptions::preserve_wav_chunks`, the marker rewrite kept at least one WAV chunk TagLib wrote that the reference marker writer drops. Only set when the whole transfer succeeded."] pub wav_tags_preserved: bool,
 }
 impl TransferReport {
     pub fn is_success(&self) -> bool { self.copy_error.is_none() && self.marker_error.is_none() }
@@ -182,7 +182,7 @@ pub struct TransferOptions {
     /// Copy embedded pictures (FLAC PICTURE, ID3 APIC, MP4 covr) unchanged
     /// instead of transcoding or refusing them. Refuses malformed pictures and
     /// pictures the destination cannot store as-is.
-    pub copy_artwork: bool,
+    pub copy_artwork: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "Keep the chunks TagLib wrote into a WAV destination (the `ID3 ` chunk, the INFO `LIST`) through the marker rewrite, which the reference drops when TagLib saved them last. Linux and `portable` builds only."] pub preserve_wav_chunks: bool,
 }
 const COPY_ARTWORK_BYTES: c_uint = 1;
 const RESULT_ARTWORK_COPIED: c_uint = 1;
@@ -463,8 +463,8 @@ impl TagBridge {
         if src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino() { return Err(TagError::SourceIsDestination); }
         let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
         let dst = CString::new(destination.as_os_str().as_bytes()).map_err(|_| TagError::PathContainsNul)?;
-        let mut report = TransferReport { mode, copy_error: None, marker_error: None, artwork_copied: false };
-        let mut result: c_uint = 0;
+        let mut report = TransferReport { mode, copy_error: None, marker_error: None, artwork_copied: false, #[cfg(any(target_os = "linux", feature = "portable"))] wav_tags_preserved: false };
+        let mut result: c_uint = 0; #[cfg(any(target_os = "linux", feature = "portable"))] let wav_scope = crate::wav_preserve::scope(options.preserve_wav_chunks);
         match mode {
             TransferMode::Direct(op) => {
                 let error = native_call(|out, len| {
@@ -501,7 +501,7 @@ impl TagBridge {
                     Ok(error) => error,
                     Err(TagError::SourceContainerUnavailable(_)) => {
                         report.marker_error = self.save_marker(&dst, destination_format, marker)?;
-                        return Ok(report);
+                        #[cfg(any(target_os = "linux", feature = "portable"))] { report.wav_tags_preserved = report.is_success() && wav_scope.kept(); } return Ok(report);
                     }
                     Err(error) => return Err(error),
                 };
@@ -512,7 +512,7 @@ impl TagBridge {
         }
         // Only a transfer that fully succeeded reports its pictures as copied: a copy or marker
         // failure after the bridge copied them leaves no usable file, and the item then fails.
-        report.artwork_copied = report.is_success() && result & RESULT_ARTWORK_COPIED != 0;
+        report.artwork_copied = report.is_success() && result & RESULT_ARTWORK_COPIED != 0; #[cfg(any(target_os = "linux", feature = "portable"))] { report.wav_tags_preserved = report.is_success() && wav_scope.kept(); }
         Ok(report)
     }
     fn save_marker(&self, c_path: &CStr, format: Format, marker: &Marker) -> Result<Option<String>, TagError> {
@@ -552,7 +552,7 @@ fn rewrite_wav(path: &Path, payload: Option<&[u8]>) -> Result<(), TagError> {
     let mut output = OpenOptions::new().write(true).create_new(true).mode(permissions.mode() & 0o777).open(&temp)
         .map_err(|e| io_error("create WAV marker sibling", e))?;
     let result = (|| {
-        metadata::rewrite_wav_marker(&mut input, &mut output, payload)?;
+        #[cfg(not(any(target_os = "linux", feature = "portable")))] crate::metadata::rewrite_wav_marker(&mut input, &mut output, payload)?; #[cfg(any(target_os = "linux", feature = "portable"))] crate::wav_preserve::rewrite_wav_marker(&mut input, &mut output, payload)?;
         output.flush().map_err(|e| io_error("flush WAV marker sibling", e))?;
         // open's umask may have narrowed the initial mode. Restore exactly the
         // stage's permissions only after writing, which can clear special bits.

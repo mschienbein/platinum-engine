@@ -60,7 +60,7 @@ fn marker() -> Marker {
 fn sha256(data: &[u8]) -> String {
     platinum_engine::portable::digest::sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn options() -> TransferOptions { TransferOptions { copy_artwork: true } }
+fn options() -> TransferOptions { TransferOptions { copy_artwork: true, ..TransferOptions::default() } }
 
 fn flac(picture: Option<(u32, &str, &str, [u32; 4], &[u8])>) -> Vec<u8> {
     fn block(kind: u8, last: bool, data: &[u8]) -> Vec<u8> {

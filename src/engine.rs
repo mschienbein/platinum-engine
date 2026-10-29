@@ -147,9 +147,9 @@ pub struct ProcessReport {
     /// creation/modification header field instead of the AudioToolbox clock.
     pub controlled_mp4_time_1904: Option<u32>,
     /// Paths used for this item that are not proven byte-identical to the macOS
-    /// reference: `mp3_decode` (open-source MP3 decoder) and `artwork_copy`
-    /// (embedded cover art copied unchanged). Always present; empty when every
-    /// path used is an identical one (always the case on macOS default builds).
+    /// reference: `mp3_decode` (open-source MP3 decoder), `artwork_copy` (embedded cover art copied unchanged)
+    /// and `wav_tag_preservation` (WAV tag chunks kept). Always present; empty when every path used is an
+    /// identical one (always the case on macOS default builds).
     pub non_identical_paths: Vec<&'static str>,
 }
 
@@ -1774,7 +1774,7 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
     let controlled_mp4_time = match plan.format() {
         AudioFormat::Aac | AudioFormat::Alac => prepared.controlled_mp4_time_1904,
         _ => None,
-    };
+    }; #[cfg(any(target_os = "linux", feature = "portable"))] let mut wav_tags_preserved = false;
     let run = (|| -> Result<(Measured, HealingResult, FinalResult, EncodedInfo, &'static str, bool), EngineError> {
         let measured = analyze(input, settings, cancel, false)?;
         identity.verify(input).map_err(|e| EngineError::workflow("verify source after analysis", e))?;
@@ -1813,10 +1813,10 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
         let tag_source = staged.backup_path().unwrap_or(input);
         staged.remember_staging_file().map_err(|e| EngineError::workflow("verify output stage", e))?;
         // Embedded artwork is copied unchanged only under the explicit opt-in; otherwise the reference policy applies.
-        let options = tags::TransferOptions { copy_artwork: settings.non_identical_enabled() };
+        let options = tags::TransferOptions { copy_artwork: settings.non_identical_enabled(), #[cfg(any(target_os = "linux", feature = "portable"))] preserve_wav_chunks: settings.non_identical_enabled() };
         let report = bridge.transfer_with_options(tag_source, staged.staging_path(), source_tag_format(input)?,
             output_tag_format(plan.format()), choice, &marker, options).map_err(|e| EngineError::new("copy source tags", e))?;
-        let artwork_copied = report.artwork_copied;
+        let artwork_copied = report.artwork_copied; #[cfg(any(target_os = "linux", feature = "portable"))] { wav_tags_preserved = report.wav_tags_preserved; }
         if !report.is_success() {
             return Err(EngineError::new("copy source tags", format!("copy error: {:?}; marker error: {:?}", report.copy_error, report.marker_error)));
         }
@@ -1856,7 +1856,7 @@ pub fn process_file(prepared: &PreparedProcess, template: &Template, settings: &
     let publication = staged.finish(cancel).map_err(|e| EngineError::workflow("publish output", e))?;
     let output_pitch = if healed.stages.iter().any(|stage| stage == "pitch") { 440.0 } else { measured.values.input_tuning_hz };
     let mut stages = healed.stages;
-    stages.push("limiter".to_owned());
+    stages.push("limiter".to_owned()); #[cfg(any(target_os = "linux", feature = "portable"))] let non_identical_paths = |mp3_decode: bool, artwork_copy: bool| crate::wav_preserve::with_member(non_identical_paths(mp3_decode, artwork_copy), wav_tags_preserved);
     Ok(ProcessReport { input_path: input.to_owned(), output_path: publication.destination, backup_path: publication.backup,
         replaced_existing_output: publication.replaced_existing_output, input_format: prepared.input_format.clone(), output_format: encoded.format,
         input_sample_rate: measured.source.sample_rate, processing_sample_rate: measured.processing_rate, sample_rate: encoded.stream.sample_rate,
