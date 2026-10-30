@@ -155,9 +155,10 @@ pub struct ProcessReport {
     pub controlled_mp4_time_1904: Option<u32>,
     /// Paths used for this item that are not proven byte-identical to the macOS
     /// reference: `artwork_copy` (embedded cover art copied unchanged) and `wav_tag_preservation`
-    /// (WAV tag chunks kept), both only with `parity.allow_non_identical`. Always present; empty when every
-    /// path used is an identical one (always the case on macOS default builds). Decoding, including MP3, is
-    /// identical to macOS and is never listed.
+    /// (WAV tag chunks that carry source data kept; a tag chunk holding nothing but an empty tempo and key is not),
+    /// both only with `parity.allow_non_identical`. Always present; empty when every
+    /// path used is an identical one (always the case on macOS default builds). Decoding, including MP3 and AAC, is
+    /// identical to macOS and is never listed; so is AAC output.
     pub non_identical_paths: Vec<&'static str>,
 }
 

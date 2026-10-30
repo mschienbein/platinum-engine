@@ -63,6 +63,12 @@ jobs:
           print(f"CI excludes {sum(expected.values())} M4 reference-platform test names")
           PY
           cargo test --locked --all-targets --features portable --no-fail-fast -- --skip mac_reference:: --skip system::
+      - name: Run the long AAC tests in release
+        shell: bash
+        run: |
+          unset RUSTUP_TOOLCHAIN
+          # The long encoder items (the moov-behind-mdat layout) and the long decode cases are #[ignore]d in the debug suite above; they need a release build.
+          cargo test --locked --release --features portable --test portable_aac_encode --test portable_aac_decode -- --ignored
 
   linux:
     name: Linux ${{ matrix.uname }}

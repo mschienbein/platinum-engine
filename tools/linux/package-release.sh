@@ -330,8 +330,38 @@ copies of data read from the arm64e slice of AudioCodecs; the table files and
 the module header in the public CLI source name the binary and the addresses.
 No Apple binary and no Apple source code is included, and the reader calls no
 Apple API. This is a statement of provenance, not a legal opinion, and no legal
-clearance of the reader, its constants or its algorithms is claimed. The macOS
-build uses AudioToolbox itself and does not use this reader.
+clearance of the reader, its constants or its algorithms is claimed. The earlier
+source also compiled, in its unit tests only, a generated register-level model of one
+Apple routine (the polyphase synthesis); it was removed in v0.4.0 and is kept only as
+private research material. The macOS build uses AudioToolbox itself
+and does not use this reader.
+
+The exact AAC encoder and decoder (Linux and portable builds) in src/portable/aac/
+are project-written Rust that uses only the standard library and the project's own
+arithmetic modules and needs no setting. The AAC modules contain no unsafe code
+apart from one unit-test module, built only for aarch64 tests, that compares a
+kernel with the hardware instructions it models; the shared arithmetic modules they
+call (src/portable/arm.rs, math.rs, dft.rs and vdsp.rs) and the flush-to-zero control
+of src/fp_mode.rs are not AAC-specific, and arm.rs, dft.rs, vdsp.rs and fp_mode.rs
+contain small unsafe blocks. They are compatibility implementations: their purpose is
+to produce what Apple's AudioToolbox produces for the engine's call sequence, and
+their behavior and numeric constants were recovered from Apple's own binaries by
+static analysis, instruction-level transcription and recorded runtime states of the
+AudioCodecs component and AudioToolbox on macOS 27.2 (build 26B123) on one reference
+machine; among the constants are tables that are bit-exact copies of data read from
+the arm64e slice of AudioCodecs. The modules hold 19 table and data files (10 binary
+data files and 9 Rust files of constant tables); the file headers name the binary and
+the addresses the tables were read from and say which tables are the published
+ISO/IEC 14496-3 tables, derived from them or computed. No Apple binary and no Apple
+source code is included, the code calls no Apple API, and the project is not
+affiliated with Apple. The generating scripts, the research corpora and the Apple
+results beyond the checked-in fixtures are not part of the public source; the
+fixtures under tests/fixtures/aac-encode, tests/fixtures/aac-decode and
+tests/fixtures/aac-reader are generated audio with recorded results. This is a
+statement of provenance, not a legal opinion, and no legal clearance is claimed. AAC
+is a patented format; patent licensing may apply to encoders and decoders in some
+jurisdictions, and the project grants no patent rights and gives no legal advice. The
+macOS build uses AudioToolbox itself and does not use these modules.
 
 Rust dependency license texts, notices, authors and declarations are in
 licenses/rust. Rust standard-library notices and referenced license texts are

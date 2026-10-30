@@ -1,6 +1,6 @@
 # Linux builds and runtime
 
-Platinum Engine v0.3.0 targets Linux aarch64 and x86_64 as well as the macOS
+Platinum Engine v0.4.0 targets Linux aarch64 and x86_64 as well as the macOS
 arm64 reference. The default objective for admitted Linux operations is an
 identical complete output file, including encoded samples, container, tags and
 marker; known unsupported operations are refused or reported unavailable
@@ -10,7 +10,10 @@ detected at runtime. Linux aarch64 is the stricter parity build. One explicit
 opt-in, [described below](#opt-in-cover-art-and-wav-tags), allows two paths
 that cannot be proven identical. A second, separate opt-in adds Opus, which
 Platinum Notes does not accept and which therefore has [no reference to
-match](#opt-in-opus-input-and-output). If you use v0.2.0, read [Upgrading from
+match](#opt-in-opus-input-and-output). MP3 input and AAC input and output are
+exact ports and need no setting ([MP3 input](#mp3-input), [AAC input and
+output](#aac-input-and-output)). If you use v0.3.0 or earlier, read [Upgrading
+from v0.3.0](#upgrading-from-v030) and [Upgrading from
 v0.2.0](#upgrading-from-v020) first. See [VERIFICATION.md](VERIFICATION.md) for
 the individual evidence and limits.
 
@@ -24,13 +27,15 @@ matches, and the x86 residual classes were not proved absent by those runs.
 
 ## What is refused
 
-- AAC input decoding and AAC output encoding: the Apple decoder/encoder
-  behavior is not reproduced on Linux, with or without either opt-in; Rust
-  ports of the AudioToolbox AAC paths are research and are not part of this
-  release. MP3 input is decoded exactly (see [MP3 input](#mp3-input)); only MP3
-  inside a WAVE container (unless the name ends in `.mp3`) and rates that need
-  conversion are refused. MP3 and FLAC *encoding* use the pinned public LAME
-  and libFLAC builds described below.
+- AAC is no longer refused as such: AAC input and AAC output are exact ports
+  that need no setting (see [AAC input and output](#aac-input-and-output)).
+  Refused or answered as macOS answers within AAC: HE-AAC (SBR/PS), AAC-LD/ELD,
+  USAC and MPEG-1 audio object types, sample-rate conversion of an AAC source,
+  AAC inside a WAVE container, and the output rates and channel counts listed
+  in that section. MP3 input is decoded exactly (see [MP3 input](#mp3-input));
+  only MP3 inside a WAVE container (unless the name ends in `.mp3`) and rates
+  that need conversion are refused. MP3 and FLAC *encoding* use the pinned
+  public LAME and libFLAC builds described below.
 - Sample-rate conversion is not reproduced. Processing that needs unequal
   input, analysis or output rates fails with an unsupported sample-rate
   conversion error; analysis of non-MP3 inputs at or below 22,050 Hz is
@@ -45,9 +50,9 @@ matches, and the x86 residual classes were not proved absent by those runs.
   22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit depths within its
   implemented container subset. Audio outside those rates or channel counts is
   refused as an output problem (`unsupported_output_format`, not an input
-  error), and the writer refuses packet conditions under which the native
-  encoder can silently lose audio. macOS checks the completed ALAC output
-  for lost frames before publication as well.
+  error), and the writer refuses, where the macOS writer's frame check does, a
+  packet that AudioToolbox cannot place after its retries and would lose audio
+  for (see [ALAC output](#alac-output-on-linux-and-portable-builds)).
 - Malformed or unknown containers with unestablished marker absence, duplicate
   AIFF ID3 chunks, candidate marker chunks in malformed matching WAV/AIFF files,
   unavailable source tags without a safe container classification, and
@@ -137,15 +142,242 @@ Boundaries (all refusals are typed; none changes a result silently):
   ADTS, FLAC and Ogg are told by their signatures, a valid MPEG frame header
   selects the MPEG reader, and anything else is `'typ?'` (also
   `invalid_input_file`). MP3 inside a WAVE container under another name is
-  refused with `unsupported_input_codec`. AAC and FLAC data under a name that
-  does not select their reader, and Ogg audio, are typed refusals
+  refused with `unsupported_input_codec`. FLAC data under a name that does not
+  select its reader and Ogg audio are typed refusals
   (`unsupported_input_codec` / `unsupported_input_format`) because AudioToolbox
-  decodes them and this build does not. Layer II at 22,050 Hz is refused as
+  decodes them and this build does not; AAC data under such a name is read by
+  the [AAC reader](#aac-input-and-output) (an AAC file named `.mp3` is read by
+  the MPEG reader, as on macOS). Layer II at 22,050 Hz is refused as
   `unsupported_sample_rate_conversion` (macOS fails it mid-read with
   `decode_failed`). The remaining differences from the macOS default build that
   the admission matrix found are listed in [VERIFICATION.md](VERIFICATION.md).
 - Apple never returns from opening a file with a chained ID3 header whose
   version byte is 0xff; this port refuses it with `'dta?'`.
+
+## AAC input and output
+
+AAC needs no setting and no library of its own. Linux and `--features portable`
+builds read and write it with `src/portable/aac/`, pure-Rust ports of what
+AudioToolbox's AAC-LC decoder and encoder do for the engine's own call sequence
+(reference: macOS 27.2 build 26B123 on one Apple M4 machine). The macOS default
+build uses AudioToolbox itself. Both ports are claimed identical within the
+bounds below and either refuse or answer as macOS answers everything outside
+them; neither adds a member to `report.non_identical_paths`. Their numeric
+constants and algorithms were recovered from Apple's binaries on that machine;
+provenance, and a note that AAC is a patented format, are in
+[THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES).
+
+### AAC output
+
+`--format aac`, and `match-input` of an AAC source, write the file that
+AudioToolbox's `ExtAudioFile` writes for the engine's call sequence: an `m4af`
+file with the `'aac '` file format, a float32 client format, `'brat'` 256000,
+`'cdqu'` 0x40 and `'acbf'` 1 (average bit rate), in the call context the v0.2.0
+release pinned on macOS (write class A: stack-pointer residue 0 at
+`ExtAudioFileWrite`, the generic NEON tail at dispose). The port encodes
+these formats, at their exact sample rates:
+
+| Sample rate | Channels |
+| --- | --- |
+| 44,100 and 48,000 Hz | 1–8 |
+| 32,000 Hz | 3–8 |
+| 24,000 and 22,050 Hz | 4–8 |
+| 16,000 Hz | 7–8 |
+
+For these formats the `.m4a` equals the macOS default build's output byte for
+byte, with the one exception both builds share: `mvhd`, every `tkhd` and every
+`mdhd` carry the wall-clock second of the close, so two runs differ in those
+fields. The hidden `--controlled-mp4-time-1904` diagnostic option pins that
+second on every build, the Linux AAC output included, and is how two files are
+compared as a whole. The container is reproduced too: the `moov` atom in front
+of the media data, or behind it once the sample tables outgrow the space
+reserved in front (at 13,509 access units at 44.1 kHz and 14,541 at 48 kHz, a
+little over five minutes), the chunking, `iTunSMPB`, the peak bit rate in
+`esds` and the layout of an empty file. Every write size gives the same file.
+The tags and the processing marker are written into the `.m4a` by the tag
+bridge exactly as for ALAC output.
+
+Every other format is answered as the macOS writer answers it, or refused:
+
+| Request | Writer answer | Item result |
+| --- | --- | --- |
+| 8, 11.025 and 12 kHz with 1–8 channels, 16 kHz with 1–6, 22.05 and 24 kHz with 1–3, 32 kHz with 1–2 (AudioToolbox takes no 256 kbit/s) | created with the warning `AacBitRateNotSet` (status `'!dat'`); a first write of a frame would fail with that status | fails before any write at stage `configure Apple encoder` with `encode_failed` |
+| no AAC converter: a rate not within 10 Hz of one of the nine AAC rates (for example 64, 88.2 or 96 kHz), or more than 8 channels | AudioToolbox's native status: `'fmt?'` (`paramErr` above 1,024 channels and for exactly 3,000,000 Hz; `'fmt?'` from the create call above 3,000,000 Hz) | fails at stage `create Apple encoder` with `encode_failed` |
+| a fractional rate, or an integral rate within 10 Hz of an AAC rate but not equal to it | typed refusal: AudioToolbox serves the request as the AAC rate but its access units follow the exact rate, which this build does not reproduce | `unsupported_output_format` |
+| a stream that needs 64-bit offsets (media data above 4 GiB) or a duration above 2^32 − 1 frames | refused when the stream grows past the limit | `encode_failed` |
+
+Other bit rates, the converter's own default bit rate, VBR and CBR modes,
+HE-AAC and AAC-ELD encoders are not reproduced; the engine never asks for them.
+The encoder runs with flush-to-zero cleared whatever mode the caller is in, as
+AudioToolbox does, with one exception that AudioToolbox shows and the port
+reproduces: when the caller's flush-to-zero mode is set while samples are
+written, subnormal input samples are flushed to zero. The engine writes outside
+its flush scopes, so this never applies to its own output; what the port does not
+reproduce of that mode is described under [Floating-point and reference
+limits](#floating-point-and-reference-limits).
+
+### AAC input
+
+AAC-LC in MP4/M4A, ADTS, LOAS/LATM and CAF is decoded as AudioToolbox's
+`ExtAudioFileOpenURL` and `ExtAudioFileRead` decode it: the same float32
+samples (interleaved, and the planar stereo read the engine's analysis uses,
+with AudioToolbox's mix-down of multichannel sources; the mix-down of a 5.1
+stream follows the `matrix_mixdown_idx` of the last in-band program config
+element when there is one, see the refusals below), the same `file_length_frames`, `bitrate` and
+`source_format`, the same padding behind a short read and the same `OSStatus`
+for a file that fails to open or to read. How AudioToolbox treats damaged and
+unusual files was recorded (atom and size fields, sample tables and sample
+groups, movie fragments, LOAS frames that change or lose their configuration,
+`ftyp` brands, `iTunSMPB` and `udta`, CAF chunks, packet tables, layered
+descriptions and `desc` fields) and is reproduced rule by rule for the shapes
+recorded, each rule pinned by recorded inputs; a damaged shape that was not
+recorded, or that AAC_INPUT.md lists under "Not reproduced", may give a
+different result or status. The rules are listed in
+AAC_INPUT.md and not repeated here. Which reader opens a file follows
+`AudioFile`, as for [MP3](#mp3-input). The complete contract, the container
+rules and the refusals are in [AAC_INPUT.md](AAC_INPUT.md); the typed refusals,
+all reported with `unsupported_input_codec` unless stated, are:
+
+| Input | Refusal |
+| --- | --- |
+| HE-AAC v1/v2 whose SBR or PS is signalled in the AudioSpecificConfig or by the container (an HE-AAC stream that signals neither is decoded as its AAC-LC core, as AudioToolbox does) | `unsupported_input_codec` |
+| AAC-LD, AAC-ELD, USAC, MPEG-1 audio object types in an AAC file | `unsupported_input_codec` |
+| a CAF whose rate or channel count differs from its cookie's | `unsupported_input_codec` |
+| AAC inside a WAVE container (format tag 0xff): AudioToolbox does not open such a file (`'fmt?'`), and the port refuses it with the typed error instead of reproducing that status | `unsupported_input_codec` |
+| a stereo read (the planar read of the engine's analysis) of a 5.1 stream, once an access unit carries an in-band program config element with a `matrix_mixdown_idx` that is not well formed (its element lists are not exactly front SCE + CPE, back CPE and one LFE, so it is not the stream's own 5.1 layout; damaged streams, for which AudioToolbox's mix-down was seen to ignore the element or to follow neither matrix); the interleaved read is not affected | `unsupported_input_codec` |
+| a packet table of more than 16,777,216 packets | `unsupported_input_codec` |
+| a client rate other than the file's (sample-rate conversion; analysis of an AAC source at or below 22,050 Hz is refused for this reason) | `unsupported_sample_rate_conversion` |
+| input above 2 GiB (the file is decoded from memory) | `unsupported_input_format` |
+
+As for every non-MP3 source, the primary waveform of an AAC source that is not
+44.1 kHz is reported unavailable (the engine asks for 44.1 kHz and the port
+does not convert); the rest of the analysis can succeed. Through the CLI an
+input is admitted by its extension (`.m4a` for AAC) and its tag stage must
+classify the container, which is narrower than what the reader accepts: a CAF
+is refused by the tag stage on every build.
+
+### Speed, memory and determinism
+
+In release builds the encoder runs about 20 to 30 times faster than real time per
+core on an arm64 laptop (measured with the long fixture items and a larger set of
+generated inputs); no figure is claimed for x86_64 or for the decoder. The
+encoder spools its access units to the private staging workspace as they appear
+(a write of any size is encoded and drained a slice at a time), so memory stays
+bounded however long the stream is. The spool and the staged output live in the
+destination's directory and exist side by side while the container is written,
+so that filesystem needs room for about twice the size of the stream; finishing
+copies the spool into the container and cannot be cancelled in portable builds.
+The decoder reads its input whole (up to 2 GiB); its memory and work are bounded
+by the input as set out in [AAC_INPUT.md](AAC_INPUT.md).
+
+Both ports use only the Apple-exact arithmetic of the portable build (explicit
+fused multiply-adds, correctly rounded libm replacements, the generic DFT), have
+no host-dependent branch and compute with flush-to-zero cleared. Every finite
+result of the decoder is the same on aarch64 and x86_64; for the adversarial
+streams whose spectrum overflows to infinity (a resonant TNS filter) the NaNs
+that follow take the sign bit of the host's arithmetic, so non-finite output bits
+can differ between architectures. The encoder and decoder gave the same output on
+macOS arm64, Linux aarch64 and Linux x86_64 on the corpora described in
+[VERIFICATION.md](VERIFICATION.md#v040-changes-and-evidence). The x86 residual
+classes of [Floating-point and reference limits](#floating-point-and-reference-limits)
+are not claimed absent for the rest of the processing chain between decoding
+and encoding.
+
+### What is not reproduced
+
+Apple's AAC encoder and decoder select a 512-point DFT kernel from the stack
+position at the call: generic NEON code, or an SME kernel. The port reproduces
+the generic classes only, the ones the engine reaches by construction on macOS
+(write class A, tail class generic, read class G, all at stack residue 0
+through the trampoline described in [BUILD.md](BUILD.md)). The SME variants
+(the encoder's write class B and SME tail, the decoder's class S) are not
+reproduced. Also not reproduced: HE-AAC (SBR, PS), AAC-LD/ELD, USAC, dynamic
+range control, sample-rate conversion, other encoder settings, and other Apple
+Silicon generations or OS builds than the recorded reference.
+
+## ALAC output on Linux and `portable` builds
+
+The portable ALAC writer (`src/portable/audio/alac.rs`, `mp4.rs`) writes what
+AudioToolbox's `ExtAudioFile` writes, packet by packet, within the limits listed
+under [What is refused](#what-is-refused). v0.4.0 corrects two differences from
+AudioToolbox that v0.3.0 shipped, found while comparing AAC and ALAC outputs on
+the same inputs; the macOS default build uses AudioToolbox and is unchanged.
+
+- **Final packets of fewer than 288 frames.** AudioToolbox scores a packet from
+  the first eighth of its frames and trains its predictors on the first
+  thirty-second, in four work buffers it keeps for the whole stream. For a
+  stereo or multichannel packet of fewer than 288 frames the span it scores
+  contains positions that the last training pass of the predictor order being
+  tried does not rewrite. They hold that pass's differential head and, beyond
+  it, what the element's own mix search wrote, never anything from an earlier
+  element or packet (pre-filling the buffers with other data changes nothing).
+  v0.3.0 modelled that span by hand
+  and got it wrong below 288 frames (a mono packet and a packet of 288 frames or
+  more were never affected), which for some content changed a predictor-order or
+  compression choice and with it the last packet: in a random sweep of 30,000
+  generated files, 1,022 of 48,270 packets of the earlier code differed from
+  AudioToolbox's, every one a final packet of fewer than 288 frames. Cases found
+  first were a 5-channel 44.1 kHz file and a 96 kHz stereo file. The writer now
+  keeps the buffers as AudioToolbox does. More than 1.67 million packets were
+  compared with AudioToolbox without a byte difference (random sweeps of 1–8
+  channels, 16/20/24/32-bit depths, rates from 8 to 192 kHz and 14 kinds of
+  content, every final-packet size from 1 to 330 frames, and selected formats
+  up to 4,095), and `tests/portable_alac_packets.rs` replays 85 recorded packet
+  streams without an Apple component (the v0.3.0 writer fails it).
+- **Oversized packets and the cookie.** AudioToolbox does not write a packet
+  larger than its converter's output buffer (the larger of 64 KiB and
+  4,096 × channels × ceil(bit depth / 8) + 8 bytes). An all-escape packet of
+  incompressible audio can exceed it by 1 to 8 bytes, which near-full-scale noise
+  in 4 or more channels at 32 bits, 6 or more at 24 bits or 8 at 16 bits does, and
+  so can input laden with NaN or infinity. AudioToolbox keeps the audio queued and
+  encodes the packet again, once per later `ExtAudioFileWrite` call and once at
+  close, with the predictor coefficients the failed attempt left behind. The
+  cookie fields `maxFrameBytes` and `avgBitRate` are its tally over every attempt,
+  rejected ones included. A call that still cannot place the packet at its third
+  or a later attempt has its audio discarded, and a packet not placed by the close
+  is dropped with everything behind it; the macOS writer's frame check then
+  refuses the file. The portable writer reproduces this: the packets and the
+  cookie equal the macOS file's, and it refuses (`encode_failed`, at the stage
+  `encode Apple output` or `finish Apple output`) where the macOS writer ends in
+  that refusal. v0.3.0 made two attempts in total and tallied only the packets
+  it wrote, so for such files its cookie fields differed, it refused files
+  AudioToolbox writes and it wrote files the macOS check refuses (on 8,000
+  generated cases 2,039 files differed and 98 were refused where AudioToolbox
+  wrote; the corrected writer has neither).
+
+Evidence for the second item: the default build's `apple_codec::Writer` against
+the portable `Writer`, fed the same float blocks, whole files compared with the
+six MP4 clock fields zeroed, over 1–8 channels, 16/24/32-bit depths, rates from
+22.05 to 96 kHz, lengths up to 17,000 frames, content around the level at which
+the first attempt overflows and a quarter of the cases laden with NaN and
+infinity. With 512-frame writes (the engine's block size; the first and last
+write of an engine run are shorter), 48,000 cases gave 46,607 identical files
+and 1,393 refusals on both sides, and none that differed. The first write of an
+engine span is 512 frames minus the limiter latency modulo 512 and its last is
+cut to the file's length, so unless the latency is a multiple of 512 its packet
+boundaries fall inside write calls and a real run belongs to the class of write
+sizes that do not divide 4,096 frames, which is covered next.
+With other write sizes (64 to 4,096 frames dividing
+4,096; 4,096; 100; mixed sizes up to 9,000), 18,000 further cases gave no
+differing file and no file written where AudioToolbox's writer refuses.
+`tests/portable_alac_packets.rs` pins 48 oversized-packet cases (whole-file
+digests, cookie fields or the kind of refusal) and
+`tests/portable_alac_digests.rs` pins the whole-file digests of 18 ordinary
+configurations to what the v0.3.0 writer produced, so files without these two
+conditions are unchanged.
+
+Limits. The retry schedule is exact for write calls of one size that divides
+4,096 frames (512-frame calls included). The engine's own calls are not all of
+that kind (above), so for engine runs, as for any caller whose write sizes do
+not divide 4,096, AudioToolbox can host more attempts than modelled: the
+portable writer can refuse a file AudioToolbox would write (29 of 9,000
+generated cases of mixed-size and 100-frame writes; the engine's own pattern
+was not swept separately, so no rate is claimed for it) but never writes a
+different one. Only a packet that is still too large after two attempts is
+affected at all. The
+recordings and sweeps are of one macOS 27.2 arm64 encoder; another ALAC encoder
+version could change them. The NaN and infinity cases matter only for robustness:
+the engine's own DSP output is finite.
 
 ## Opt-in cover art and WAV tags
 
@@ -186,38 +418,44 @@ With it on (Linux and `--features portable` builds only):
   succeeds, while with the setting on the same file fails instead of losing the
   picture silently. Leave the setting off for such sources.
 - **WAV tag chunks** (`ID3 `/`id3 ` and INFO `LIST`) that TagLib writes into a WAV
-  output are all kept. macOS and the original application lose the chunk TagLib
-  saves last (the `ID3 ` chunk, or the `LIST` when both exist) because their
-  marker rewrite runs while TagLib's RIFF size update is still buffered; with the
-  setting on, a WAV source's tags and artwork survive WAV-to-WAV and
-  `match-input`, and the output is the default output plus those chunks. A
-  cross-format copy into a WAV always writes tempo and key, so with the setting
-  on even a source without tags gains an `ID3 ` chunk (`TBPM` "0", an empty
-  `TKEY`) and the item lists `wav_tag_preservation`; this policy is unchanged
-  in v0.3.0 and remains an open point. Without the setting the original
-  behavior is kept byte for byte.
+  output and that carry source data are kept. macOS and the original application
+  lose the chunk TagLib saves last (the `ID3 ` chunk, or the `LIST` when both exist)
+  because their marker rewrite runs while TagLib's RIFF size update is still
+  buffered; with the setting on, a WAV source's tags and artwork survive
+  WAV-to-WAV and `match-input`, and the output is the default output plus those
+  chunks. TagLib writes tempo and key into every cross-format copy into a WAV.
+  For a source without a tempo, a key or tags that chunk holds only a zero
+  tempo and an empty key, which is nothing the source had: it is dropped (v0.3.0
+  kept it), the output is the default one and the item lists nothing. A source with a tempo,
+  a key or tags keeps the chunk (and the INFO `LIST` for tags) and the item lists
+  `wav_tag_preservation`. An INFO `LIST` without a value is dropped the same way;
+  a tag chunk that cannot be proven empty is kept as TagLib wrote it. The rewrite
+  applies only to a WAV whose chunks before the declared RIFF end tile it exactly
+  and whose bytes after it are a short run of well-formed chunks reaching the end
+  of the file; any other file gets the default output. Without the
+  setting the original behavior is kept byte for byte.
 
 Each item that took one of these paths says so: `report.non_identical_paths` is
 `["artwork_copy"]`, `["wav_tag_preservation"]` or both (always present, `[]`
 otherwise). Without the setting Linux refuses what needs the transcoder and
 drops those chunks, as in v0.1.0. The setting does not gate MP3 input (it did
-in v0.2.0). On a macOS default build the setting is stored
-but has no effect, and `config show` says so. AAC stays refused either way. The
-setting and the item list are specified in
+in v0.2.0) or AAC input and output, which are exact and need no setting. On a
+macOS default build the setting is stored but has no effect, and `config show`
+says so. The setting and the item list are specified in
 [CLI_CONTRACT.md](../research/CLI_CONTRACT.md#opt-in-non-identical-paths).
 
 ## Upgrading from v0.2.0
 
 - **Libraries.** Library paths and digests live in the state directory. The
-  v0.3.0 Linux tag bridge (v09, still ABI 5) has a new SHA-256 (see
-  [Linux native libraries](#linux-native-libraries)) and the v0.3.0 CLI refuses
-  the v0.2.0 bridge, so `libraries.tag_bridge` must be repointed at the v0.3.0
-  bridge. libFLAC and LAME are byte-identical to v0.2.0 and keep their pins;
-  libopus is new and needed only for Opus. Unpack v0.3.0 into a new directory
-  next to v0.2.0.
+  Linux tag bridge since v0.3.0 (v09, still ABI 5) has a new SHA-256 (see
+  [Linux native libraries](#linux-native-libraries)) and the v0.4.0 CLI refuses
+  the v0.2.0 bridge, so `libraries.tag_bridge` must be repointed at the bridge
+  of the new release. libFLAC and LAME are byte-identical to v0.2.0 and keep
+  their pins; libopus is new and needed only for Opus. Unpack v0.4.0 into a new
+  directory next to v0.2.0.
 - **State file.** A state file that stores `parity.allow_non_identical` stays
   valid and keeps its meaning for cover art and WAV tag chunks. A file written
-  by v0.3.0 that stores `formats` or `libraries.opus*` (only after you set
+  by v0.3.0 or later that stores `formats` or `libraries.opus*` (only after you set
   them) cannot be read by v0.2.0 or v0.1.0; a file that never set them can.
 - **MP3 input.** In v0.2.0 MP3 input on Linux was refused with
   `unsupported_input_codec` unless `parity.allow_non_identical` was on, and then
@@ -238,6 +476,54 @@ setting and the item list are specified in
   field modulo 2^28). With the setting off nothing changed.
 - **Error codes** grew from 37 to 39 (`opus_not_enabled`,
   `unsupported_opus_variant`); the existing codes keep their meaning.
+
+## Upgrading from v0.3.0
+
+- **Libraries.** The Linux tag bridge, libFLAC, LAME and libopus pins of v0.4.0
+  are unchanged since v0.3.0 (bridge `5c52c5f1…` aarch64 / `8c61f6bb…` x86_64, libFLAC `41b59a45…` aarch64 / `9420c96f…` x86_64, LAME `c780062f…` aarch64 / `cf59ae7f…` x86_64, libopus `c09146de…` aarch64 / `d09791af…` x86_64); the CLI refuses a library that is not on its
+  allowlist, as before. Unpack v0.4.0 into a new directory next to v0.3.0.
+- **State file.** Unchanged and valid; nothing new is stored.
+- **AAC input.** v0.3.0 refused AAC input on Linux and `portable` with
+  `unsupported_input_codec`. v0.4.0 decodes it exactly; an AAC file is refused
+  with that code only for the variants listed under [AAC
+  input](#aac-input), a damaged one fails as macOS fails it for the shapes
+  recorded (`invalid_input_file` at open, `decode_failed` while reading), and a
+  hand-built stub that v0.3.0 refused as an unsupported codec can now be
+  `invalid_input_file`. An MP4 whose first sound entry is neither `mp4a` nor
+  `alac` nor a type AudioToolbox opens as another codec is now
+  `invalid_input_file` (`'wht?'`, as on macOS); v0.3.0 answered
+  `unsupported_input_format`.
+- **AAC output.** v0.3.0 refused `--format aac` (and `match-input` of an AAC
+  source) with `unsupported_output_codec`. v0.4.0 publishes the `.m4a`, or fails
+  the item as listed under [AAC output](#aac-output). `unsupported_output_codec`
+  is kept in the table as reserved and no build produces it.
+- **WAV tag chunks.** With `parity.allow_non_identical` on, a WAV output whose
+  source has no tempo, key or tags no longer keeps TagLib's empty `ID3 ` chunk
+  and no longer lists `wav_tag_preservation`; its bytes equal the default
+  output's. An INFO `LIST` without a value is dropped the same way. Sources
+  with a tempo, a key or tags are unchanged, and with the setting off nothing
+  changed. Consumers that expected the member for every cross-format copy into
+  a WAV should stop doing so.
+- **ALAC output.** Portable ALAC files can differ from v0.3.0's in two cases in
+  which v0.3.0 differed from AudioToolbox: the last packet of a stereo or
+  multichannel stream of fewer than 288 frames, and a stream with a packet
+  larger than AudioToolbox's output buffer (near-full-scale incompressible audio
+  in many channels at high bit depth; the cookie fields `maxFrameBytes` and
+  `avgBitRate` change as well). Of the second kind, a stream v0.3.0 wrote can now
+  be refused (`encode_failed`) where the macOS writer refuses it, and one v0.3.0
+  refused can now be written where AudioToolbox writes it. Files without these
+  conditions are unchanged (pinned by test). See [ALAC
+  output](#alac-output-on-linux-and-portable-builds).
+- **Worker panics.** On every build a panic in the worker of one batch item
+  fails that item (`internal_error`, stage `worker`) and the rest of the batch
+  is processed and reported; in v0.3.0 it ended the run. The panicking item can
+  leave its staging files behind (`.pn-workflow-*` directories and a
+  `.<name>.pn-reservation` file next to the output); remove them by hand
+  before reprocessing that item (v0.3.0 left the same files when the run
+  ended).
+- **Error codes.** Still 39; `unsupported_input_codec` is narrower and
+  `internal_error` also covers a worker panic (see the
+  [CLI contract](../research/CLI_CONTRACT.md#error-codes)).
 
 ## Opt-in Opus input and output
 
@@ -278,6 +564,25 @@ also differed in the sampled probes. These classes can affect raw bits; the
 sampled probes do not prove that all such values are reachable in the engine,
 and no general runtime guard for all such cases is claimed.
 
+AAC adds two notes. The AAC ports reproduce Apple's encoder and decoder on the
+recorded Apple M4 reference (macOS 27.2 build 26B123) for the engine's own call
+sequence; AudioToolbox picks between a generic and an SME kernel from the stack
+position at the call, and only the generic classes are reproduced (the engine
+pins them by construction on macOS). Another Apple Silicon generation, OS build
+or caller can behave differently; do not assume it is an identical reference.
+The ports run with flush-to-zero cleared, so the x86 tininess difference above
+does not arise inside them, but it still applies to the DSP that runs between
+the decoder and the encoder. Second, with the caller's flush-to-zero mode set
+while samples are written, the encoder reproduces AudioToolbox's flushing of
+subnormal input samples but not the change that mode also makes to
+AudioToolbox's own arithmetic for input made of tiny normal numbers (a constant
+level of about 2^-126 to 4e-37, a sine of 1e-33 to 1e-30, subnormals mixed with
+one near-minimum normal sample, infinities or NaN mixed with subnormals), which
+gives other access units than the mode-clear stream; the smallest recorded case
+is 3,008 frames of mono DC at -2^-126, and 18 such cases turned up in 24,000
+random ones written inside a flush scope. The engine never writes inside a
+flush scope, where its output is exact.
+
 ## Hostile-input limits
 
 The portable readers and the tag bridge parse untrusted files in the engine's
@@ -298,11 +603,44 @@ defect, and recorded these bounded limits, none of which is new in kind:
   property). Apply a size, duration or free-space policy outside the engine for
   untrusted input.
 - **Worker panics.** A panic in one worker thread ends the whole run (exit 101,
-  no JSON outcome); none is known to be reachable.
+  no JSON outcome); none is known to be reachable. **Superseded in v0.4.0:** a
+  panic in the worker of one `process`, `analyze` or `inspect` item fails that
+  item alone (`internal_error`, stage `worker`) and the rest of the batch is
+  processed and reported; a panic elsewhere still ends the run. The failed item
+  can leave its staging files behind (`.pn-workflow-*` directories and a
+  `.<name>.pn-reservation` file next to the output); remove them by hand before
+  reprocessing it. This is a limit, not a feature: the files were left behind
+  in v0.3.0 as well when the run ended.
 - **Pictures.** With the opt-in, a FLAC or MP4 destination has no aggregate
   picture cap; TagLib 1.11.1 sizes its byte vectors in 32 bits, so pictures
   totalling 4 GiB or more (and roughly 12 GiB of memory) are outside what is
   supported. ID3 destinations (MP3, AIFF, WAV) are checked exactly.
+- **AAC input (new in v0.4.0).** An AAC file is read whole like an MP3 (at most
+  2 GiB) and a packet table of more than 16,777,216 packets is refused; the
+  decoded length a file claims is not capped, as above (an access unit of 4
+  bytes already yields 1,024 frames). Memory and work are bounded by the
+  input: beyond the file image the reader holds 16 bytes per packet, a file of
+  N bytes costs at most about 21 N bytes live and 16 N in one allocation, and
+  every walk of an atom, chunk or tag chain is linear in the file or stops at a
+  fixed limit ([AAC_INPUT.md](AAC_INPUT.md)). `tests/portable_aac_hostile.rs`
+  mutates the small AAC-LC inputs and a fragmented MP4 6,000 times (byte and
+  bit damage, truncation, forged container headers, absurd table counts, noise
+  over access units), generates 20,000 LOAS/LATM, 8,000 CAF and 8,000
+  fragmented MP4 streams from the grammar of their container in a release
+  build (a fifth of each in a debug build) and builds inputs of megabytes
+  whose tables would cost a product of two sizes if they were scanned naively.
+  It asserts no panic and no hang (a watchdog per case), allocations of at
+  most 17 bytes per input byte in one piece and 40 in total beyond a fixed
+  256 KiB and 1 MiB, CPU time in proportion to the input size, frames bounded
+  by the input size, and typed outcomes only. The v0.3.0 reviews above did not
+  cover the AAC reader; the reviews of this release are summarized in
+  [VERIFICATION.md](VERIFICATION.md#v040-changes-and-evidence).
+- **Atom and chunk count of the ALAC and PCM CAF readers.** The ALAC reader, the
+  generic PCM CAF reader and the scan that refuses other MP4 files read at most
+  65,536 top-level atoms or chunks (`MAX_SCANNED_BOXES`): a file with more is
+  refused (`invalid_input_file` for ALAC, `unsupported_input_format` for the
+  others) however small its atoms are. The AAC container model has its own
+  bounds ([AAC_INPUT.md](AAC_INPUT.md)).
 - **Hardening.** The bridge is built with `-fstack-protector-strong`,
   `-D_FORTIFY_SOURCE=2` and `-z relro,now`; the TagLib static library it links
   and libopus are not.
@@ -311,14 +649,14 @@ defect, and recorded these bounded limits, none of which is new in kind:
 
 The ABI-5 bridge and codec libraries are loaded from explicitly configured,
 trusted paths. Linux additionally permits only exact, architecture-specific
-SHA-256 identities compiled into `src/linux_libraries.rs`. The v0.3.0 bridge
-(v09) adds WAV picture handling and the ID3 size check to the v0.2.0 bridge
+SHA-256 identities compiled into `src/linux_libraries.rs`. The bridge introduced
+in v0.3.0 (v09) adds WAV picture handling and the ID3 size check to the v0.2.0 bridge
 (v08, aarch64 `8708af52d83fc7fdb6a487d72abc90ff4bd9f9b94e313436cc6fb68cc9db2aa0`,
 x86_64 `ea86881cb6615d7cf8614dfb285e8670d978de621957b15611b8bd6d5b0e1ad5`) and is
 built with stack protector, `_FORTIFY_SOURCE=2` and immediate binding with a
 read-only relocation segment, so it has a new identity; libFLAC and LAME are the
 v0.1.0 builds, and libopus is the optional fixed-point 1.6.1 build (the v0.1.0
-and v0.2.0 bridge digests are no longer accepted):
+and v0.2.0 bridge digests are no longer accepted; the pins of v0.4.0 are unchanged since v0.3.0 (bridge `5c52c5f1…` aarch64 / `8c61f6bb…` x86_64, libFLAC `41b59a45…` aarch64 / `9420c96f…` x86_64, LAME `c780062f…` aarch64 / `cf59ae7f…` x86_64, libopus `c09146de…` aarch64 / `d09791af…` x86_64)):
 
 | Architecture | TagLib bridge | libFLAC | LAME | libopus |
 | --- | --- | --- | --- | --- |
@@ -364,20 +702,20 @@ a published tag whose pins are reviewed in the workflow.
 The smoke test is one bounded comparison, not a universal parity guarantee.
 
 When published, the multi-architecture image is
-`ghcr.io/mschienbein/platinum-engine:v0.3.0`. It contains the CLI, libraries,
+`ghcr.io/mschienbein/platinum-engine:v0.4.0`. It contains the CLI, libraries,
 notices and corresponding-source/relink materials. It uses UID/GID 65532 and
 runs `platinum` as its entrypoint; it does not set the library configuration
 automatically. The following gives the named volume a persistent state and uses
 libraries from the image. Verify the three printed hashes against the table in
 "Linux native libraries" for the image's architecture before configuring them;
-the v0.3.0 image carries the v0.3.0 bridge. The bridge digests of the v0.1.0
+the v0.4.0 image carries the bridge of that table. The bridge digests of the v0.1.0
 image (aarch64 `10eb77c1e12d7a12959300da3a1d853fe4907a3c7872bb4f83b12ab255549a9b`,
 x86_64 `27922fdf10e6c7efbb43f8645f74138b82c4598edf0c3f2e2f55410cbaf3714d`) and
 of the v0.2.0 image (listed above) are not in that table, and this release
 refuses those bridges.
 
 ```sh
-IMAGE=ghcr.io/mschienbein/platinum-engine:v0.3.0
+IMAGE=ghcr.io/mschienbein/platinum-engine:v0.4.0
 pn() {
   docker run --rm --mount type=volume,src=platinum-engine-state,dst=/state \
     "$IMAGE" --state-dir /state "$@"
@@ -421,8 +759,8 @@ From the repository root, using Docker on the target's native architecture,
 choose new, absent output directories with existing parents:
 
 ```sh
-sh tools/linux/build-image.sh platinum-native:local "$HOME/platinum-build-context-v0.3.0"
-sh tools/linux/build-cli.sh platinum-native:local "$HOME/platinum-build-output-v0.3.0"
+sh tools/linux/build-image.sh platinum-native:local "$HOME/platinum-build-context-v0.4.0"
+sh tools/linux/build-cli.sh platinum-native:local "$HOME/platinum-build-output-v0.4.0"
 ```
 
 The first command creates a context from precisely the public native inputs;
@@ -444,7 +782,7 @@ Inspect its options and prerequisites before using or adapting it; tmpfs
 staging consumes memory shared with other services.
 
 The release packaging helper is `sh tools/linux/package-release.sh PLATFORM
-v0.3.0 NEW_OUTPUT_DIR`, where PLATFORM is `linux-arm64`, `linux-amd64`, or
+v0.4.0 NEW_OUTPUT_DIR`, where PLATFORM is `linux-arm64`, `linux-amd64`, or
 `macos-arm64`; it does not publish. The runtime image recipe is
 `linux/Dockerfile.runtime` and expects verified extracted release payloads for
 both architectures. [BUILD.md](BUILD.md) and [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)

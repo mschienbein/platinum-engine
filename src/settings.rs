@@ -124,9 +124,11 @@ pub struct LibraryPaths {
 /// `allow_non_identical` enables, on Linux and `portable` builds only, the
 /// byte-for-byte copy of embedded cover art that Apple's image pipeline would
 /// transcode and the preservation of the WAV tag chunks the reference marker
-/// writer drops. It does not gate MP3 input: the portable MP3 reader is verified
-/// identical to AudioToolbox and needs no opt-in. macOS default builds always
-/// use the reference paths, so the setting is stored but has no effect there.
+/// writer drops, but only those that carry source data (an `ID3 ` chunk of nothing
+/// but an empty tempo and key is dropped). It does not gate MP3 input: the portable
+/// MP3 reader is verified identical to AudioToolbox and needs no opt-in. macOS
+/// default builds always use the reference paths, so the setting is stored but has
+/// no effect there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParitySettings {

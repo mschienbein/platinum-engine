@@ -1,6 +1,6 @@
 # Build and run on macOS arm64
 
-The production CLI is independent of the Platinum Notes installation. On macOS arm64 it uses Rust DSP, AudioToolbox and Accelerate, a separately built TagLib bridge, and separately built FLAC and LAME libraries when needed (and libopus for the optional Opus format). Reference-only probes are optional. Linux aarch64 and x86_64 builds use portable implementations and the pinned native-library builds described in [LINUX.md](LINUX.md).
+The production CLI is independent of the Platinum Notes installation. On macOS arm64 it uses Rust DSP, AudioToolbox and Accelerate, a separately built TagLib bridge, and separately built FLAC and LAME libraries when needed (and libopus for the optional Opus format). Reference-only probes are optional. Linux aarch64 and x86_64 builds use portable implementations and the pinned native-library builds described in [LINUX.md](LINUX.md). MP3 and AAC input and AAC output need no library on any platform: macOS uses AudioToolbox, and Linux and `--features portable` builds use the in-tree exact ports.
 
 ## Prerequisites and recorded setup
 
@@ -235,7 +235,7 @@ The v0.1.0 macOS battery executable SHA-256 was
 The earlier source-path-remapped battery executable was
 `82d8b48904f8d6128b7399330556ea13d130f01426d86041db1d974676d49b0d`;
 the release rebuild adds home, Cargo and Rustup path remaps and has its own
-identity-gated battery. The v0.3.0 macOS executable is built the same way from
+identity-gated battery. The v0.4.0 macOS executable is built the same way from
 the frozen source; its SHA-256 is recorded in the release evidence
 ([VERIFICATION.md](VERIFICATION.md)), not here, because it describes
 the tree this file belongs to.
@@ -248,12 +248,15 @@ modulo 64 at residue 0 (`WRITE_SP_RESIDUE`, `DISPOSE_SP_RESIDUE`,
 `READ_SP_RESIDUE`). AudioToolbox's AAC encoder and decoder choose between an
 SME and a NEON kernel from that residue, so the pin selects the kernel the
 references used by construction and not through the compiler's frame layout (the
-encoder pins date from v0.2.0, the two read pins are new in v0.3.0; the output
-is meant to be unchanged). It is an observation of the tested macOS arm64
+encoder pins date from v0.2.0, the two read pins from v0.3.0, and v0.4.0 leaves
+all three unchanged; the output is meant to be unchanged). The Linux and
+`portable` AAC encoder and decoder reproduce exactly the classes these pins
+select (write class A with the generic tail, read class G) and not the SME
+variants. It is an observation of the tested macOS arm64
 AudioToolbox; see [VERIFICATION.md](VERIFICATION.md#v030-changes-and-evidence).
 
 For Linux, run on the target's native Docker host with a prepared offline
-registry cache (`index/` and `cache/`), a new output directory and the v0.3.0
+registry cache (`index/` and `cache/`), a new output directory and the v0.4.0
 native-library image (built by `tools/linux/build-image.sh`; check that the
 bridge, libFLAC, LAME and libopus it contains have the digests in
 [LINUX.md](LINUX.md#linux-native-libraries)):
@@ -266,8 +269,8 @@ PN_LINUX_REGISTRY_DIR="$REGISTRY" PN_LINUX_RUN_TESTS=1 PN_LINUX_TMP_TARGET=1 \
 
 `PN_LINUX_RUN_TESTS=1` runs the regular all-target suite and then a
 library-gated lane: the `error_codes`, `linux_opt_in`, `portable_art_copy` and
-`opus_cli` suites with `--ignored`, the three WAV tag-chunk bridge tests of
-`tags_reference` (the default policy and the opt-in that keeps the chunks) and
+`opus_cli` suites with `--ignored`, the four WAV tag-chunk bridge tests of
+`tags_reference` (the default policy, the opt-in that keeps the chunks that carry source data, and the one that drops those that do not) and
 the Opus layer's own tests (`--lib opus::`, with `PN_OPUS_LIB` and
 `PN_OPUS_SHA256`). Those tests need the approved bridge, libFLAC, LAME and
 libopus in the image, so the regular suite ignores them and never counts them
@@ -283,8 +286,8 @@ v0.1.0 bridge, which this release refuses). The v0.1.0 frozen Linux binary
 hashes were arm64
 `6e19449bc9d492d27fa0068013b4e9d3aeaa7b4fe915a3abc6285ffbe00e289e`
 and amd64
-`1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`; the v0.2.0
-and v0.3.0 hashes are in the release evidence.
+`1c34e59b586b0f6adfa394b858cbdd2d3abb3d675cd8711c3a6e443c7c7ddfff`; the v0.2.0,
+v0.3.0 and v0.4.0 hashes are in the release evidence.
 
 For v0.3.0 the Linux bridge matrices ran in
 `platinum-codec09-artbridge-arm64:study`
@@ -299,12 +302,109 @@ reproduced the pinned digest. Those image IDs are local build identities, not
 a pin. The helper's output hashes and logs are
 evidence for that build, not proof of universal audio-file parity.
 
+## Tests and fixtures of the AAC ports
+
+The exact AAC encoder and decoder (`src/portable/aac/`, wired in through
+`src/portable/audio.rs` and `src/portable/audio/aac_read.rs`) are tested
+without any Apple component against golden fixtures that were recorded on
+macOS arm64 from AudioToolbox. The test targets belong to the regular suite
+(`cargo test --locked --all-targets`) and run unchanged on macOS (with or
+without `--features portable`), Linux aarch64 and Linux x86_64:
+
+| Target | What it replays |
+| --- | --- |
+| `portable_aac_encode` | The encoder through the public portable `Writer` against `tests/fixtures/aac-encode/`: every accepted configuration, content kind and write size, the `create` answer for every rate and channel count (native status, warning or acceptance), bit depths, paths, cleanup and misuse, whole `.m4a` files byte for byte with the MP4 header times pinned |
+| `portable_aac_encode_beyond_engine` | Three corners of AudioToolbox that the engine cannot observe: a writer that carries a warning, fractional sample rates (not reproduced: refused) and subnormal input under an ambient flush-to-zero mode |
+| `portable_aac_decode` | The reader through the public `Reader` against `tests/fixtures/aac-decode/`: open outcomes, properties, streams, the frames written behind short reads, other read sizes, refusal classes, poisoning and file-name routing |
+| `portable_aac_hostile` | Seeded mutations of the small AAC-LC inputs (6,000), grammar-generated LOAS, CAF and fragmented MP4 streams (20,000, 8,000 and 8,000 in a release build) and inputs of megabytes with tables that a naive scan would make quadratic: no panic, no hang, allocations and CPU time in proportion to the input, typed outcomes only; it does not compare with Apple |
+
+The library tests (`cargo test --lib -- portable::aac portable::audio`) cover
+the stages, the container layout and the `Writer` and `Reader` semantics, with
+the five small inputs of `tests/fixtures/aac-reader/`. A debug build runs the
+default encoder replay in about a minute on a hosted runner; the decoder tests
+can be run alone with:
+
+```sh
+cargo test --offline --locked --features portable --test portable_aac_decode --test portable_aac_hostile
+```
+
+Tests marked `#[ignore = "long: run by the release battery"]` are never counted
+as passes by the regular suite: the long encoder items of `portable_aac_encode`
+(streams of 301 to 330 seconds, among them silence at the point where the `moov`
+atom moves behind the media data) and the two long cases of `portable_aac_decode`
+(a 464 s ADTS stream and a 302 s MP4 with `moov` in either place). They need a
+release build (about twenty seconds there, many minutes in a debug build) and are
+run, with one more ignored test of `portable_aac_decode` that reports timings, by
+the release battery and by a step of the macOS CI job:
+
+```sh
+cargo test --locked --release --features portable --test portable_aac_encode --test portable_aac_decode -- --ignored
+```
+
+### Recorders and rebuilding the fixtures
+
+The fixtures are generated audio with the results AudioToolbox gave for it; no
+recording of real music is included. They are rebuilt on macOS arm64 only (the
+recorders drive the engine's own AudioToolbox-based `Writer` and `Reader` in the
+default build) and can be checked on any machine. The recorders are standalone
+Cargo projects under `tools/portable/aac/`:
+
+- `encode_probe` and `make_encode_fixtures.py`:
+  `python3 tools/portable/aac/make_encode_fixtures.py --record --work DIR`
+  (macOS arm64; `DIR` must not exist) builds the probe, records the generated
+  inputs three times and writes `manifest.json`, `refs.bin` and `refusals.json`;
+  `--verify` checks the pack against its manifest anywhere, without Apple or
+  Rust, and `--append` records only the items of a new group on the machine
+  the pack was recorded on. The generator of the inputs is
+  `tests/support/aac_encode_input.rs`, shared by the recorder and the replay.
+- `decode_probe`, `make_decode_fixtures.py` and `make_decode_rule_fixtures.py`:
+  `verify-pack` checks the pack anywhere, `readsizes` records the 100-, 513- and
+  4096-frame reads and `build` collects, records and classifies the inputs of
+  the first parts; `build` needs generated corpora outside the repository, so
+  the pack itself is checked here and not regenerated. `make_decode_rule_fixtures.py
+  extend` (macOS arm64) cuts and records the container-rule cases (`rule/`)
+  from files of the repository alone.
+- `reader_probe/` (`apple/` and `portable/` probes, `structure_sweeps.py`,
+  `compare.py`): the structural-damage sweeps (CAF chunks and fields, ADTS
+  headers, LOAS and MP4 atoms, file names) from which the container rules in
+  [AAC_INPUT.md](AAC_INPUT.md) were recorded, and the comparison of
+  AudioToolbox's answers with the port's.
+
+The README of each fixture directory (`tests/fixtures/aac-encode/`,
+`tests/fixtures/aac-decode/`) lists its contents, hashes, what the reference
+was and its limits. The reference is valid for the machine and OS build
+recorded in the manifests only.
+
+### CI
+
+The macOS job runs the `portable` all-target suite, which includes the four
+AAC targets, with the live-system reference modules skipped (see
+[VERIFICATION.md](VERIFICATION.md#macos-reference-tests-and-ci)); the Linux jobs
+run the all-target suites with and without `--features portable` in the native
+image on both architectures. The `#[ignore]` long AAC tests run in a separate release step of the macOS job (the command above); the other `#[ignore]`
+tests are not run by CI, except the library-gated suites listed in the Linux job.
+
+## Tests and fixtures of the portable ALAC writer
+
+The portable ALAC writer is checked the same way, without an Apple component:
+`tests/portable_alac_packets.rs` replays AudioToolbox's recorded packets for
+short final packets (45 generated cases and a 40-point series) and its recorded
+whole files, cookie fields or refusals for oversized packets (48 cases), and
+`tests/portable_alac_digests.rs` pins the whole-file digests of 18 ordinary
+configurations to what the v0.3.0 writer produced, so that a change to a file
+without those conditions is a decision of its own. `tools/portable/alac/partial_probe.rs`
+(macOS) records the expected values and compares AudioToolbox's packets with the
+portable ones: `rustc --edition 2024 -O tools/portable/alac/partial_probe.rs -o
+partial-probe && partial-probe /absolute/scratch/dir` prints the tables the tests
+pin and exits 1 on any difference. See [LINUX.md](LINUX.md#alac-output-on-linux-and-portable-builds)
+for what the two ALAC corrections are.
+
 ## Linux and release packages
 
 See [LINUX.md](LINUX.md) for the pinned multi-architecture native image,
 architecture-specific library allowlist, source builds and runtime image. From
 an appropriate native host, `sh tools/linux/package-release.sh PLATFORM
-v0.3.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
+v0.4.0 NEW_OUTPUT_DIR` creates a local archive and source/relink materials
 without publishing. The available platform values are `macos-arm64`,
 `linux-arm64` and `linux-amd64`. The Linux allowlist means a locally rebuilt
 library is refused unless its digest matches an approved entry; matching a
@@ -318,8 +418,8 @@ FLAC uses BSD-3-Clause terms and LAME LGPL-2.0-or-later; the optional libopus
 uses BSD-3-Clause terms with royalty-free patent licenses. Linux codec patches
 and source/relink materials are supplied in release packages; the independently
 written portable ALAC implementation was informed by Apple's Apache-2.0
-reference, and the in-tree exact MP3 reader is a project-written port whose
-provenance is stated in THIRD_PARTY_NOTICES. See [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) and
+reference, and the in-tree exact MP3 reader and exact AAC encoder and decoder
+are project-written ports whose provenance is stated in THIRD_PARTY_NOTICES. See [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) and
 [NOTICE](../NOTICE), plus the package's `licenses/` and
 `corresponding-source/RELINK.txt`. Review the actual distribution and its
 dependencies; these notices do not constitute legal clearance or grant rights

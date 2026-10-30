@@ -185,12 +185,13 @@ fn short_and_non_mp3_files_are_refused_as_an_mp3_open_not_as_an_io_failure() {
         assert!([DTA, EOF, WHT].contains(&error.status), "{name}: {error:?}");
     }
     // The file name decides which reader looks. An ADTS stream named .mp3 is MPEG data with no frame header in it (Apple: 'dta?');
-    // under any other name AudioFile recognises ADTS, which it decodes and this port refuses.
+    // under any other name AudioFile recognises ADTS, which the AAC reader opens: this one announces a frame of 13 bytes and holds 12, so
+    // it has no frame at all ('wht?').
     let adts_bytes = [0xff, 0xf9, 0x50, 0xa0, 0x01, 0xa0, 0x00, 0x21, 0x20, 0x03, 0x40, 0x68];
     let adts = scratch.write("adts.mp3", &adts_bytes);
     assert_eq!(open(&adts).map(|_| ()).map_err(failure), Err(Failure { operation: OPEN.into(), status: DTA }));
     let adts = scratch.write("adts.bin", &adts_bytes);
-    assert!(matches!(open(&adts), Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })));
+    assert_eq!(open(&adts).map(|_| ()).map_err(failure), Err(Failure { operation: OPEN.into(), status: WHT }));
     let mut wav = b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0".to_vec();
     wav.extend_from_slice(&[0x55, 0, 2, 0, 0x44, 0xac, 0, 0, 0x10, 0xb1, 2, 0, 1, 0, 0, 0]); // tag 0x55: MPEG layer III in WAVE
     wav.extend_from_slice(b"data\0\0\0\0");
@@ -421,12 +422,14 @@ fn file_type_admission_follows_audiofile_for_every_recorded_name_and_content() {
         let apple_open: String = apple.splitn(8, '/').take(7).collect::<Vec<_>>().join("/");
         let ok = match kind {
             "same" => describe_open(&result) == apple_open,
-            "aac" => matches!(&result, Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })),
+            // recorded when AAC was refused; the AAC reader answers as AudioToolbox does
+            "aac" => describe_open(&result) == apple_open,
             "flac" => matches!(&result, Err(CodecError::UnsupportedCodec { codec: "FLAC", operation: "decoding", .. })),
             "ogg" => matches!(&result, Err(CodecError::UnsupportedFormat(m)) if m.contains("Ogg")),
             "wave-behind-tag" => matches!(&result, Err(CodecError::UnsupportedFormat(m)) if m.contains("behind a leading ID3 tag")),
-            // The malformed container is refused with `InvalidInput`, which the engine reports like AudioToolbox's `'dta?'`.
-            "invalid-input" => matches!(&result, Err(CodecError::InvalidInput(_))) && apple == "err/open/1685348671",
+            // The malformed WAVE is refused with `InvalidInput`, which the engine reports like AudioToolbox's `'dta?'`; a malformed MP4 or CAF gets the
+            // status itself from the container model of the AAC reader.
+            "invalid-input" => describe_open(&result) == apple_open || (matches!(&result, Err(CodecError::InvalidInput(_))) && apple == "err/open/1685348671"),
             other => panic!("unknown kind {other}"),
         };
         *kinds.entry(kind.to_owned()).or_default() += 1;

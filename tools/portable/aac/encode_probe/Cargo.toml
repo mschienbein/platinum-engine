@@ -1,0 +1,17 @@
+[package]
+name = "encode_probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: its own workspace, like tools/portable/mp3/apple_probe. macOS only (it drives the engine's AudioToolbox
+# `apple_codec::Writer`), so the engine is used with its default features, never `portable`.
+[workspace]
+
+[[bin]]
+name = "encode_probe"
+path = "main.rs"
+
+[dependencies]
+platinum-engine = { path = "../../../.." }
+serde_json = { version = "1", features = ["float_roundtrip"] }

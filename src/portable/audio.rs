@@ -7,6 +7,18 @@
 //! MP3, MP2 and MP1 elementary streams are read by [`mp3`], the bit-exact
 //! port of AudioToolbox's MPEG audio path (container, priming trim, decoder and
 //! read errors); like every other codec here it needs no opt-in.
+//!
+//! AAC output is written by [`Writer`] with the encoder of [`super::aac`]: the file AudioToolbox's `ExtAudioFile` writes for the engine's call sequence,
+//! byte for byte except for the close-time clock, for the formats AudioToolbox takes at 256 kbit/s at their exact sample rates. Every other rate and
+//! channel count is answered as the macOS writer answers it (a native status, or the `AacBitRateNotSet` warning), and what AudioToolbox serves but
+//! this build does not reproduce (rates that only round to an AAC rate, fractional rates) is refused with a typed error; see [`super::aac::encoder`].
+//!
+//! AAC-LC in MP4/M4A, ADTS, LOAS/LATM and CAF is read by [`aac_read`] on top of the
+//! exact decoder of [`crate::portable::aac::decoder`], with the same contract: the
+//! samples, the frames written behind a short read, the statuses of failing opens
+//! and reads, and `file_length_frames` / `bitrate` are AudioToolbox's; streams it
+//! decodes that the port does not reproduce (HE-AAC, AAC-LD/ELD, ...) are typed
+//! refusals.
 
 #[path = "audio/alac.rs"]
 pub mod alac;
@@ -16,6 +28,8 @@ pub mod gsm;
 pub mod mp4;
 #[path = "audio/mp3/mod.rs"]
 pub mod mp3;
+#[path = "audio/aac_read.rs"]
+mod aac_read;
 
 use std::error::Error;
 use std::fmt;
@@ -24,6 +38,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::aac;
 
 const LPCM: u32 = u32::from_be_bytes(*b"lpcm");
 const ALAC: u32 = u32::from_be_bytes(*b"alac");
@@ -65,6 +81,10 @@ pub enum CodecError {
     AlacEncode(alac::EncodeError),
     Mp4Read(mp4::Mp4Error),
     Mp4Write(mp4::WriterError),
+    /// The AAC encoder failed on a block of input.
+    AacEncode(aac::encoder::EncodeError),
+    /// The AAC `.m4a` container cannot hold the stream (more than 32 bits of offsets or duration) or was given inconsistent parameters.
+    AacContainer(aac::mp4::Mp4Error),
     Cleanup { primary: Box<CodecError>, source: io::Error },
     PublishedButCleanupFailed { path: PathBuf, source: io::Error },
     Poisoned,
@@ -83,6 +103,8 @@ impl fmt::Display for CodecError {
             Self::AlacEncode(error) => write!(f, "ALAC encode: {error}"),
             Self::Mp4Read(error) => write!(f, "ALAC container: {error}"),
             Self::Mp4Write(error) => write!(f, "ALAC container output: {error}"),
+            Self::AacEncode(error) => write!(f, "AAC encode: {error}"),
+            Self::AacContainer(error) => write!(f, "AAC container output: {error}"),
             Self::Cleanup { primary, source } => write!(f, "{primary}; additionally, cleanup failed: {source}"),
             Self::PublishedButCleanupFailed { path, source } => write!(f, "{} was published, but temporary cleanup failed: {source}", path.display()),
             Self::Poisoned => f.write_str("audio stream is unusable after an earlier codec failure"),
@@ -97,6 +119,8 @@ impl Error for CodecError {
             Self::AlacEncode(source) => Some(source),
             Self::Mp4Read(source) => Some(source),
             Self::Mp4Write(source) => Some(source),
+            Self::AacEncode(source) => Some(source),
+            Self::AacContainer(source) => Some(source),
             _ => None,
         }
     }
@@ -511,10 +535,15 @@ fn mp4_audio_entry(data: &[u8], depth: usize) -> Result<Option<[u8; 4]>, CodecEr
     Ok(found)
 }
 
+pub(crate) use mp4::MAX_SCANNED_BOXES;
+
 fn unsupported_mp4(file: &mut File, path: &Path, length: u64) -> Result<CodecError, CodecError> {
     const MAX_MOOV: u64 = 64 * 1024 * 1024;
     let mut offset = 0u64;
+    let mut seen = 0usize;
     while length.saturating_sub(offset) >= 8 {
+        seen += 1;
+        if seen > MAX_SCANNED_BOXES { return Err(CodecError::UnsupportedFormat("MP4 with more top-level atoms than are scanned")); }
         let mut header = [0u8; 16];
         read_at(file, offset, &mut header[..8], path)?;
         let (size, header_size) = match be32(&header[..4]) {
@@ -531,8 +560,9 @@ fn unsupported_mp4(file: &mut File, path: &Path, length: u64) -> Result<CodecErr
             let mut moov = vec![0u8; (size - header_size) as usize];
             read_at(file, offset + header_size, &mut moov, path)?;
             return Ok(match mp4_audio_entry(&moov, 0)? {
+                // an `mp4a` entry exists, but not as the first sample entry of the first sound track (the AAC reader takes that one only)
                 Some(kind) if &kind == b"mp4a" => CodecError::UnsupportedCodec {
-                    codec: "AAC/MP4A", operation: "decoding", reason: "Apple's compressed decoder output is not reproducible",
+                    codec: "AAC/MP4A", operation: "decoding", reason: "the AAC reader takes the first sound track of an MP4 only, and its first sample entry is not mp4a",
                 },
                 Some(kind) if &kind == b"alac" => CodecError::UnsupportedCodec {
                     codec: "ALAC", operation: "decoding", reason: "portable lossless decoding is unavailable",
@@ -570,7 +600,10 @@ fn parse_caf(file: &mut File, path: &Path, length: u64) -> Result<ParsedPcm, Cod
     let mut offset = 8u64;
     let mut format = None;
     let mut data = None;
+    let mut seen = 0usize;
     while offset.checked_add(12).is_some_and(|n| n <= length) {
+        seen += 1;
+        if seen > MAX_SCANNED_BOXES { return Err(CodecError::UnsupportedFormat("CAF with more chunks than are scanned")); }
         let mut chunk = [0u8; 12];
         read_at(file, offset, &mut chunk, path)?;
         let raw_size = i64::from_be_bytes(chunk[4..12].try_into().expect("CAF chunk size"));
@@ -619,9 +652,6 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
     let aiff = (&header[..4] == b"FORM" && &header[8..12] == b"AIFF") || aifc;
     if !wav && !aiff {
         if &header[4..8] == b"ftyp" { return Err(unsupported_mp4(file, path, length)?); }
-        if is_adts_aac(header) {
-            return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" });
-        }
         // `Reader::open` sends everything that is not PCM, MP4 or ADTS to the MP3 reader first.
         return Err(CodecError::UnsupportedFormat("expected uncompressed RIFF/WAVE or AIFF PCM"));
     }
@@ -666,7 +696,7 @@ fn parse_pcm(file: &mut File, path: &Path, length: u64, header: &[u8; 12]) -> Re
                 (0x02, 4) => Encoding::WavMs,
                 (0x31, _) if !extensible || gsm_extensible_supported => Encoding::WavGsm,
                 (0x55, _) => return Err(CodecError::UnsupportedCodec { codec: "MP3", operation: "decoding", reason: "MP3 inside a WAVE container is not reproduced; only elementary MP3 streams are" }),
-                (0xff, _) => return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" }),
+                (0xff, _) => return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "AAC inside a WAVE container is not reproduced; only AAC files and elementary streams are" }),
                 _ => return Err(CodecError::UnsupportedFormat("WAVE encoding or bit depth has not been reproduced")),
             };
             if channels == 0 || rate == 0.0 { return Err(CodecError::InvalidInput("invalid WAVE sample rate or channel count")); }
@@ -834,6 +864,7 @@ pub struct Reader {
     packets: Option<PacketState>,
     alac: Option<AlacReadState>,
     mp3: Option<Box<Mp3ReadState>>,
+    aac: Option<Box<aac_read::AacReadState>>,
 }
 impl Reader {
     pub fn open(path: impl AsRef<Path>, sample_rate: Option<f64>) -> Result<Self, CodecError> {
@@ -848,18 +879,50 @@ impl Reader {
         // extension commits to the MPEG audio types: whatever the content is (a WAVE, an MP4, ADTS, FLAC or random bytes),
         // only the MPEG reader looks at it, and its refusal is final. Any other name leaves the choice to the content.
         if has_mpeg_extension(path) { return Self::open_mp3(file, path, length, sample_rate); }
+        // `.aac .adts .loas .latm` commit to the ADTS / LOAS types the same way: whatever the content is, only those parsers look at it.
+        if aac_read::has_adts_extension(path) { return Self::open_aac(file, path, length, sample_rate); }
+        // `.ogg .oga .opus` commit to the Ogg types, which fail `'dta?'` on anything that is not an Ogg stream, and `.sd2` to Sound Designer II, which
+        // fails with an end-of-file error on every file that is not empty.
+        if length != 0 {
+            if aac_read::has_ogg_extension(path) {
+                let mut magic = [0u8; 4];
+                read_at(&mut file, 0, &mut magic[..length.min(4) as usize], path)?;
+                if &magic != b"OggS" { return Err(open_refusal(DTA)); }
+            } else if aac_read::has_extension(path, "sd2") {
+                return Err(open_refusal(END_OF_FILE));
+            }
+        }
         let skipped = leading_tag_length(&mut file, length, path)?;
         if skipped != 0 { return Self::open_behind_tags(file, path, length, skipped, sample_rate); }
         let mut header = [0u8; 12]; read_prefix(&mut file, &mut header, path)?;
+        // A `.mov` name commits AudioFile to its QuickTime type, which refuses every file that is not an MP4 / QuickTime one.
+        if length != 0 && aac_read::has_extension(path, "mov") && !matches!(&header[4..8], b"ftyp" | b"moov" | b"free" | b"wide" | b"mdat") {
+            return Err(open_refusal(NOT_QUICKTIME));
+        }
         if matches!(&header[4..8], b"ftyp" | b"moov" | b"free" | b"wide" | b"mdat") {
+            // The sample entry of the first sound track decides the reader: AAC is decoded by the AAC reader, everything else is judged as before.
+            if aac_read::first_sound_entry_is_mp4a(&mut file, length) { return Self::open_aac(file, path, length, sample_rate); }
             let info = match mp4::read_alac(&mut file) {
                 Ok(info) => info,
                 Err(error) => {
-                    let reason = unsupported_mp4(&mut file, path, length)?;
-                    return Err(match reason {
-                        CodecError::UnsupportedCodec { codec: "ALAC", .. } => CodecError::Mp4Read(error),
-                        other => other,
-                    });
+                    // A container that is damaged for any codec fails as AudioToolbox says; whatever else is wrong with the file is described as before.
+                    let reason = match unsupported_mp4(&mut file, path, length) {
+                        Ok(reason) => reason,
+                        Err(failure) => return Err(match aac_read::container_verdict(&mut file, path, length) {
+                            aac_read::Verdict::Status(status) => status,
+                            aac_read::Verdict::Aac => return Self::open_aac(file, path, length, sample_rate),
+                            aac_read::Verdict::Silent => failure,
+                        }),
+                    };
+                    let alac = matches!(reason, CodecError::UnsupportedCodec { codec: "ALAC", .. });
+                    if !alac {
+                        match aac_read::container_verdict(&mut file, path, length) {
+                            aac_read::Verdict::Status(status) => return Err(status),
+                            aac_read::Verdict::Aac => return Self::open_aac(file, path, length, sample_rate),
+                            aac_read::Verdict::Silent => {}
+                        }
+                    }
+                    return Err(if alac { CodecError::Mp4Read(error) } else { reason });
                 }
             };
             let config = info.config;
@@ -891,12 +954,23 @@ impl Reader {
             let client = client_format(rate, source.channels_per_frame, false)?;
             let frames = info.frames;
             return Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Alac,
-                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)), mp3: None });
+                frames, position: 0, raw: Vec::new(), packets: None, alac: Some(AlacReadState::new(info)), mp3: None, aac: None });
         }
-        if !is_pcm_container(&header) && !adts_sniff(&header, length) {
+        if &header[..4] == b"caff" && aac_read::caf_format_is_aac(&mut file, length) { return Self::open_aac(file, path, length, sample_rate); }
+        if adts_sniff(&header, length) { return Self::open_aac(file, path, length, sample_rate); }
+        if !is_pcm_container(&header) {
             return Self::open_unrecognised(file, path, length, &header, sample_rate);
         }
-        let parsed = parse_pcm(&mut file, path, length, &header)?;
+        let parsed = match parse_pcm(&mut file, path, length, &header) {
+            Ok(parsed) => parsed,
+            // a CAF that is damaged for any codec fails as AudioToolbox says
+            Err(error) if &header[..4] == b"caff" => return Err(match aac_read::container_verdict(&mut file, path, length) {
+                aac_read::Verdict::Status(status) => status,
+                aac_read::Verdict::Aac => return Self::open_aac(file, path, length, sample_rate),
+                aac_read::Verdict::Silent => error,
+            }),
+            Err(error) => return Err(error),
+        };
         let rate = same_rate(parsed.source.sample_rate, sample_rate)?;
         let client = client_format(rate, parsed.source.channels_per_frame, false)?;
         file.seek(SeekFrom::Start(parsed.data_offset)).map_err(|e| io_error("seek audio data", path, e))?;
@@ -910,16 +984,18 @@ impl Reader {
             _ => None,
         };
         Ok(Self { file, path: path.to_owned(), source: parsed.source, client, encoding: parsed.encoding,
-            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None, mp3: None })
+            frames: parsed.frames, position: 0, raw: Vec::new(), packets, alac: None, mp3: None, aac: None })
     }
     pub fn source_format(&self) -> StreamDescription { self.source }
     pub fn client_format(&self) -> StreamDescription { self.client }
     pub fn file_length_frames(&self) -> Result<i64, CodecError> {
         if let Some(mp3) = &self.mp3 { return Ok(mp3.reader.file_length_frames()); }
+        if self.aac.is_some() { return self.aac_file_length_frames(); }
         i64::try_from(self.frames).map_err(|_| CodecError::InvalidInput("frame count exceeds i64"))
     }
     pub fn bitrate(&self) -> Result<u32, CodecError> {
         if let Some(mp3) = &self.mp3 { return Ok(mp3.reader.bitrate()); }
+        if self.aac.is_some() { return self.aac_bitrate(); }
         if let Some(alac) = &self.alac {
             return alac.bitrate.ok_or(CodecError::InvalidInput("ALAC bitrate exceeds u32"));
         }
@@ -929,8 +1005,8 @@ impl Reader {
         Ok(value as u32)
     }
     pub fn set_stereo_planar(&mut self, sample_rate: f64) -> Result<(), CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
-        let rate = same_rate(self.source.sample_rate, Some(sample_rate))?;
+        if self.poisoned() { return Err(CodecError::Poisoned); }
+        let rate = if self.aac.is_some() { self.aac_set_stereo_planar(sample_rate)? } else { same_rate(self.source.sample_rate, Some(sample_rate))? };
         self.client = client_format(rate, 2, true)?;
         Ok(())
     }
@@ -1015,13 +1091,14 @@ impl Reader {
     /// Read complete interleaved frames; the unused output tail is untouched (an MP3 read that reaches the end of the valid
     /// frames fills it with the decoder's padding, as AudioToolbox does).
     pub fn read(&mut self, output: &mut [f32]) -> Result<usize, CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
+        if self.poisoned() { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 != 0 { return Err(CodecError::InvalidInput("use read_stereo_planar for a planar reader")); }
         let channels = self.source.channels_per_frame as usize;
         if output.len() % channels != 0 { return Err(CodecError::InvalidInput("buffer does not contain whole interleaved frames")); }
         if output.len().checked_mul(4).is_none_or(|n| n > u32::MAX as usize) { return Err(CodecError::InvalidInput("buffer is too large")); }
         if self.alac.is_some() { return self.read_alac(output, None); }
         if self.mp3.is_some() { return self.read_mp3(output, None); }
+        if self.aac.is_some() { return self.read_aac(output, None); }
         if self.packets.is_some() { return self.read_packets(output, None); }
         let frames = self.fetch(output.len() / channels)?;
         let width = self.encoding.width();
@@ -1034,12 +1111,13 @@ impl Reader {
     /// ALAC follows the verified default layout's left/right channel positions. The unused tail is untouched, except for an
     /// MP3 read that reaches the end of the valid frames (see [`Reader::read`]).
     pub fn read_stereo_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize, CodecError> {
-        if self.alac.as_ref().is_some_and(|state| state.failed) || self.mp3.as_ref().is_some_and(|state| state.failed) { return Err(CodecError::Poisoned); }
+        if self.poisoned() { return Err(CodecError::Poisoned); }
         if self.client.format_flags & 0x20 == 0 { return Err(CodecError::InvalidInput("reader is not configured for planar stereo")); }
         if left.len() != right.len() { return Err(CodecError::InvalidInput("stereo plane lengths differ")); }
         if left.len().checked_mul(4).is_none_or(|n| n > u32::MAX as usize) { return Err(CodecError::InvalidInput("stereo plane is too large")); }
         if self.alac.is_some() { return self.read_alac(left, Some(right)); }
         if self.mp3.is_some() { return self.read_mp3(left, Some(right)); }
+        if self.aac.is_some() { return self.read_aac(left, Some(right)); }
         if self.packets.is_some() { return self.read_packets(left, Some(right)); }
         let frames = self.fetch(left.len())?;
         let width = self.encoding.width();
@@ -1073,7 +1151,7 @@ fn is_pcm_container(header: &[u8; 12]) -> bool {
 }
 
 /// ADTS framing: a 12-bit sync and layer bits 00, which no MPEG audio layer
-/// uses. AAC has no portable decoder.
+/// uses.
 fn is_adts_aac(header: &[u8; 12]) -> bool { header[0] == 0xff && header[1] & 0xf6 == 0xf0 }
 
 /// AudioFile's ADTS answer when the file starts with ADTS framing: `'typ?'` unless the header can belong to a stream. Fitted on
@@ -1087,7 +1165,7 @@ fn adts_sniff(header: &[u8; 12], remaining: u64) -> bool {
 
 /// File name extensions that make AudioFile choose its MPEG audio types (`.mp1 .mp2 .mp3 .mpa .mpeg`, any case). Observed on
 /// macOS 27.2 with random data: these answer `'dta?'`, the names the engine hands to this reader otherwise `'typ?'`
-/// (`.ogg .oga .opus` also commit, to the Ogg types, and `.aac .adts` to ADTS; the engine never opens those names here).
+/// (`.ogg .oga .opus` also commit, to the Ogg types, and `.aac .adts`, `.loas .latm` to the ADTS and LOAS types the AAC reader opens).
 fn has_mpeg_extension(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         let extension = extension.as_encoded_bytes();
@@ -1097,17 +1175,24 @@ fn has_mpeg_extension(path: &Path) -> bool {
 
 const DTA: i32 = 0x6474_613f; // 'dta?': recognised as a type, but the data does not open
 const TYP: i32 = 0x7479_703f; // 'typ?': no file type recognises the data
+const END_OF_FILE: i32 = -39; // `kAudioFileEndOfFileError`
+const NOT_QUICKTIME: i32 = -12_848; // a `.mov` name with data that is not an MP4 / QuickTime file (observed on macOS 27.2)
 fn open_refusal(status: i32) -> CodecError { CodecError::Native { operation: "ExtAudioFileOpenURL", status } }
 
 /// Bytes of leading ID3v2 and ID3v1 blocks, which AudioFile steps over before it identifies the format (same size rule as
-/// the MPEG container: `ID3` + syncsafe size + 10 without footer, `TAG` 128). May exceed the length of the file.
+/// the MPEG container: `ID3` + syncsafe size + 10 without footer, `TAG` 128). May exceed the length of the file.  The heads are read through a window of the
+/// file: a chain of empty tags costs a read per window, not per tag.
 fn leading_tag_length(file: &mut File, length: u64, path: &Path) -> Result<u64, CodecError> {
     let mut offset = 0u64;
-    for _ in 0..1_000_000 {
+    let mut window = aac_read::Window::new(file);
+    for _ in 0..crate::portable::aac::decoder::MAX_TAG_BLOCKS {
         if offset >= length { break; }
         let wanted = (length - offset).min(10) as usize;
         let mut head = [0u8; 10];
-        read_at(file, offset, &mut head[..wanted], path)?;
+        match window.at(offset, wanted) {
+            Some(bytes) => head[..wanted].copy_from_slice(bytes),
+            None => return Err(io_error("read audio", path, io::Error::from(io::ErrorKind::UnexpectedEof))),
+        }
         let size = mp3::container::id3_size(&head[..wanted]);
         if size == 0 { break; }
         offset = offset.saturating_add(size as u64);
@@ -1118,7 +1203,7 @@ fn leading_tag_length(file: &mut File, length: u64, path: &Path) -> Result<u64, 
 /// What AudioFile's per-type content sniffing makes of the data at the start of a file (or behind its leading tags) whose
 /// name carries no MPEG audio extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Content { Adts, Flac, Ogg, Wave, Aiff, Caf, Mp4, Mpeg, Unknown }
+enum Content { Adts, Loas, Flac, Ogg, Wave, Aiff, Caf, Mp4, Mpeg, Unknown }
 
 /// `remaining` is the number of bytes from the start of `header` to the end of the file. The MPEG types answer yes to a
 /// valid layer I/II/III frame header in the first four bytes (`MPEGAudioFormat::FileDataIsThisFormat`) and to nothing at
@@ -1126,6 +1211,7 @@ enum Content { Adts, Flac, Ogg, Wave, Aiff, Caf, Mp4, Mpeg, Unknown }
 fn identify(header: &[u8; 12], remaining: u64) -> Content {
     if remaining == 0 { return Content::Mpeg; }
     if adts_sniff(header, remaining) { return Content::Adts; }
+    if header[0] == 0x56 && header[1] & 0xe0 == 0xe0 { return Content::Loas; }
     if header.starts_with(b"fLaC") { return Content::Flac; }
     if header.starts_with(b"OggS") { return Content::Ogg; }
     if &header[..4] == b"RIFF" && &header[8..12] == b"WAVE" { return Content::Wave; }
@@ -1136,9 +1222,6 @@ fn identify(header: &[u8; 12], remaining: u64) -> Content {
     Content::Unknown
 }
 
-fn aac_refusal() -> CodecError {
-    CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", reason: "Apple's decoder output is not reproducible" }
-}
 fn flac_refusal() -> CodecError {
     CodecError::UnsupportedCodec { codec: "FLAC", operation: "decoding", reason: "AudioToolbox's own FLAC reader, used for a FLAC stream whose file name does not end in flac, is not reproduced" }
 }
@@ -1189,7 +1272,7 @@ impl Reader {
         // it does not read from).
         Ok(Self { file, path: path.to_owned(), source, client, encoding: Encoding::Float32 { big_endian: false },
             frames: 0, position: 0, raw: Vec::new(), packets: None, alac: None,
-            mp3: Some(Box::new(Mp3ReadState { reader, scratch: Vec::new(), failed: false })) })
+            mp3: Some(Box::new(Mp3ReadState { reader, scratch: Vec::new(), failed: false })), aac: None })
     }
     /// A file with no MPEG audio extension whose start is not WAVE, AIFF, CAF, MP4 or ADTS: what is left of AudioFile's
     /// content sniffing is FLAC and Ogg (typed refusals: AudioToolbox decodes them, this port does not), the MPEG types
@@ -1197,14 +1280,15 @@ impl Reader {
     fn open_unrecognised(file: File, path: &Path, length: u64, header: &[u8; 12], sample_rate: Option<f64>) -> Result<Self, CodecError> {
         match identify(header, length) {
             Content::Mpeg => Self::open_mp3(file, path, length, sample_rate),
+            Content::Loas => Self::open_aac(file, path, length, sample_rate),
             Content::Flac => Err(flac_refusal()),
             Content::Ogg => Err(ogg_refusal()),
             _ => Err(open_refusal(TYP)),
         }
     }
     /// The same for a file that starts with ID3v2/ID3v1 blocks (`skipped` bytes), which AudioFile steps over before it sniffs.
-    /// ADTS, FLAC, Ogg and WAVE are then still opened by AudioToolbox (the first three are refused as above, WAVE because
-    /// its parser here starts at the first byte); AIFF, CAF and MP4 are sniffed but do not open (`'dta?'`).
+    /// ADTS and LOAS are then decoded by the AAC reader, FLAC and Ogg are refused as above, and WAVE data is refused too (its parser here starts at
+    /// the first byte); AIFF, CAF and MP4 are sniffed but do not open (`'dta?'`).
     fn open_behind_tags(file: File, path: &Path, length: u64, skipped: u64, sample_rate: Option<f64>) -> Result<Self, CodecError> {
         let remaining = length.saturating_sub(skipped);
         let mut header = [0u8; 12];
@@ -1213,9 +1297,11 @@ impl Reader {
             let wanted = remaining.min(12) as usize;
             read_at(&mut file, skipped, &mut header[..wanted], path)?;
         }
-        match identify(&header, remaining) {
+        let content = identify(&header, remaining);
+        if remaining != 0 && content != Content::Mp4 && aac_read::has_extension(path, "mov") { return Err(open_refusal(NOT_QUICKTIME)); }
+        match content {
             Content::Mpeg => Self::open_mp3(file, path, length, sample_rate),
-            Content::Adts => Err(aac_refusal()),
+            Content::Adts | Content::Loas => Self::open_aac(file, path, length, sample_rate),
             Content::Flac => Err(flac_refusal()),
             Content::Ogg => Err(ogg_refusal()),
             Content::Wave => Err(CodecError::UnsupportedFormat("RIFF/WAVE data behind a leading ID3 tag has not been reproduced")),
@@ -1432,14 +1518,15 @@ impl Workspace {
         self.identity = Some(file);
         self.identity.as_ref().unwrap().try_clone().map_err(|e| io_error("pin codec file", &self.file, e))
     }
-    fn open_packet_file(&mut self) -> Result<File, CodecError> {
-        let mut path = self.directory.join(".pn-alac-packets");
-        if path == self.file { path = self.directory.join(".pn-alac-packets-1"); }
+    /// The one private spool file of a codec that cannot hold its output in memory: `name` inside the workspace (`-1` appended if it is the output's name).
+    fn open_spool(&mut self, name: &str, create: &'static str, pin: &'static str) -> Result<File, CodecError> {
+        let mut path = self.directory.join(name);
+        if path == self.file { path = self.directory.join(format!("{name}-1")); }
         let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)
-            .map_err(|e| io_error("create ALAC packet spool", &path, e))?;
+            .map_err(|e| io_error(create, &path, e))?;
         self.auxiliary = Some((path, file));
         let (path, file) = self.auxiliary.as_ref().unwrap();
-        file.try_clone().map_err(|e| io_error("pin ALAC packet spool", path, e))
+        file.try_clone().map_err(|e| io_error(pin, path, e))
     }
     fn check_identity(path: &Path, identity: Option<&File>) -> io::Result<()> {
         let metadata = fs::symlink_metadata(path)?;
@@ -1482,7 +1569,9 @@ fn with_workspace_cleanup(primary: CodecError, workspace: &mut Workspace) -> Cod
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, CodecError> {
-    if path.as_os_str().is_empty() { return Err(CodecError::InvalidInput("path is empty")); }
+    if path.as_os_str().as_encoded_bytes().is_empty() || path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(CodecError::InvalidInput("path is empty or contains NUL"));
+    }
     if path.is_absolute() { Ok(path.to_owned()) }
     else { std::env::current_dir().map(|dir| dir.join(path)).map_err(|e| io_error("resolve output", path, e)) }
 }
@@ -1573,41 +1662,190 @@ fn alac_config(config: WriterConfig) -> Result<alac::Config, CodecError> {
 
 struct AlacWriteState {
     config: alac::Config,
-    encoder: alac::Encoder,
+    stream: alac::Stream,
     spool: File,
     spool_path: PathBuf,
-    pending: Vec<i32>,
-    encoded: Vec<u8>,
+    quantized: Vec<i32>,
     packets: Vec<mp4::EncodedPacket>,
+    /// Set when the stream is closed: AudioToolbox's tally over all encode attempts, for the cookie.
+    stats: alac::AttemptStats,
 }
 impl AlacWriteState {
     fn new(config: alac::Config, workspace: &mut Workspace) -> Result<Self, CodecError> {
-        let encoder = alac::Encoder::new(config).map_err(CodecError::AlacEncode)?;
-        let spool = workspace.open_packet_file()?;
+        let stream = alac::Stream::new(config).map_err(CodecError::AlacEncode)?;
+        let spool = workspace.open_spool(".pn-alac-packets", "create ALAC packet spool", "pin ALAC packet spool")?;
         let spool_path = workspace.auxiliary.as_ref().expect("created packet spool").0.clone();
-        Ok(Self { config, encoder, spool, spool_path,
-            pending: Vec::with_capacity(4096 * usize::from(config.channels)), encoded: Vec::new(), packets: Vec::new() })
+        Ok(Self { config, stream, spool, spool_path, quantized: Vec::new(), packets: Vec::new(), stats: alac::AttemptStats::default() })
     }
-    fn flush_packet(&mut self) -> Result<(), CodecError> {
-        let frames = self.pending.len() / usize::from(self.config.channels);
-        self.encoder.encode_packet_into(&self.pending, &mut self.encoded).map_err(CodecError::AlacEncode)?;
-        let size = u32::try_from(self.encoded.len()).map_err(|_| CodecError::InvalidInput("ALAC packet exceeds u32"))?;
-        self.spool.write_all(&self.encoded).map_err(|e| io_error("write ALAC packet spool", &self.spool_path, e))?;
-        self.packets.push(mp4::EncodedPacket { size, frames: frames as u32 });
-        self.pending.clear();
+    /// Append one packet of the stream to the spool and the packet table.
+    fn store(spool: &mut File, spool_path: &Path, packets: &mut Vec<mp4::EncodedPacket>, packet: &[u8], frames: u32) -> Result<(), CodecError> {
+        let size = u32::try_from(packet.len()).map_err(|_| CodecError::InvalidInput("ALAC packet exceeds u32"))?;
+        spool.write_all(packet).map_err(|e| io_error("write ALAC packet spool", spool_path, e))?;
+        packets.push(mp4::EncodedPacket { size, frames });
         Ok(())
     }
-    fn write(&mut self, mut input: &[f32]) -> Result<(), CodecError> {
-        let capacity = 4096 * usize::from(self.config.channels);
-        while !input.is_empty() {
-            let count = input.len().min(capacity - self.pending.len());
-            let start = self.pending.len();
-            self.pending.resize(start + count, 0);
-            alac::quantize_into(&input[..count], self.config.bit_depth, &mut self.pending[start..]).map_err(CodecError::AlacEncode)?;
-            input = &input[count..];
-            if self.pending.len() == capacity { self.flush_packet()?; }
+    /// One write call. AudioToolbox encodes (and, for an oversized packet, re-encodes) per call, so the call boundary is
+    /// handed to the stream; the audio itself is quantized and queued a packet at a time.
+    fn write(&mut self, input: &[f32]) -> Result<(), CodecError> {
+        if input.is_empty() { return Ok(()); }
+        let Self { config, stream, spool, spool_path, quantized, packets, .. } = self;
+        let mut emit = |packet: &[u8], frames: u32| Self::store(spool, spool_path, packets, packet, frames);
+        stream.begin_call();
+        for chunk in input.chunks(4096 * usize::from(config.channels)) {
+            quantized.resize(chunk.len(), 0);
+            alac::quantize_into(chunk, config.bit_depth, quantized).map_err(CodecError::AlacEncode)?;
+            stream.push(quantized, &mut emit).map_err(Self::error)?;
         }
         Ok(())
+    }
+    /// Close the stream: the last packet, and the finalization packet after an exact multiple of 4096 frames.
+    fn finish(&mut self) -> Result<(), CodecError> {
+        let Self { stream, spool, spool_path, packets, stats, .. } = self;
+        *stats = stream.finish(&mut |packet: &[u8], frames: u32| Self::store(spool, spool_path, packets, packet, frames)).map_err(Self::error)?;
+        Ok(())
+    }
+    fn error(error: alac::StreamError<CodecError>) -> CodecError {
+        match error { alac::StreamError::Encode(e) => CodecError::AlacEncode(e), alac::StreamError::Sink(e) => e }
+    }
+}
+
+/// OSStatus values AudioToolbox answers for an AAC output its converter cannot serve: `'fmt?'` (no such format), `paramErr`, and `'!dat'` (`'brat'` 256000
+/// is above the converter's maximum for the format).
+const FORMAT_NOT_SUPPORTED: i32 = 0x666d_743f;
+const PARAM_ERROR: i32 = -50;
+const BIT_RATE_REFUSED: i32 = 0x2164_6174;
+const CLIENT_FORMAT: &str = "ExtAudioFileSetProperty(client format)";
+
+/// What the macOS writer does with an AAC output of this rate and channel count. Measured on macOS: every integer rate from 1 to 200,000 Hz on 1 to 8
+/// channels, the edges of the rate windows, the grid in `tests/fixtures/aac-encode`, and the region around 3,000,000 Hz (2,999,998 to 3,000,001 Hz, the
+/// neighbouring doubles of 3,000,000, and 250,000 and 1,000,000 Hz, on 0 to 1,025 channels; the `create` command of `encode_probe` re-measures it).
+/// AudioToolbox serves the request as one of nine AAC sample rates when it lies within 10 Hz of it and the channel count is 1 to 8, and takes `'brat'`
+/// 256000 for the formats listed at [`aac::encoder::accepts`]. Everything else is a native failure: of `ExtAudioFileCreateWithURL` (`'fmt?'` for a rate
+/// above 3,000,000 Hz) or of the client-format property (`paramErr` for exactly 3,000,000 Hz and for more than 1,024 channels, `'fmt?'` otherwise).
+enum AacPlan {
+    /// An exact AAC rate and channel count the encoder reproduces.
+    Encode { rate: u32 },
+    /// The converter exists but took no 256 kbit/s: the macOS writer carries a `'!dat'` warning, its first write of a frame fails with that status and a stream of no
+    /// frames is its default-bitrate empty file.
+    BitrateRefused { rate: u32 },
+}
+
+fn aac_plan(rate: f64, channels: u32) -> Result<AacPlan, CodecError> {
+    let native = |operation, status| CodecError::Native { operation, status };
+    if rate > 3_000_000.0 { return Err(native("ExtAudioFileCreateWithURL", FORMAT_NOT_SUPPORTED)); }
+    // exactly 3,000,000 Hz fails the client format with paramErr, whatever the channel count; below it only more than 1,024 channels does
+    if rate == 3_000_000.0 || channels > 1024 { return Err(native(CLIENT_FORMAT, PARAM_ERROR)); }
+    let Some(nominal) = aac::encoder::nominal_rate(rate).filter(|_| channels <= aac::encoder::MAX_CHANNELS) else {
+        return Err(native(CLIENT_FORMAT, FORMAT_NOT_SUPPORTED));
+    };
+    // AudioToolbox creates the converter for a rate near an AAC rate and rounds the file to it, but its access units follow the exact rate
+    if rate != f64::from(nominal) {
+        return Err(CodecError::UnsupportedFormat(if rate.fract() != 0.0 { "fractional AAC sample rates are not reproduced" }
+            else { "AAC output is reproduced only at the exact sample rates 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100 and 48000 Hz" }));
+    }
+    match aac::encoder::accepts(nominal, channels) {
+        Ok(()) => Ok(AacPlan::Encode { rate: nominal }),
+        Err(aac::encoder::ConfigError::Refused { .. }) => Ok(AacPlan::BitrateRefused { rate: nominal }),
+        Err(_) => Err(CodecError::UnsupportedFormat("AAC encoder configuration")),
+    }
+}
+
+/// Frames per slice of an AAC write (16 blocks of 1024): the most the encoder's queue holds before it is drained.
+const AAC_WRITE_SLICE_FRAMES: usize = 16 * 1024;
+
+/// AAC output: the encoder, and its access units spooled to the workspace as they appear (only their sizes stay in memory) until the container can be written.
+struct AacWriteState {
+    rate: u32,
+    channels: u32,
+    /// `None` for a converter that refused 256 kbit/s.
+    stream: Option<AacStream>,
+}
+struct AacStream {
+    encoder: aac::encoder::AacEncoder,
+    spool: File,
+    spool_path: PathBuf,
+    /// the size of every access unit spooled so far
+    au_sizes: Vec<u32>,
+    /// the bytes spooled so far
+    bytes: u64,
+    /// test hook: the spool write of the access unit with this index fails with ENOSPC
+    #[cfg(test)]
+    spool_fault_at: Option<usize>,
+}
+impl AacStream {
+    /// Move the access units the encoder has finished to the spool; a stream the container cannot hold fails as soon as it grows past the limit.
+    fn spool_units(&mut self, rate: u32) -> Result<(), CodecError> {
+        #[cfg(test)]
+        let fault_at = self.spool_fault_at;
+        let Self { encoder, spool, spool_path, au_sizes, bytes, .. } = self;
+        encoder.drain_access_units(|unit| {
+            let size = u32::try_from(unit.len()).map_err(|_| CodecError::AacContainer(aac::mp4::Mp4Error::FileTooLarge))?;
+            #[cfg(test)]
+            if fault_at == Some(au_sizes.len()) {
+                return Err(io_error("write AAC access-unit spool", spool_path, io::Error::from_raw_os_error(28)));
+            }
+            spool.write_all(unit).map_err(|e| io_error("write AAC access-unit spool", spool_path, e))?;
+            au_sizes.push(size);
+            *bytes += u64::from(size);
+            aac::mp4::check_limits(rate, au_sizes.len() as u64, *bytes).map_err(CodecError::AacContainer)
+        })
+    }
+}
+impl AacWriteState {
+    fn new(plan: AacPlan, channels: u32, workspace: &mut Workspace) -> Result<Self, CodecError> {
+        match plan {
+            AacPlan::BitrateRefused { rate } => Ok(Self { rate, channels, stream: None }),
+            AacPlan::Encode { rate } => {
+                let encoder = aac::encoder::AacEncoder::new(rate, channels).map_err(|_| CodecError::UnsupportedFormat("AAC encoder configuration"))?;
+                let spool = workspace.open_spool(".pn-aac-units", "create AAC access-unit spool", "pin AAC access-unit spool")?;
+                let spool_path = workspace.auxiliary.as_ref().expect("created access-unit spool").0.clone();
+                Ok(Self { rate, channels, stream: Some(AacStream { encoder, spool, spool_path, au_sizes: Vec::new(), bytes: 0,
+                    #[cfg(test)] spool_fault_at: None }) })
+            }
+        }
+    }
+    /// `Some` for the converter that refused 256 kbit/s: the status of its failures.
+    fn refusal(&self) -> Option<i32> { self.stream.is_none().then_some(BIT_RATE_REFUSED) }
+    /// Encode complete interleaved frames (not none), a slice at a time: the encoder's queue is drained into the spool after every slice, so the access
+    /// units waiting in memory stay bounded by the slice however large the buffer of the caller is.
+    fn write(&mut self, input: &[f32]) -> Result<(), CodecError> {
+        let rate = self.rate;
+        let Some(stream) = &mut self.stream else {
+            return Err(CodecError::Native { operation: "ExtAudioFileWrite", status: BIT_RATE_REFUSED });
+        };
+        // the slices are the ones the encoder cuts its input into itself: the access units do not depend on them
+        for part in input.chunks(AAC_WRITE_SLICE_FRAMES * self.channels as usize) {
+            stream.encoder.push_interleaved(part).map_err(CodecError::AacEncode)?;
+            stream.spool_units(rate)?;
+        }
+        Ok(())
+    }
+    /// Finish the stream and write the whole `.m4a` into `file` (the staged output, empty so far) with the close-time clock.
+    fn finish(&mut self, workspace: &Workspace, file: &mut File, frames: u64) -> Result<(), CodecError> {
+        let clock = mp4_close_time()?;
+        let output = &workspace.file;
+        file.seek(SeekFrom::Start(0)).map_err(|e| io_error("seek AAC output", output, e))?;
+        let mut out = io::BufWriter::with_capacity(256 * 1024, &mut *file);
+        let (rate, channels) = (self.rate, self.channels);
+        let (result, spool_path) = match &mut self.stream {
+            Some(stream) => {
+                stream.encoder.finish().map_err(CodecError::AacEncode)?;
+                stream.spool_units(rate)?;
+                let (path, identity) = workspace.auxiliary.as_ref().expect("AAC spool identity");
+                Workspace::check_identity(path, Some(identity)).map_err(|e| io_error("inspect AAC access-unit spool", path, e))?;
+                stream.spool.seek(SeekFrom::Start(0)).map_err(|e| io_error("rewind AAC access-unit spool", &stream.spool_path, e))?;
+                (aac::encoder::m4a::write_file(&mut out, &mut stream.spool, &stream.au_sizes, rate, channels, frames, clock), stream.spool_path.clone())
+            }
+            None => (aac::encoder::m4a::write_file(&mut out, &mut io::empty(), &[], rate, channels, frames, clock), PathBuf::new()),
+        };
+        result.map_err(|error| match error {
+            aac::mp4::WriteError::Layout(e) => CodecError::AacContainer(e),
+            aac::mp4::WriteError::Output(e) => io_error("write AAC output", output, e),
+            aac::mp4::WriteError::Source(e) => io_error("read AAC access-unit spool", &spool_path, e),
+        })?;
+        out.flush().map_err(|e| io_error("write AAC output", output, e))?;
+        drop(out);
+        file.sync_all().map_err(|e| io_error("sync AAC output", output, e))
     }
 }
 
@@ -1716,7 +1954,7 @@ fn patch_mp4_times_file(file: &mut File, seconds_since_1904: u32) -> io::Result<
     Ok(2 + tracks.len() * 4)
 }
 
-/// Synchronous WAV, AIFF and bounded ALAC writer with no-replace publication.
+/// Synchronous WAV, AIFF, ALAC and AAC writer with no-replace publication.
 ///
 /// WAVE/AIFF comparisons cover 16/24/32-bit files, 1/2/6 channels, all six
 /// requested rates, boundary frames and random float inputs. The extended
@@ -1725,16 +1963,42 @@ fn patch_mp4_times_file(file: &mut File, seconds_since_1904: u32) -> io::Result<
 /// rates 22,050..=96,000 and 1..=8 channels: reservation was checked for every
 /// integer in that interval, while fractional rates and full-file contents
 /// were sampled across both clock modes, bit depths and packet boundaries.
-/// See the `audio-01` and `alac-01` receipts for exact coverage.
-/// AAC and unverified ALAC rates are refused; oversized packets fail closed.
+/// See the `audio-01` and `alac-01` receipts for exact coverage. Unverified
+/// ALAC rates are refused; oversized packets fail closed.
+///
+/// AAC output is the encoder of [`aac::encoder`] and its `.m4a` container: the
+/// file AudioToolbox's `ExtAudioFile` writes for the engine's call sequence
+/// (`'brat'` 256000, write class A, generic tail), byte for byte except for the
+/// close-time clock. Every write size gives the same file, and a caller that
+/// writes in flush-to-zero mode gets AudioToolbox's file for that mode
+/// (subnormal input samples are flushed). The access units are
+/// spooled to the private workspace as they appear (a write of any size is
+/// encoded and drained a slice at a time) and the container is
+/// written when the writer finishes (its `moov` in front, or behind `mdat` for
+/// streams of more than about 300 seconds), so memory stays bounded; a stream
+/// that needs 64-bit offsets or a 64-bit duration fails closed. The spool and
+/// the staged output live in the same directory as the destination and exist
+/// side by side while the container is written, so the filesystem needs room
+/// for about twice the size of the stream. Finishing copies the spool into the
+/// container and cannot be cancelled in portable builds (the engine's cancel
+/// flag is not consulted between `finish` and the publication). Where the macOS
+/// writer was measured (see [`AacPlan`]), this writer answers as it does: the
+/// same native status where AudioToolbox cannot create the converter, the same
+/// `AacBitRateNotSet` warning (status `'!dat'`) where it takes no 256 kbit/s
+/// (its first write then fails with that status, as on macOS, and a writer that
+/// never writes still publishes Apple's default-bitrate empty file). Rates that
+/// AudioToolbox serves but rounds, including every fractional rate, are refused
+/// with [`CodecError::UnsupportedFormat`]: its access units follow the exact rate.
 pub struct Writer {
     file: Option<File>,
     workspace: Workspace,
     target: PathBuf,
     config: WriterConfig,
+    warnings: Vec<CodecWarning>,
     frames: u64,
     data_bytes: u64,
     alac: Option<AlacWriteState>,
+    aac: Option<AacWriteState>,
     failed: bool,
 }
 impl Writer {
@@ -1744,14 +2008,18 @@ impl Writer {
     fn create_impl(path: impl AsRef<Path>, config: WriterConfig,
         #[cfg(test)] fail_after_create: bool) -> Result<Self, CodecError> {
         if config.format == OutputFormat::Aac {
-            return Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "encoding", reason: "Apple's encoder output is not reproducible" });
+            // the order of the macOS writer's file description: rate, channel count (its checks come before the recorder depth), then the depth
+            if !config.sample_rate.is_finite() || config.sample_rate <= 0.0 {
+                return Err(CodecError::InvalidInput("sample rate must be positive and finite"));
+            }
+            if config.channels.checked_mul(4).is_none_or(|bytes| bytes == 0) { return Err(CodecError::InvalidInput("invalid channel count")); }
         }
         if !matches!(config.bit_depth, 0 | 16 | 24 | 32) {
             return Err(CodecError::InvalidInput("recorder bit depth must be 0, 16, 24 or 32"));
         }
         if config.channels == 0 { return Err(CodecError::InvalidInput("invalid channel count")); }
         let alac_config = if config.format == OutputFormat::Alac { Some(alac_config(config)?) } else { None };
-        let header = if alac_config.is_none() { Some(pcm_header(config, 0, 0)?) } else { None };
+        let header = if matches!(config.format, OutputFormat::Wav | OutputFormat::Aiff) { Some(pcm_header(config, 0, 0)?) } else { None };
         let target = absolute_path(path.as_ref())?;
         match fs::symlink_metadata(&target) {
             Ok(_) => return Err(io_error("create new output", &target, io::Error::new(io::ErrorKind::AlreadyExists, "output already exists"))),
@@ -1759,6 +2027,12 @@ impl Writer {
             Err(e) => return Err(io_error("inspect output", &target, e)),
         }
         let mut workspace = Workspace::create(&target)?;
+        let aac_plan = if config.format == OutputFormat::Aac {
+            match aac_plan(config.sample_rate, config.channels) {
+                Ok(plan) => Some(plan),
+                Err(error) => return Err(with_workspace_cleanup(error, &mut workspace)),
+            }
+        } else { None };
         let mut file = match workspace.open_file() {
             Ok(file) => file, Err(error) => return Err(with_workspace_cleanup(error, &mut workspace)),
         };
@@ -1775,10 +2049,16 @@ impl Writer {
         let alac = match alac_config.map(|config| AlacWriteState::new(config, &mut workspace)).transpose() {
             Ok(alac) => alac, Err(error) => { drop(file); return Err(with_workspace_cleanup(error, &mut workspace)); }
         };
-        Ok(Self { file: Some(file), workspace, target, config, frames: 0, data_bytes: 0, failed: false, alac })
+        let aac = match aac_plan.map(|plan| AacWriteState::new(plan, config.channels, &mut workspace)).transpose() {
+            Ok(aac) => aac, Err(error) => { drop(file); return Err(with_workspace_cleanup(error, &mut workspace)); }
+        };
+        let warnings = if aac.as_ref().and_then(AacWriteState::refusal).is_some() {
+            vec![CodecWarning::AacBitRateNotSet { status: BIT_RATE_REFUSED }]
+        } else { Vec::new() };
+        Ok(Self { file: Some(file), workspace, target, config, warnings, frames: 0, data_bytes: 0, failed: false, alac, aac })
     }
     pub fn config(&self) -> WriterConfig { self.config }
-    pub fn warnings(&self) -> &[CodecWarning] { &[] }
+    pub fn warnings(&self) -> &[CodecWarning] { &self.warnings }
     /// Append complete interleaved float32 frames.
     pub fn write(&mut self, input: &[f32]) -> Result<(), CodecError> {
         if self.failed { return Err(CodecError::Poisoned); }
@@ -1786,6 +2066,13 @@ impl Writer {
         if input.len() % channels != 0 { return Err(CodecError::InvalidInput("buffer does not contain whole interleaved frames")); }
         if input.len().checked_mul(4).is_none_or(|n| n > u32::MAX as usize) { return Err(CodecError::InvalidInput("buffer is too large")); }
         let frames = self.frames.checked_add((input.len() / channels) as u64).ok_or(CodecError::InvalidInput("frame count overflows"))?;
+        if let Some(aac) = &mut self.aac {
+            // like the macOS writer, an empty buffer never reaches the encoder
+            if input.is_empty() { return Ok(()); }
+            if let Err(error) = aac.write(input) { self.failed = true; return Err(error); }
+            self.frames = frames;
+            return Ok(());
+        }
         if let Some(alac) = &mut self.alac {
             if let Err(error) = alac.write(input) { self.failed = true; return Err(error); }
             self.frames = frames;
@@ -1821,16 +2108,27 @@ impl Writer {
         self.data_bytes = bytes;
         Ok(())
     }
+    /// The error of a writer that failed before: the macOS writer reports a converter that refused 256 kbit/s as unable to close.
+    fn poisoned(&self) -> CodecError {
+        match self.aac.as_ref().and_then(AacWriteState::refusal) {
+            Some(status) => CodecError::Cleanup { primary: Box::new(CodecError::Poisoned),
+                source: io::Error::other(CodecError::Native { operation: "ExtAudioFileDispose", status }) },
+            None => CodecError::Poisoned,
+        }
+    }
     fn finalize_data(&mut self) -> Result<(), CodecError> {
-        if self.failed { return Err(CodecError::Poisoned); }
-        if let Some(state) = &mut self.alac {
-            if self.frames != 0 { state.flush_packet()?; }
+        if self.failed { return Err(self.poisoned()); }
+        if let Some(state) = &mut self.aac {
+            let file = self.file.as_mut().expect("live AAC writer");
+            state.finish(&self.workspace, file, self.frames)?;
+        } else if let Some(state) = &mut self.alac {
+            state.finish()?;
             let (path, identity) = self.workspace.auxiliary.as_ref().expect("ALAC spool identity");
             Workspace::check_identity(path, Some(identity)).map_err(|e| io_error("inspect ALAC packet spool", path, e))?;
             state.spool.seek(SeekFrom::Start(0)).map_err(|e| io_error("rewind ALAC packet spool", &state.spool_path, e))?;
             let file = self.file.as_mut().expect("live ALAC writer");
             file.seek(SeekFrom::Start(0)).map_err(|e| io_error("seek ALAC output", &self.workspace.file, e))?;
-            mp4::write_alac_with_rate(file, &mut state.spool, state.config, self.config.sample_rate, &state.packets, 0).map_err(CodecError::Mp4Write)?;
+            mp4::write_alac_with_stats(file, &mut state.spool, state.config, self.config.sample_rate, &state.packets, state.stats, 0).map_err(CodecError::Mp4Write)?;
             let clock = mp4_close_time()?;
             patch_mp4_times_file(file, clock).map_err(|e| io_error("set ALAC close time", &self.workspace.file, e))?;
         } else {
@@ -1847,6 +2145,7 @@ impl Writer {
     fn discard_error(&mut self, primary: CodecError) -> CodecError {
         drop(self.file.take());
         drop(self.alac.take());
+        drop(self.aac.take());
         match self.workspace.cleanup() {
             Ok(()) => primary,
             Err(source) => CodecError::Cleanup { primary: Box::new(primary), source },
@@ -1858,6 +2157,7 @@ impl Writer {
         if let Err(error) = self.finalize_data() { return Err(self.discard_error(error)); }
         let file = self.file.take().expect("live codec output");
         drop(self.alac.take());
+        drop(self.aac.take());
         if let Err(error) = self.workspace.check_owned_file() {
             let error = io_error("inspect codec output before publication", &self.workspace.file, error);
             return Err(self.discard_error(error));
@@ -1874,15 +2174,26 @@ impl Writer {
         Ok(())
     }
     pub fn abort(mut self) -> Result<(), CodecError> {
+        // a converter that refused 256 kbit/s and then failed a write cannot be disposed of: the macOS writer reports that after removing its workspace
+        let dispose = if self.failed { self.aac.as_ref().and_then(AacWriteState::refusal) } else { None };
         drop(self.file.take());
         drop(self.alac.take());
-        self.workspace.cleanup().map_err(|e| io_error("remove codec workspace", &self.workspace.directory, e))
+        drop(self.aac.take());
+        let cleanup = self.workspace.cleanup();
+        match dispose {
+            Some(status) => {
+                let primary = CodecError::Native { operation: "ExtAudioFileDispose", status };
+                Err(match cleanup { Ok(()) => primary, Err(source) => CodecError::Cleanup { primary: Box::new(primary), source } })
+            }
+            None => cleanup.map_err(|e| io_error("remove codec workspace", &self.workspace.directory, e)),
+        }
     }
 }
 impl Drop for Writer {
     fn drop(&mut self) {
         drop(self.file.take());
         drop(self.alac.take());
+        drop(self.aac.take());
     }
 }
 
@@ -1894,7 +2205,7 @@ mod writer_ownership_tests {
     fn partial_initialization_and_registration_failures_cleanup_all_codecs() {
         let dir = std::env::temp_dir().join(format!("pn-portable-ownership-{}-{}", std::process::id(), NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir(&dir).unwrap();
-        for (format, name) in [(OutputFormat::Wav, "out.wav"), (OutputFormat::Aiff, "out.aiff"), (OutputFormat::Alac, "out.m4a")] {
+        for (format, name) in [(OutputFormat::Wav, "out.wav"), (OutputFormat::Aiff, "out.aiff"), (OutputFormat::Alac, "out.m4a"), (OutputFormat::Aac, "out.m4a")] {
             let path = dir.join(name);
             let config = WriterConfig { format, sample_rate: 48_000.0, channels: 2, bit_depth: 16 };
             assert!(Writer::create_impl(&path, config, true).is_err());
@@ -1907,6 +2218,394 @@ mod writer_ownership_tests {
             assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         }
         fs::remove_dir(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod aac_writer_tests {
+    use super::*;
+
+    /// A private directory that is removed on drop.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("pn-aac-writer-{}-{}", std::process::id(), NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+        fn target(&self) -> PathBuf { self.0.join("out.m4a") }
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(&self.0).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+        fn assert_empty(&self, what: &str) { assert_eq!(self.names(), Vec::<String>::new(), "{what}"); }
+    }
+    impl Drop for Scratch { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+
+    const CLOCK: u32 = 3_800_000_001;
+
+    fn config(rate: f64, channels: u32) -> WriterConfig { WriterConfig { format: OutputFormat::Aac, sample_rate: rate, channels, bit_depth: 0 } }
+
+    /// Deterministic interleaved test signal: one tone per channel and a little noise.
+    fn pcm(frames: usize, channels: usize) -> Vec<f32> {
+        let mut state = 0x9e37_79b9u32;
+        (0..frames * channels).map(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            0.2 * ((i / channels) as f32 * (0.03 + 0.005 * (i % channels) as f32)).sin() + 0.02 * ((state >> 9) as f32 / 8_388_608.0 - 1.0)
+        }).collect()
+    }
+
+    /// Write `data` in `block`-frame writes and return the published file with its clock fixed.
+    fn encode(scratch: &Scratch, config: WriterConfig, data: &[f32], block: usize) -> Vec<u8> {
+        let mut writer = Writer::create(scratch.target(), config).unwrap();
+        assert!(writer.warnings().is_empty());
+        for chunk in data.chunks(block * config.channels as usize) { writer.write(chunk).unwrap(); }
+        writer.finish().unwrap();
+        assert_eq!(scratch.names(), ["out.m4a"], "a finished writer leaves exactly its target");
+        set_mp4_header_times(&scratch.target(), CLOCK).unwrap();
+        let bytes = fs::read(scratch.target()).unwrap();
+        fs::remove_file(scratch.target()).unwrap();
+        bytes
+    }
+
+    fn top_level(file: &[u8]) -> Vec<String> {
+        let mut kinds = Vec::new();
+        let mut at = 0;
+        while at < file.len() {
+            kinds.push(String::from_utf8_lossy(&file[at + 4..at + 8]).into_owned());
+            at += be32(&file[at..at + 4]) as usize;
+        }
+        assert_eq!(at, file.len());
+        kinds
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn native(error: &CodecError) -> Option<(&'static str, i32)> {
+        if let CodecError::Native { operation, status } = error { Some((operation, *status)) } else { None }
+    }
+
+    #[test]
+    fn every_write_size_gives_the_same_file() {
+        let scratch = Scratch::new();
+        for (rate, channels, frames) in [(44_100.0, 2u32, 5000usize), (48_000.0, 6, 3000)] {
+            let data = pcm(frames, channels as usize);
+            let reference = encode(&scratch, config(rate, channels), &data, 512);
+            assert_eq!(top_level(&reference), ["ftyp", "moov", "free", "mdat"]);
+            for block in [1usize, 7, 1025, frames] {
+                assert_eq!(encode(&scratch, config(rate, channels), &data, block), reference, "{rate} Hz x {channels} ch in writes of {block} frames");
+            }
+        }
+    }
+
+    #[test]
+    fn the_file_describes_exactly_the_frames_written() {
+        let scratch = Scratch::new();
+        let file = encode(&scratch, config(44_100.0, 2), &pcm(4096, 2), 512);
+        let text = String::from_utf8_lossy(&file);
+        assert!(text.contains(" 00000000 00000840 000003C0 0000000000001000 "), "iTunSMPB: priming 2112, 960 frames of padding, 4096 valid frames");
+        let stsz = file.windows(4).position(|w| w == b"stsz").unwrap();
+        assert_eq!(u32_at(&file, stsz + 12), 7, "ceil((4096 + 2112) / 1024) access units");
+    }
+
+    #[test]
+    fn no_frame_written_publishes_apples_empty_file() {
+        let scratch = Scratch::new();
+        for (channels, length) in [(1u32, 557usize), (2, 557), (4, 564), (7, 557), (8, 557)] {
+            let mut writer = Writer::create(scratch.target(), config(44_100.0, channels)).unwrap();
+            writer.write(&[]).unwrap();
+            writer.finish().unwrap();
+            let file = fs::read(scratch.target()).unwrap();
+            assert_eq!(file.len(), length, "{channels} channels");
+            assert_eq!(top_level(&file), ["ftyp", "moov"]);
+            fs::remove_file(scratch.target()).unwrap();
+        }
+        scratch.assert_empty("after the empty files");
+    }
+
+    #[test]
+    fn creation_is_classified_like_the_macos_writer() {
+        let scratch = Scratch::new();
+        let create = |rate: f64, channels: u32| Writer::create(scratch.target(), config(rate, channels));
+        // the measured acceptance grid: 44.1/48 kHz 1..8, 32 kHz 3..8, 24/22.05 kHz 4..8, 16 kHz 7..8 take 256 kbit/s; the rest of the nine rates warn
+        for rate in aac::encoder::NOMINAL_RATES {
+            for channels in 1..=8u32 {
+                let writer = create(f64::from(rate), channels).unwrap();
+                let refused = aac::encoder::accepts(rate, channels).is_err();
+                let expected: &[CodecWarning] = if refused { &[CodecWarning::AacBitRateNotSet { status: 0x2164_6174 }] } else { &[] };
+                assert_eq!(writer.warnings(), expected, "{rate} Hz x {channels} ch");
+                writer.abort().unwrap();
+                scratch.assert_empty("after an abort");
+            }
+        }
+        // formats with no converter: the client-format property fails with 'fmt?', and for exactly 3,000,000 Hz or above 1,024 channels with paramErr
+        for (rate, channels, operation, status) in [
+            (7350.0, 2, CLIENT_FORMAT, 0x666d_743f), (64_000.0, 2, CLIENT_FORMAT, 0x666d_743f), (96_000.0, 1, CLIENT_FORMAT, 0x666d_743f), (1.0, 1, CLIENT_FORMAT, 0x666d_743f),
+            (44_100.0, 9, CLIENT_FORMAT, 0x666d_743f), (48_000.0, 64, CLIENT_FORMAT, 0x666d_743f), (44_100.0, 1024, CLIENT_FORMAT, 0x666d_743f), (44_100.0, 1025, CLIENT_FORMAT, -50),
+            (44_110.5, 2, CLIENT_FORMAT, 0x666d_743f), (43_989.9, 2, CLIENT_FORMAT, 0x666d_743f), (384_000.0, 2, CLIENT_FORMAT, 0x666d_743f),
+            (3_000_000.0, 2, CLIENT_FORMAT, -50), (3_000_000.5, 2, "ExtAudioFileCreateWithURL", 0x666d_743f), (1e300, 2, "ExtAudioFileCreateWithURL", 0x666d_743f),
+        ] {
+            let error = create(rate, channels).err().unwrap_or_else(|| panic!("{rate} Hz x {channels} ch was created"));
+            assert_eq!(native(&error), Some((operation, status)), "{rate} Hz x {channels} ch: {error:?}");
+            scratch.assert_empty("after a refused create");
+        }
+        // rates AudioToolbox serves as an AAC rate but encodes at the exact value: refused, never encoded as the nominal rate
+        for rate in [44_100.5, 44_099.99999, 44_100.00001, 47_999.999, 8_000.25] {
+            assert!(matches!(create(rate, 2), Err(CodecError::UnsupportedFormat(m)) if m.contains("fractional")), "{rate}");
+        }
+        for rate in [44_101.0, 44_090.0, 47_990.0, 8_010.0] {
+            assert!(matches!(create(rate, 2), Err(CodecError::UnsupportedFormat(m)) if m.contains("exact sample rates")), "{rate}");
+        }
+        scratch.assert_empty("after the refusals");
+    }
+
+    /// The cells measured with the macOS writer around its 3,000,000 Hz limit (`encode_probe create`): below the limit a rate with no converter fails the
+    /// client-format property with 'fmt?' (paramErr above 1,024 channels); exactly at it the property fails with paramErr whatever the channel count;
+    /// above it the create call fails with 'fmt?'.
+    #[test]
+    fn the_region_around_3_000_000_hz_is_classified_like_the_macos_writer() {
+        let scratch = Scratch::new();
+        let rates = [250_000.0, 1_000_000.0, 2_999_998.0, 2_999_999.0, 2_999_999.5, 2_999_999.999_999_999_5, 3_000_000.0, 3_000_000.000_000_001,
+            3_000_000.000_000_1, 3_000_000.5, 3_000_001.0];
+        for rate in rates {
+            for channels in [1u32, 2, 3, 4, 7, 8, 9, 16, 1024, 1025] {
+                let expected = if rate > 3_000_000.0 { ("ExtAudioFileCreateWithURL", 0x666d_743f) }
+                    else if rate == 3_000_000.0 || channels > 1024 { (CLIENT_FORMAT, -50) }
+                    else { (CLIENT_FORMAT, 0x666d_743f) };
+                let error = Writer::create(scratch.target(), config(rate, channels)).err().unwrap_or_else(|| panic!("{rate} Hz x {channels} ch was created"));
+                assert_eq!(native(&error), Some(expected), "{rate} Hz x {channels} ch: {error:?}");
+                scratch.assert_empty("after a refused create");
+            }
+        }
+    }
+
+    #[test]
+    fn create_checks_run_in_the_macos_order() {
+        let scratch = Scratch::new();
+        let target = scratch.target();
+        let message = |result: Result<Writer, CodecError>| match result { Err(CodecError::InvalidInput(m)) => m, other => panic!("{:?}", other.err()) };
+        let depth7 = |rate: f64, channels: u32| WriterConfig { bit_depth: 7, ..config(rate, channels) };
+        assert_eq!(message(Writer::create(&target, depth7(f64::NAN, 2))), "sample rate must be positive and finite");
+        assert_eq!(message(Writer::create(&target, config(f64::NAN, 0))), "sample rate must be positive and finite");
+        assert_eq!(message(Writer::create(&target, config(-1.0, 2))), "sample rate must be positive and finite");
+        assert_eq!(message(Writer::create(&target, depth7(44_100.0, 0))), "invalid channel count");
+        assert_eq!(message(Writer::create(&target, config(44_100.0, 1 << 30))), "invalid channel count");
+        assert_eq!(message(Writer::create(&target, depth7(44_100.0, 2))), "recorder bit depth must be 0, 16, 24 or 32");
+        assert_eq!(message(Writer::create("", config(44_100.0, 2))), "path is empty or contains NUL");
+        assert_eq!(message(Writer::create("a\0b.m4a", config(44_100.0, 2))), "path is empty or contains NUL");
+        // an existing target comes before the converter's verdict, a missing directory before it as well
+        fs::write(&target, b"existing").unwrap();
+        assert!(matches!(Writer::create(&target, config(192_000.0, 2)), Err(CodecError::Io { operation: "create new output", .. })));
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        fs::remove_file(&target).unwrap();
+        assert!(matches!(Writer::create(scratch.0.join("missing").join("out.m4a"), config(192_000.0, 2)), Err(CodecError::Io { operation: "create codec workspace", .. })));
+        scratch.assert_empty("after the refusals");
+    }
+
+    #[test]
+    fn a_converter_that_refuses_256_kbit_fails_its_first_write_like_the_macos_writer() {
+        let scratch = Scratch::new();
+        let refused = config(32_000.0, 2);
+        // the first write of a frame fails with '!dat', then the writer is poisoned (even for an empty write)
+        let mut writer = Writer::create(scratch.target(), refused).unwrap();
+        assert_eq!(writer.warnings(), [CodecWarning::AacBitRateNotSet { status: 0x2164_6174 }]);
+        writer.write(&[]).unwrap();
+        let error = writer.write(&[0.0; 4]).unwrap_err();
+        assert_eq!(native(&error), Some(("ExtAudioFileWrite", 0x2164_6174)));
+        assert!(matches!(writer.write(&[0.0; 4]), Err(CodecError::Poisoned)));
+        assert!(matches!(writer.write(&[]), Err(CodecError::Poisoned)));
+        // it cannot be disposed of: abort reports that after removing its workspace; finish reports the poisoning with it
+        assert!(matches!(writer.abort(), Err(e) if native(&e) == Some(("ExtAudioFileDispose", 0x2164_6174))));
+        scratch.assert_empty("after an abort");
+        let mut writer = Writer::create(scratch.target(), refused).unwrap();
+        writer.write(&[0.0; 4]).unwrap_err();
+        match writer.finish() {
+            Err(CodecError::Cleanup { primary, source }) => {
+                assert!(matches!(*primary, CodecError::Poisoned));
+                assert!(source.to_string().contains("ExtAudioFileDispose"), "{source}");
+            }
+            other => panic!("{other:?}"),
+        }
+        scratch.assert_empty("after a failed finish");
+        // a refused writer that never wrote: abort is clean and finish publishes the empty file with Apple's default bitrate (96 kbit/s for 2 channels at 32 kHz)
+        Writer::create(scratch.target(), refused).unwrap().abort().unwrap();
+        scratch.assert_empty("after a clean abort");
+        Writer::create(scratch.target(), refused).unwrap().finish().unwrap();
+        let file = fs::read(scratch.target()).unwrap();
+        assert_eq!(top_level(&file), ["ftyp", "moov"]);
+        let esds = file.windows(4).position(|w| w == b"esds").unwrap() + 4 + 4 + 5 + 3 + 5 + 2 + 3;
+        assert_eq!((u32_at(&file, esds), u32_at(&file, esds + 4)), (96_000, 96_000));
+    }
+
+    #[test]
+    fn aborted_dropped_and_failed_writers_leave_nothing() {
+        let scratch = Scratch::new();
+        let data = pcm(3000, 2);
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&data).unwrap();
+        assert_eq!(scratch.names().len(), 1, "only the private workspace exists while writing");
+        assert!(!scratch.target().exists(), "the target appears only when the writer finishes");
+        drop(writer);
+        scratch.assert_empty("after a drop");
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&data).unwrap();
+        writer.abort().unwrap();
+        scratch.assert_empty("after an abort");
+        // a registration failure at the last step
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&data).unwrap();
+        assert!(writer.finish_registered(|_| Err(io::Error::other("injected"))).is_err());
+        scratch.assert_empty("after a failed registration");
+        // the encoder's queue is drained into the spool after every write: only sizes stay in memory
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        for chunk in data.chunks(1000) {
+            writer.write(chunk).unwrap();
+            let stream = writer.aac.as_ref().unwrap().stream.as_ref().unwrap();
+            assert_eq!(stream.encoder.pending_access_units(), 0);
+            assert_eq!(stream.au_sizes.len() as u64, stream.encoder.frames_pushed() / 1024);
+        }
+        writer.abort().unwrap();
+    }
+
+    #[test]
+    fn a_published_destination_is_never_replaced() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&pcm(2000, 2)).unwrap();
+        fs::write(scratch.target(), b"someone else's file").unwrap();
+        assert!(matches!(writer.finish(), Err(CodecError::Io { operation: "publish new output", .. })));
+        assert_eq!(fs::read(scratch.target()).unwrap(), b"someone else's file");
+        assert_eq!(scratch.names(), ["out.m4a"], "the private workspace is gone");
+    }
+
+    #[test]
+    fn a_swapped_spool_file_is_detected_before_anything_is_published() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&pcm(3000, 2)).unwrap();
+        let path = writer.workspace.auxiliary.as_ref().unwrap().0.clone();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        match writer.finish() {
+            Err(CodecError::Cleanup { primary, .. }) => assert!(matches!(*primary, CodecError::Io { operation: "inspect AAC access-unit spool", .. }), "{primary:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!scratch.target().exists());
+        // the foreign file is not ours to delete: it stays, in the workspace directory
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn a_stream_the_container_cannot_hold_fails_closed_and_poisons_the_writer() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&pcm(2048, 2)).unwrap();
+        // pretend the spool already holds all but a few bytes of what 32-bit offsets can address
+        writer.aac.as_mut().unwrap().stream.as_mut().unwrap().bytes = u64::from(u32::MAX) - aac::mp4::data_offset(44_100) - 10;
+        let error = writer.write(&pcm(2048, 2)).unwrap_err();
+        assert!(matches!(error, CodecError::AacContainer(aac::mp4::Mp4Error::FileTooLarge)), "{error:?}");
+        assert!(matches!(writer.write(&pcm(10, 2)), Err(CodecError::Poisoned)));
+        assert!(matches!(writer.finish(), Err(CodecError::Poisoned)));
+        scratch.assert_empty("after the failed finish");
+    }
+
+    #[test]
+    fn a_large_write_is_drained_a_slice_at_a_time() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        // one write of three slices: the queue of the encoder is empty afterwards (it held every unit of the buffer before, 48 of them here)
+        let frames = 3 * AAC_WRITE_SLICE_FRAMES + 123;
+        writer.write(&pcm(frames, 2)).unwrap();
+        let stream = writer.aac.as_ref().unwrap().stream.as_ref().unwrap();
+        assert_eq!(stream.encoder.pending_access_units(), 0);
+        assert_eq!(stream.au_sizes.len(), frames / 1024);
+        writer.abort().unwrap();
+        scratch.assert_empty("after the abort");
+    }
+
+    fn assert_spool_failure(error: &CodecError) {
+        match error {
+            CodecError::Io { operation: "write AAC access-unit spool", source, .. } => assert_eq!(source.raw_os_error(), Some(28), "{source}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failing_spool_write_fails_the_writer_cleanly_while_writing_and_while_finishing() {
+        // while writing: the third access unit cannot be written
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.aac.as_mut().unwrap().stream.as_mut().unwrap().spool_fault_at = Some(2);
+        assert_spool_failure(&writer.write(&pcm(8 * 1024, 2)).unwrap_err());
+        assert!(matches!(writer.write(&pcm(10, 2)), Err(CodecError::Poisoned)));
+        assert!(matches!(writer.finish(), Err(CodecError::Poisoned)));
+        scratch.assert_empty("after a spool failure while writing");
+        // while finishing: the units of the zero-padded tail and the flush blocks cannot be written (au_count(2500) = 5, two are spooled by the write)
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        writer.write(&pcm(2500, 2)).unwrap();
+        assert_eq!(writer.aac.as_ref().unwrap().stream.as_ref().unwrap().au_sizes.len(), 2);
+        writer.aac.as_mut().unwrap().stream.as_mut().unwrap().spool_fault_at = Some(3);
+        assert_spool_failure(&writer.finish().unwrap_err());
+        scratch.assert_empty("after a spool failure while finishing");
+        assert!(!scratch.target().exists());
+    }
+
+    #[test]
+    fn more_access_units_than_the_container_can_count_is_a_typed_error_through_the_writer() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::create(scratch.target(), config(44_100.0, 2)).unwrap();
+        // the 32-bit duration holds 1024 * 4_194_303 frames: pretend that many units are spooled already
+        writer.aac.as_mut().unwrap().stream.as_mut().unwrap().au_sizes = vec![0; 4_194_303];
+        let error = writer.write(&pcm(2048, 2)).unwrap_err();
+        assert!(matches!(error, CodecError::AacContainer(aac::mp4::Mp4Error::TooManyAccessUnits(4_194_304))), "{error:?}");
+        assert!(matches!(writer.write(&pcm(10, 2)), Err(CodecError::Poisoned)));
+        assert!(matches!(writer.finish(), Err(CodecError::Poisoned)));
+        scratch.assert_empty("after the failed finish");
+    }
+
+    #[test]
+    fn unusable_destinations_fail_at_create_and_leave_nothing_behind() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let scratch = Scratch::new();
+        // a dangling symlink is an existing destination: never followed, never replaced
+        let link = scratch.0.join("link.m4a");
+        symlink(scratch.0.join("nowhere.m4a"), &link).unwrap();
+        let error = Writer::create(&link, config(44_100.0, 2)).err().expect("a dangling symlink is taken");
+        assert!(matches!(error, CodecError::Io { operation: "create new output", ref source, .. } if source.kind() == io::ErrorKind::AlreadyExists), "{error:?}");
+        assert_eq!(fs::read_link(&link).unwrap(), scratch.0.join("nowhere.m4a"));
+        assert_eq!(scratch.names(), ["link.m4a"]);
+        fs::remove_file(&link).unwrap();
+        // a directory that cannot be written to (skipped when the process may write there anyway, e.g. as root)
+        let locked = scratch.0.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(locked.join("probe"), b"").is_err() {
+            let error = Writer::create(locked.join("out.m4a"), config(44_100.0, 2)).err().expect("a locked directory is refused");
+            assert!(matches!(error, CodecError::Io { operation: "create codec workspace", .. }), "{error:?}");
+            assert_eq!(fs::read_dir(&locked).unwrap().count(), 0);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&locked).unwrap();
+        // a destination name that is not UTF-8: published under exactly that name where the filesystem takes such names, a typed error otherwise
+        let name = std::ffi::OsStr::from_bytes(b"out-\xff\xfe.m4a");
+        let target = scratch.0.join(name);
+        let supported = fs::write(&target, b"").is_ok();
+        if supported { fs::remove_file(&target).unwrap(); }
+        let created = Writer::create(&target, config(44_100.0, 2));
+        if supported {
+            let mut writer = created.unwrap();
+            writer.write(&pcm(1500, 2)).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(fs::read_dir(&scratch.0).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>(), [name.to_owned()]);
+            assert_eq!(&fs::read(&target).unwrap()[4..8], b"ftyp");
+        } else {
+            assert!(matches!(created.err().expect("refused by the filesystem"), CodecError::Io { .. }));
+            scratch.assert_empty("after the refused name");
+        }
     }
 }
 

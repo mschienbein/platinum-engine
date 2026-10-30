@@ -938,3 +938,23 @@ pub unsafe fn vDSP_fft_zrip(
         setup.plan.inverse(real, imaginary);
     }
 }
+
+/// Safe unit-stride form of [`vDSP_dotpr`] for vectors of equal length, with the same accumulation order.
+///
+/// # Panics
+/// If the slices differ in length.
+pub fn dotpr(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "dotpr needs vectors of equal length");
+    let mut result = 0.0;
+    // SAFETY: both slices cover `a.len()` unit-stride samples and `result` is a distinct local.
+    unsafe { vDSP_dotpr(a.as_ptr(), 1, b.as_ptr(), 1, &mut result, a.len()) };
+    result
+}
+
+/// Safe unit-stride form of [`vDSP_maxvi`]: the maximum and the index of its first occurrence, `(-infinity, 0)` for an empty slice.
+pub fn maxvi(input: &[f32]) -> (f32, usize) {
+    let (mut value, mut index) = (0.0, 0);
+    // SAFETY: the slice covers `input.len()` unit-stride samples; `value` and `index` are distinct locals.
+    unsafe { vDSP_maxvi(input.as_ptr(), 1, &mut value, &mut index, input.len()) };
+    (value, index)
+}

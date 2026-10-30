@@ -31,3 +31,6 @@ __pycache__/
 *.sqlite-*
 *.db
 *.db-*
+
+# committed test fixtures whose extensions are ignored above
+!/tests/fixtures/aac-reader/*

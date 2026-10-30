@@ -178,7 +178,7 @@ pub struct TransferReport {
     /// byte-identical to macOS. Only set when the whole transfer succeeded
     /// (`is_success`); for a WAV destination the picture then travels in the
     /// ID3 chunk that `wav_tags_preserved` reports.
-    pub artwork_copied: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "True when, under `TransferOptions::preserve_wav_chunks`, the marker rewrite kept at least one WAV chunk TagLib wrote that the reference marker writer drops. Only set when the whole transfer succeeded."] pub wav_tags_preserved: bool,
+    pub artwork_copied: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "True when, under `TransferOptions::preserve_wav_chunks`, the marker rewrite kept at least one WAV chunk TagLib wrote that carries source data and the reference marker writer drops. An `ID3 ` chunk holding only an empty tempo and key, and an INFO `LIST` without a value, carry none. Only set when the whole transfer succeeded."] pub wav_tags_preserved: bool,
     /// Opus outputs only: Opus loudness tags (R128_TRACK_GAIN, R128_ALBUM_GAIN)
     /// that were not carried over because processing changes the loudness.
     pub dropped_tags: Vec<String>,
@@ -197,7 +197,7 @@ pub struct TransferOptions {
     /// Copy embedded pictures (FLAC PICTURE, ID3 APIC, MP4 covr) unchanged
     /// instead of transcoding or refusing them. Refuses malformed pictures and
     /// pictures the destination cannot store as-is.
-    pub copy_artwork: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "Keep the chunks TagLib wrote into a WAV destination (the `ID3 ` chunk, the INFO `LIST`) through the marker rewrite, which the reference drops when TagLib saved them last. Linux and `portable` builds only."] pub preserve_wav_chunks: bool,
+    pub copy_artwork: bool, #[cfg(any(target_os = "linux", feature = "portable"))] #[doc = "Keep the chunks TagLib wrote into a WAV destination that carry source data (an `ID3 ` chunk with any frame beyond an empty tempo and key, an INFO `LIST` with a value, any other chunk) through the marker rewrite, which the reference drops when TagLib saved them last. Chunks that carry nothing are dropped as the reference does. Linux and `portable` builds only."] pub preserve_wav_chunks: bool,
 }
 const COPY_ARTWORK_BYTES: c_uint = 1;
 const RESULT_ARTWORK_COPIED: c_uint = 1;

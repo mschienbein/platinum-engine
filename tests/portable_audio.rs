@@ -713,22 +713,26 @@ fn portable_codec_refusals() {
     // An ID3-only file is an MP3 open: refused by the exact reader with AudioFile's status, not by a codec gate.
     assert!(matches!(PReader::open(&mp3, None), Err(CodecError::Native { operation: "ExtAudioFileOpenURL", .. })));
     let aac = dir.join("aac-header");
-    // A header AudioFile sniffs as ADTS (frame length 13, sampling index 4); a name without an extension leaves the choice to the content.
+    // A header AudioFile sniffs as ADTS (frame length 13, sampling index 4) but that holds no complete frame: the exact AAC reader answers with
+    // AudioFile's 'wht?'; a name without an extension leaves the choice to the content.
     write_new(&aac, &[0xff, 0xf1, 0x50, 0x80, 0x01, 0xa0, 0, 0, 0, 0, 0, 0]);
-    assert!(matches!(PReader::open(&aac, None), Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "decoding", .. })));
+    assert!(matches!(PReader::open(&aac, None), Err(CodecError::Native { operation: "ExtAudioFileOpenURL", status }) if status == i32::from_be_bytes(*b"wht?")));
     let aac_m4a = root.parent().unwrap().parent().unwrap().join("apple-codecs/aac-writer-warning-matrix-01/aac-44100-2.m4a");
-    assert!(matches!(PReader::open(&aac_m4a, None), Err(CodecError::UnsupportedCodec { codec: "AAC/MP4A", operation: "decoding", .. })));
+    let aac_reader = PReader::open(&aac_m4a, None).unwrap();
+    assert_eq!(aac_reader.source_format().format_id, u32::from_be_bytes(*b"aac "));
+    assert!(matches!(PReader::open(&aac_m4a, Some(48_000.0)),
+        Err(CodecError::UnsupportedSampleRateConversion { source_rate: 44_100.0, client_rate: 48_000.0 })));
     let alac = root.join("native-alac/alac-16-2-44100-513.m4a");
     let alac_reader = PReader::open(&alac, None).unwrap();
     assert_eq!(alac_reader.source_format().format_id, u32::from_be_bytes(*b"alac"));
     assert!(matches!(PReader::open(&alac, Some(48_000.0)),
         Err(CodecError::UnsupportedSampleRateConversion { source_rate: 44_100.0, client_rate: 48_000.0 })));
-    let config = PConfig { format: PFormat::Aac, sample_rate: 44_100.0, channels: 2, bit_depth: 16 };
+    let config = PConfig { format: PFormat::Aac, sample_rate: 44_100.5, channels: 2, bit_depth: 16 };
     assert!(matches!(PWriter::create(dir.join("no-aac.m4a"), config),
-        Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "encoding", .. })));
+        Err(CodecError::UnsupportedFormat(message)) if message.contains("fractional")));
     let receipt = json!({"model":"Anthropic claude-opus-5-5 xhigh","cases":[
         "same-rate PCM accepted","44.1->48 kHz open refused","44.1->48 kHz planar setter refused without changing client format",
-        "MP3 ID3 refused","AAC ADTS refused","AAC M4A refused","ALAC same-rate accepted and SRC refused","AAC writer refused"
+        "MP3 ID3 refused","AAC ADTS header-only file refused with its status","AAC M4A decoded and SRC refused","ALAC same-rate accepted and SRC refused","AAC writer refuses fractional rates"
     ]});
     write_new(&dir.join("receipt.json"), serde_json::to_string_pretty(&receipt).unwrap().as_bytes());
 }
@@ -1353,9 +1357,12 @@ fn portable_channel_and_mp3_pcm_basics() {
     assert_eq!(encoded, [0, 0, 1, 1, -1, -1, 32_767, 32_767, -32_768, -32_768]);
     assert!(matches!(pcm.convert(&[0.0], &mut []), Err(CodecError::InvalidInput(_))));
     pcm.close().unwrap();
-    let config = WriterConfig { format: OutputFormat::Aac, sample_rate: 44_100.0, channels: 2, bit_depth: 16 };
-    assert!(matches!(Writer::create("unused-aac.m4a", config),
-        Err(CodecError::UnsupportedCodec { codec: "AAC", operation: "encoding", .. })));
+    // AAC output is encoded (see tests/portable_aac_encode.rs); what is not reproduced is refused with a typed error
+    let config = WriterConfig { format: OutputFormat::Aac, sample_rate: 44_100.5, channels: 2, bit_depth: 16 };
+    // the target's directory must be writable: the writer's private workspace is created before the format is judged, as on macOS
+    let target = std::env::temp_dir().join(format!("pn-unused-aac-{}.m4a", std::process::id()));
+    assert!(matches!(Writer::create(&target, config), Err(CodecError::UnsupportedFormat(message)) if message.contains("fractional")));
+    assert!(!target.exists());
     for sample_rate in [22_049.0, 96_000.5, 96_001.0, f64::NAN] {
         let config = WriterConfig { format: OutputFormat::Alac, sample_rate, channels: 2, bit_depth: 16 };
         assert!(matches!(Writer::create("unused-alac.m4a", config), Err(CodecError::UnsupportedFormat(_))));
@@ -1947,9 +1954,11 @@ fn portable_alac_native_loss_refusal() {
         for chunk in samples.chunks(512 * 6) {
             if let Err(e) = writer.write(chunk) { error = Some(e); break; }
         }
-        assert!(matches!(&error, Some(CodecError::AlacEncode(EncodeError::NativePacketLimit { .. }))));
+        // The 4096th frame arrives with the last write call, so no call follows it: AudioToolbox's second attempt at the
+        // oversized packet is the close, and it still does not fit.
+        assert!(error.is_none(), "{error:?}");
         let finish = writer.finish();
-        assert!(matches!(&finish, Err(CodecError::Poisoned)));
+        assert!(matches!(&finish, Err(CodecError::AlacEncode(EncodeError::NativePacketLimit { .. }))), "{finish:?}");
         assert!(!target.exists());
         rows.push(serde_json::json!({"bits":bits,"error":format!("{error:?}"),"finish":format!("{finish:?}"),"target_exists":target.exists()}));
     }
@@ -2030,8 +2039,14 @@ fn portable_alac_long_writer_parity() {
         }
         let finish = writer.finish();
         if f[9] == "REFUSED_NATIVE_LOSS" {
-            let safe = matches!(&write_error, Some(CodecError::AlacEncode(EncodeError::NativePacketLimit { .. }))) &&
-                matches!(&finish, Err(CodecError::Poisoned)) && !portable.exists();
+            // AudioToolbox encodes an oversized packet again once per later write call and once at the close, and a call whose
+            // third or later attempt still fails loses its audio. The portable writer refuses at that call (the close then reports
+            // the poisoned writer) or, when no call is left to host the failing attempt, at the close.
+            let safe = !portable.exists() && match (&write_error, &finish) {
+                (Some(CodecError::AlacEncode(EncodeError::NativeFrameLoss { .. })), Err(CodecError::Poisoned)) => true,
+                (None, Err(CodecError::AlacEncode(EncodeError::NativePacketLimit { .. }))) => true,
+                _ => false,
+            };
             if safe { refused += 1; } else { failures += 1; }
             rows.push(serde_json::json!({"case":label,"outcome":"native_loss","safe_refusal":safe,
                 "write_error":format!("{write_error:?}"),"finish":format!("{finish:?}")}));

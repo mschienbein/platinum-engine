@@ -848,6 +848,29 @@ fn portable_reference_cases() {
 }
 
 #[test]
+fn safe_slice_forms_equal_the_pointer_entry_points() {
+    use platinum_engine::portable::vdsp;
+    let a: Vec<f32> = (0..300).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.173).collect();
+    let b: Vec<f32> = (0..300).map(|i| ((i * 53 % 89) as f32 - 44.0) * 0.291).collect();
+    for len in (0..=300).step_by(7).chain(0..=40) {
+        let mut expected = 0.0f32;
+        unsafe { vdsp::vDSP_dotpr(a.as_ptr(), 1, b.as_ptr(), 1, &mut expected, len); }
+        assert_eq!(vdsp::dotpr(&a[..len], &b[..len]).to_bits(), expected.to_bits(), "dotpr {len}");
+        let (mut value, mut index) = (0.0f32, 0usize);
+        unsafe { vdsp::vDSP_maxvi(a.as_ptr(), 1, &mut value, &mut index, len); }
+        let (got_value, got_index) = vdsp::maxvi(&a[..len]);
+        assert_eq!((got_value.to_bits(), got_index), (value.to_bits(), index), "maxvi {len}");
+    }
+    assert_eq!(vdsp::maxvi(&[]).0.to_bits(), f32::NEG_INFINITY.to_bits());
+}
+
+#[test]
+#[should_panic(expected = "equal length")]
+fn dotpr_rejects_unequal_lengths() {
+    platinum_engine::portable::vdsp::dotpr(&[1.0, 2.0], &[1.0]);
+}
+
+#[test]
 fn portable_fz_fused_boundary() {
     use platinum_engine::portable::vdsp::vDSP_dotpr;
     let got = platinum_engine::fp_mode::with_flush_to_zero(|| {

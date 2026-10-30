@@ -488,3 +488,174 @@ pub fn vfmaq_f32_fz(accumulator: [f32; 4], a: [f32; 4], b: [f32; 4]) -> [f32; 4]
 pub fn vfmaq_f32_with_mode(accumulator: [f32; 4], a: [f32; 4], b: [f32; 4], mode: FpMode) -> [f32; 4] {
     std::array::from_fn(|i| fmadd_f32_with_mode(a[i], b[i], accumulator[i], mode))
 }
+
+// Estimate and Newton-step instructions. The 8-bit estimates come from the
+// ARM ARM's `RecipEstimate` and `RecipSqrtEstimate`, evaluated in integer
+// arithmetic, so nothing here depends on the host's estimate instructions.
+
+/// `RecipEstimate(a)` for the 9-bit argument `a` in 256..=511: result in 256..=511.
+const fn recip_estimates() -> [u16; 512] {
+    let mut table = [0_u16; 512];
+    let mut a = 256_u32;
+    while a < 512 {
+        table[a as usize] = ((((1_u32 << 19) / (2 * a + 1)) + 1) / 2) as u16;
+        a += 1;
+    }
+    table
+}
+
+/// `RecipSqrtEstimate(a)` for the 9-bit argument `a` in 128..=511: result in 256..=511.
+const fn rsqrt_estimates() -> [u16; 512] {
+    let mut table = [0_u16; 512];
+    let mut a = 128_u32;
+    while a < 512 {
+        let scaled = (if a < 256 { 2 * a + 1 } else { 2 * (((a >> 1) << 1) + 1) }) as u64;
+        let mut b = 512_u64;
+        while scaled * (b + 1) * (b + 1) < (1_u64 << 28) { b += 1; }
+        table[a as usize] = ((b + 1) / 2) as u16;
+        a += 1;
+    }
+    table
+}
+
+static RECIP_ESTIMATE: [u16; 512] = recip_estimates();
+static RSQRT_ESTIMATE: [u16; 512] = rsqrt_estimates();
+
+/// Scalar FRECPE: the reciprocal estimate with 8 fraction bits.
+#[inline]
+pub fn frecpe_f32(x: f32) -> f32 { frecpe_f32_with_mode(x, FpMode::IEEE) }
+/// Scalar FRECPE in flush-to-zero mode.
+#[inline]
+pub fn frecpe_f32_fz(x: f32) -> f32 { frecpe_f32_with_mode(x, FpMode::FZ) }
+/// Scalar FRECPE with explicit FZ and DN. A subnormal operand is zero in FZ
+/// mode, and an operand of 2^126 or more gives zero rather than a subnormal.
+#[inline]
+pub fn frecpe_f32_with_mode(x: f32, mode: FpMode) -> f32 {
+    let bits = SINGLE.flush(u64::from(x.to_bits()), mode) as u32;
+    let sign = bits & 0x8000_0000;
+    // A normal operand whose reciprocal is normal as well takes the table directly.
+    let biased = (bits >> 23) & 0xff;
+    if biased.wrapping_sub(1) < 252 {
+        let estimate = u32::from(RECIP_ESTIMATE[(0x100 | ((bits >> 15) & 0xff)) as usize]) & 0xff;
+        return f32::from_bits(sign | ((253 - biased) << 23) | (estimate << 15));
+    }
+    let mut exponent = ((bits >> 23) & 0xff) as i32;
+    let mut fraction = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        return f32::from_bits(if fraction != 0 { SINGLE.processed_nan(u64::from(bits), mode) as u32 } else { sign });
+    }
+    // Zero, or a magnitude below 2^-128: the reciprocal overflows.
+    if exponent == 0 && fraction < 0x0020_0000 { return f32::from_bits(sign | 0x7f80_0000); }
+    if mode.flush_to_zero && exponent >= 253 { return f32::from_bits(sign); }
+    if exponent == 0 {
+        if fraction & 0x0040_0000 == 0 {
+            exponent = -1;
+            fraction = (fraction << 2) & 0x007f_ffff;
+        } else {
+            fraction = (fraction << 1) & 0x007f_ffff;
+        }
+    }
+    let estimate = u32::from(RECIP_ESTIMATE[(0x100 | (fraction >> 15)) as usize]) & 0xff;
+    let mut result_exponent = 253 - exponent;
+    let mut result_fraction = estimate << 15;
+    if result_exponent == 0 {
+        result_fraction = 0x0040_0000 | (result_fraction >> 1);
+    } else if result_exponent == -1 {
+        result_fraction = 0x0020_0000 | (result_fraction >> 2);
+        result_exponent = 0;
+    }
+    f32::from_bits(sign | ((result_exponent as u32) << 23) | result_fraction)
+}
+
+/// Scalar FRSQRTE: the reciprocal square root estimate with 8 fraction bits.
+#[inline]
+pub fn frsqrte_f32(x: f32) -> f32 { frsqrte_f32_with_mode(x, FpMode::IEEE) }
+/// Scalar FRSQRTE in flush-to-zero mode.
+#[inline]
+pub fn frsqrte_f32_fz(x: f32) -> f32 { frsqrte_f32_with_mode(x, FpMode::FZ) }
+/// Scalar FRSQRTE with explicit FZ and DN. Negative operands, including
+/// negative infinity, give the default NaN whatever DN says.
+#[inline]
+pub fn frsqrte_f32_with_mode(x: f32, mode: FpMode) -> f32 {
+    let bits = SINGLE.flush(u64::from(x.to_bits()), mode) as u32;
+    let sign = bits & 0x8000_0000;
+    // A positive normal operand takes the table directly.
+    let biased = (bits >> 23) & 0xff;
+    if sign == 0 && biased.wrapping_sub(1) < 254 {
+        let scaled = if biased & 1 == 0 { 0x100 | ((bits >> 15) & 0xff) } else { 0x80 | ((bits >> 16) & 0x7f) };
+        let estimate = u32::from(RSQRT_ESTIMATE[scaled as usize]) & 0xff;
+        return f32::from_bits((((380 - biased) / 2) << 23) | (estimate << 15));
+    }
+    let mut exponent = ((bits >> 23) & 0xff) as i32;
+    let fraction = bits & 0x007f_ffff;
+    if exponent == 0xff && fraction != 0 {
+        return f32::from_bits(SINGLE.processed_nan(u64::from(bits), mode) as u32);
+    }
+    if exponent == 0 && fraction == 0 { return f32::from_bits(sign | 0x7f80_0000); }
+    if sign != 0 { return f32::from_bits(SINGLE.default_nan() as u32); }
+    if exponent == 0xff { return 0.0; }
+    // The fraction as a 52-bit register; a subnormal operand is normalised.
+    const MASK: u64 = (1 << 52) - 1;
+    let mut fraction = u64::from(fraction) << 29;
+    if exponent == 0 {
+        while fraction & (1 << 51) == 0 {
+            fraction = (fraction << 1) & MASK;
+            exponent -= 1;
+        }
+        fraction = (fraction << 1) & MASK;
+    }
+    let scaled = if exponent & 1 == 0 { 0x100 | (fraction >> 44) } else { 0x80 | (fraction >> 45) };
+    let estimate = u32::from(RSQRT_ESTIMATE[scaled as usize]) & 0xff;
+    f32::from_bits((((380 - exponent) / 2) as u32) << 23 | (estimate << 15))
+}
+
+#[inline]
+fn is_zero_or_infinity(bits: u32) -> (bool, bool) {
+    (bits & 0x7fff_ffff == 0, bits & 0x7fff_ffff == 0x7f80_0000)
+}
+
+/// Scalar FRECPS: the Newton step `2 - a * b` with a single rounding.
+#[inline]
+pub fn frecps_f32(a: f32, b: f32) -> f32 { frecps_f32_with_mode(a, b, FpMode::IEEE) }
+/// Scalar FRECPS in flush-to-zero mode.
+#[inline]
+pub fn frecps_f32_fz(a: f32, b: f32) -> f32 { frecps_f32_with_mode(a, b, FpMode::FZ) }
+/// Scalar FRECPS with explicit FZ and DN. The first operand is negated before
+/// NaN selection, so a NaN result carries the negated sign of a NaN `a`. An
+/// infinity times a zero gives exactly 2.0 rather than a NaN.
+#[inline]
+pub fn frecps_f32_with_mode(a: f32, b: f32, mode: FpMode) -> f32 {
+    let a = SINGLE.flush(u64::from(a.to_bits()), mode) as u32 ^ 0x8000_0000;
+    let b = SINGLE.flush(u64::from(b.to_bits()), mode) as u32;
+    let ((a_zero, a_inf), (b_zero, b_inf)) = (is_zero_or_infinity(a), is_zero_or_infinity(b));
+    if (a_inf && b_zero) || (a_zero && b_inf) { return 2.0; }
+    fmadd_f32_with_mode(f32::from_bits(a), f32::from_bits(b), 2.0, mode)
+}
+
+/// Scalar FRSQRTS: the Newton step `(3 - a * b) / 2` with a single rounding.
+#[inline]
+pub fn frsqrts_f32(a: f32, b: f32) -> f32 { frsqrts_f32_with_mode(a, b, FpMode::IEEE) }
+/// Scalar FRSQRTS in flush-to-zero mode.
+#[inline]
+pub fn frsqrts_f32_fz(a: f32, b: f32) -> f32 { frsqrts_f32_with_mode(a, b, FpMode::FZ) }
+/// Scalar FRSQRTS with explicit FZ and DN. NaN selection and the infinity-times-zero
+/// result (exactly 1.5) are those of [`frecps_f32_with_mode`]; an exact zero is +0.
+#[inline]
+pub fn frsqrts_f32_with_mode(a: f32, b: f32, mode: FpMode) -> f32 {
+    let a = SINGLE.flush(u64::from(a.to_bits()), mode) as u32 ^ 0x8000_0000;
+    let b = SINGLE.flush(u64::from(b.to_bits()), mode) as u32;
+    let ((a_zero, a_inf), (b_zero, b_inf)) = (is_zero_or_infinity(a), is_zero_or_infinity(b));
+    if (a_inf && b_zero) || (a_zero && b_inf) { return 1.5; }
+    let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+    let result = if SINGLE.is_nan(u64::from(a.to_bits())) || SINGLE.is_nan(u64::from(b.to_bits())) || a_inf || b_inf {
+        // The NaN and infinity results do not depend on the constant.
+        fmadd_f32_with_mode(a, b, 3.0, mode)
+    } else if a.to_bits() & 0x7fff_ffff >= 0x0100_0000 {
+        // Halving `a` is exact from 2^-125 up, and keeps (3 + a*b) / 2 from overflowing.
+        fmadd_f32_with_mode(f32::from_bits(a.to_bits() - 0x0080_0000), b, 1.5, mode)
+    } else {
+        // |a| < 2^-125 and |b| <= 2^128: the product is small, and the sum is exact to halve.
+        fmadd_f32_with_mode(a, b, 3.0, mode) * 0.5
+    };
+    if result == 0.0 { 0.0 } else { result }
+}

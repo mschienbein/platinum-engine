@@ -220,6 +220,8 @@ fn typed_code(error: &dyn Any) -> Option<ErrorCode> {
 fn codec_code(error: &crate::apple_codec::CodecError) -> Option<ErrorCode> {
     use crate::apple_codec::CodecError as E;
     match error {
+        // Produced by no build since v0.4.0 (AAC output is exact, AudioToolbox serves macOS); the mapping stays so that a codec path that reports an encoding
+        // refusal gets the reserved code, which `portable_codec_refusals_have_distinct_codes` pins.
         E::UnsupportedCodec { operation: "encoding", .. } => Some(ErrorCode::UnsupportedOutputCodec),
         E::UnsupportedCodec { .. } => Some(ErrorCode::UnsupportedInputCodec),
         E::UnsupportedFormat(_) => Some(ErrorCode::UnsupportedInputFormat),
@@ -228,6 +230,7 @@ fn codec_code(error: &crate::apple_codec::CodecError) -> Option<ErrorCode> {
         // A failed cleanup after a cancel is a failure, never a clean cancellation.
         E::Cleanup { primary, .. } => match codec_code(primary) { Some(ErrorCode::Cancelled) => Some(ErrorCode::IoError), other => other },
         E::InvalidInput(_) | E::Mp4Read(_) | E::AlacDecode(_) => Some(ErrorCode::InvalidInputFile),
+        E::AacEncode(_) | E::AacContainer(_) => Some(ErrorCode::EncodeFailed),
         // Variants without one meaning (including future ones) take the stage code.
         _ => None,
     }
@@ -597,6 +600,29 @@ mod tests {
         assert_eq!(classify("encode Apple output", &E::Native { operation: "op", status: -1 }), ErrorCode::EncodeFailed);
         let wrapped = crate::audio_input::AudioInputError::Apple(E::UnsupportedCodec { codec: "MP3", operation: "decoding", reason: "r" });
         assert_eq!(classify("open analysis input", &wrapped), ErrorCode::UnsupportedInputCodec);
+    }
+
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    fn portable_aac_encoder_and_container_failures_are_encode_failures_at_every_stage() {
+        use crate::apple_codec::CodecError as E;
+        use crate::portable::aac::{encoder::EncodeError, mp4::Mp4Error};
+        let encode = E::AacEncode(EncodeError::PartialFrame);
+        let container = E::AacContainer(Mp4Error::FileTooLarge);
+        // a stage that names the output says encode_failed anyway; the typed variant carries the meaning, not the stage
+        for stage in ["encode Apple output", "finish Apple output", "create Apple encoder"] {
+            assert_eq!(classify(stage, &encode), ErrorCode::EncodeFailed, "{stage}");
+            assert_eq!(classify(stage, &container), ErrorCode::EncodeFailed, "{stage}");
+        }
+        // wrapped by a failed cleanup, the primary failure keeps its code
+        let wrapped = E::Cleanup { primary: Box::new(E::AacContainer(Mp4Error::TooManyAccessUnits(1 << 23))), source: std::io::Error::other("remove failed") };
+        assert_eq!(classify("finish Apple output", &wrapped), ErrorCode::EncodeFailed);
+        // a fractional rate is a format refusal about the output, not the input
+        let fractional = E::UnsupportedFormat("fractional AAC sample rates are not reproduced");
+        assert_eq!(classify("create Apple encoder", &fractional), ErrorCode::UnsupportedOutputFormat);
+        // the native statuses of an AAC format AudioToolbox cannot create are encode failures too
+        let native = E::Native { operation: "ExtAudioFileSetProperty(client format)", status: 0x666d_743f };
+        assert_eq!(classify("create Apple encoder", &native), ErrorCode::EncodeFailed);
     }
 
     #[cfg(not(any(target_os = "linux", feature = "portable")))]

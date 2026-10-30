@@ -1,6 +1,6 @@
 //! End-to-end CLI tests of the v0.2.0 opt-in `parity.allow_non_identical` (embedded artwork copy) and of
-//! the Linux-only failure codes (`unsupported_input_codec`,
-//! `unsupported_output_codec`, `unsupported_sample_rate_conversion`,
+//! the Linux-only failure codes (`unsupported_input_codec` for what the portable decoders still refuse,
+//! `unsupported_sample_rate_conversion`,
 //! `artwork_conversion_unavailable`; see `tests/error_codes.rs`, whose coverage
 //! ledger points here). Every test runs the real `platinum` binary against
 //! generated audio and generated images in an isolated HOME and state
@@ -33,13 +33,14 @@
 //! | D4 `a_48_khz_mp3_is_analyzed_without_a_waveform_and_processes` | decoder at a kept processing rate; engine waveform guard (waveform stays unavailable off 44.1 kHz) |
 //! | E `an_undecodable_mp3_fails_at_the_first_read_with_apples_status` | decoder: container check at open, Apple's `'bada'` at the first `ExtAudioFileRead` |
 //! | E2 `a_truncated_mp3_is_refused_by_the_container_check_before_any_decoder_runs` | art bridge / tag bridge refusing "invalid or truncated MPEG audio" (status 3), engine container sniffing |
-//! | F `aac_is_always_refused` | portable codec layer keeping AAC (decode and encode) unsupported in v0.2.0; tag bridge parsing the hand-built `.m4a` |
+//! | F `aac_input_is_decoded_and_aac_output_is_produced` | portable codec layer: the exact AAC decoder (`portable::aac::decoder`, behind `Reader::open`) reads the `.m4a` the exact AAC encoder (`portable::aac`, the `.m4a` the CLI publishes) wrote, for `process`, `inspect` and `analyze`; the opt-in changes nothing; tag bridge (marker) |
+//! | F2 `aac_streams_the_decoder_does_not_cover_are_refused_and_a_stub_is_an_invalid_file` | portable codec layer: HE-AAC and AAC in a WAVE container stay `unsupported_input_codec`; a stub `.m4a` with no sample tables is `invalid_input_file` (AudioToolbox's `'wht?'`) |
 //! | G1, G2 `artwork_flac_png_to_*` | art bridge, engine `TransferOptions`, libFLAC (and LAME for G2) |
 //! | G3 `artwork_flac_webp_to_alac_is_refused_but_png_is_copied` | art bridge (MP4 `covr` rules), libFLAC |
 //! | G4 `artwork_mp3_apic_is_moved_unchanged_and_reports_no_non_identical_path` | decoder, the bridge's ID3 direct copy, LAME |
 //! | G5 `sources_without_artwork_report_no_artwork_copy` | engine reporting, art bridge accepting pictureless sources |
 //! | G6 `wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without` | `src/wav_preserve.rs` (Rust marker rewrite), engine `TransferOptions` and `non_identical_paths`; works with any bridge |
-//! | G7 `cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote` | the same rewrite for generic copies into a WAV (tempo and key are always written) |
+//! | G7 `cross_format_copies_into_a_wav_keep_only_chunks_that_carry_source_data` | the same rewrite for generic copies into a WAV: TagLib always writes tempo and key, and only a source with tempo, key or tags makes the chunk worth keeping |
 //! | H `failed_items_have_no_report` | engine/CLI JSON assembly |
 #![cfg(any(target_os = "linux", feature = "portable"))]
 
@@ -274,15 +275,16 @@ fn truncated_mp3() -> Vec<u8> {
     mpeg_frames([0xff, 0xfb, 0x90, 0x00], 104, 1, |_, _| {})
 }
 
-/// A minimal MP4 (ftyp, moov > trak > mdia > minf > stbl > stsd with an `mp4a`
-/// entry, mdat) of the kind the sniffer and the portable reader recognise.
-fn aac_m4a() -> Vec<u8> {
-    fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut atom = ((body.len() + 8) as u32).to_be_bytes().to_vec();
-        atom.extend_from_slice(kind);
-        atom.extend_from_slice(body);
-        atom
-    }
+/// An MP4 box: size, type, body.
+fn mp4_atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut atom = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    atom.extend_from_slice(kind);
+    atom.extend_from_slice(body);
+    atom
+}
+
+/// The `mp4a` sample entry fields (version 0) of a stereo 16-bit track at `RATE`, without children.
+fn mp4a_entry_fields() -> Vec<u8> {
     let mut entry = vec![0u8; 6];
     entry.extend_from_slice(&1u16.to_be_bytes()); // data reference index
     entry.extend_from_slice(&[0u8; 8]); // version, revision, vendor
@@ -290,10 +292,11 @@ fn aac_m4a() -> Vec<u8> {
     entry.extend_from_slice(&16u16.to_be_bytes()); // sample size
     entry.extend_from_slice(&[0u8; 4]); // compression id, packet size
     entry.extend_from_slice(&(RATE << 16).to_be_bytes()); // 16.16 sample rate
-    let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1]; // version/flags, one entry
-    stsd.extend(atom(b"mp4a", &entry));
-    let stbl = atom(b"stbl", &atom(b"stsd", &stsd));
-    let minf = atom(b"minf", &stbl);
+    entry
+}
+
+/// `moov > trak > mdia` with `mdhd`, a `soun` `hdlr` and `minf` (all the sample tables the caller builds).
+fn mp4_moov(minf_body: &[u8]) -> Vec<u8> {
     let mut mdhd = vec![0u8; 12]; // version/flags, creation, modification
     mdhd.extend_from_slice(&RATE.to_be_bytes()); // time scale
     mdhd.extend_from_slice(&(RATE * 2).to_be_bytes()); // duration
@@ -301,17 +304,91 @@ fn aac_m4a() -> Vec<u8> {
     let mut hdlr = vec![0u8; 8]; // version/flags, pre-defined
     hdlr.extend_from_slice(b"soun");
     hdlr.extend_from_slice(&[0u8; 13]); // reserved, empty name
-    let mut mdia = atom(b"mdhd", &mdhd);
-    mdia.extend(atom(b"hdlr", &hdlr));
-    mdia.extend(minf);
-    let moov = atom(b"moov", &atom(b"trak", &atom(b"mdia", &mdia)));
+    let mut mdia = mp4_atom(b"mdhd", &mdhd);
+    mdia.extend(mp4_atom(b"hdlr", &hdlr));
+    mdia.extend(mp4_atom(b"minf", minf_body));
+    mp4_atom(b"moov", &mp4_atom(b"trak", &mp4_atom(b"mdia", &mdia)))
+}
+
+fn m4a_ftyp() -> Vec<u8> {
     let mut ftyp = b"M4A ".to_vec();
     ftyp.extend_from_slice(&[0u8; 4]);
     ftyp.extend_from_slice(b"M4A mp42isom");
-    let mut m4a = atom(b"ftyp", &ftyp);
-    m4a.extend(moov);
-    m4a.extend(atom(b"mdat", &[0u8; 64]));
+    mp4_atom(b"ftyp", &ftyp)
+}
+
+/// A stub MP4 (ftyp, moov > trak > mdia > minf > stbl > stsd with an `mp4a` entry, mdat) that no AAC decoder can open: the entry has no `esds`
+/// and the sample tables are missing. AudioToolbox answers `'wht?'` for it, which the engine reports as `invalid_input_file`.
+fn aac_m4a() -> Vec<u8> {
+    let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1]; // version/flags, one entry
+    stsd.extend(mp4_atom(b"mp4a", &mp4a_entry_fields()));
+    let mut m4a = m4a_ftyp();
+    m4a.extend(mp4_moov(&mp4_atom(b"stbl", &mp4_atom(b"stsd", &stsd))));
+    m4a.extend(mp4_atom(b"mdat", &[0u8; 64]));
     m4a
+}
+
+/// An MP4 with complete sample tables for one 8-byte access unit and an AudioSpecificConfig that signals SBR (AOT 2, 22.05 kHz core, stereo, the
+/// backward-compatible extension 0x2b7 with AOT 5 and 44.1 kHz): HE-AAC. AudioToolbox decodes it; the portable reader refuses it at open.
+fn he_aac_m4a() -> Vec<u8> {
+    let descriptor = |tag: u8, body: &[u8]| {
+        let mut d = vec![tag, 0x80, 0x80, 0x80, body.len() as u8];
+        d.extend_from_slice(body);
+        d
+    };
+    let mut decoder = vec![0x40, 0x15, 0, 0, 0]; // MPEG-4 audio, audio stream, buffer size
+    decoder.extend_from_slice(&[0u8; 8]); // maximum and average bit rate
+    decoder.extend(descriptor(5, &[0x13, 0x90, 0x56, 0xe5, 0xa0]));
+    let mut es = vec![0, 1, 0]; // ES_ID, flags
+    es.extend(descriptor(4, &decoder));
+    es.extend(descriptor(6, &[2]));
+    let mut esds = vec![0u8; 4]; // version/flags
+    esds.extend(descriptor(3, &es));
+    let mut entry = mp4a_entry_fields();
+    entry.extend(mp4_atom(b"esds", &esds));
+    let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+    stsd.extend(mp4_atom(b"mp4a", &entry));
+    let table = |entries: &[u32]| { let mut t = vec![0u8; 4]; for value in entries { t.extend_from_slice(&value.to_be_bytes()); } t };
+    let ftyp = m4a_ftyp();
+    let moov = |chunk_offset: u32| {
+        let mut stbl = mp4_atom(b"stsd", &stsd);
+        stbl.extend(mp4_atom(b"stts", &table(&[1, 1, 1024])));
+        stbl.extend(mp4_atom(b"stsc", &table(&[1, 1, 1, 1])));
+        stbl.extend(mp4_atom(b"stsz", &table(&[0, 1, 8])));
+        stbl.extend(mp4_atom(b"stco", &table(&[1, chunk_offset])));
+        mp4_moov(&mp4_atom(b"stbl", &stbl))
+    };
+    let chunk_offset = (ftyp.len() + moov(0).len() + 8) as u32;
+    let mut m4a = ftyp;
+    m4a.extend(moov(chunk_offset));
+    m4a.extend(mp4_atom(b"mdat", &[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0, 0]));
+    m4a
+}
+
+/// The `.m4a` the CLI itself published for a generated WAV, with its processed marker renamed away (`----` item that is not the iTunSMPB one becomes
+/// `free`; sizes and offsets stay), so that the engine takes it as an unprocessed input: the same thing `strip_id3` does for MP3.
+fn without_processed_marker(m4a: &[u8]) -> Vec<u8> {
+    let mut data = m4a.to_vec();
+    let ilst = data.windows(4).position(|window| window == b"ilst").expect("an ilst atom") - 4;
+    let end = ilst + u32::from_be_bytes(data[ilst..ilst + 4].try_into().unwrap()) as usize;
+    let (mut position, mut renamed) = (ilst + 8, 0);
+    while position + 8 <= end {
+        let size = u32::from_be_bytes(data[position..position + 4].try_into().unwrap()) as usize;
+        if &data[position + 4..position + 8] == b"----" && !data[position..position + size].windows(8).any(|window| window == b"iTunSMPB") {
+            data[position + 4..position + 8].copy_from_slice(b"free");
+            renamed += 1;
+        }
+        position += size;
+    }
+    assert_eq!(renamed, 1, "exactly one processed-marker item in the engine's AAC output");
+    data
+}
+
+/// A WAV whose format tag says AAC (0x00ff): the portable reader refuses it as AAC in a WAVE container.
+fn aac_in_wave() -> Vec<u8> {
+    let mut wav = generated_wav(RATE, SECONDS, false);
+    wav[20..22].copy_from_slice(&0x00ffu16.to_le_bytes());
+    wav
 }
 
 // --- Generated images: framing-valid and, where practical, decodable -------------
@@ -471,6 +548,30 @@ fn flac_rewritten(flac: &[u8], picture: Option<&FlacPicture>) -> Vec<u8> {
     out
 }
 
+/// The same audio frames behind STREAMINFO and one VORBIS_COMMENT block holding `comments` (every other tag, and with it
+/// the processed marker, is dropped).
+fn flac_with_comments(flac: &[u8], comments: &[(&str, &str)]) -> Vec<u8> {
+    let (blocks, frames) = flac_blocks(flac);
+    assert_eq!(blocks[0].0, 0, "first metadata block must be STREAMINFO");
+    let vendor = b"platinum-test";
+    let mut comment = (vendor.len() as u32).to_le_bytes().to_vec();
+    comment.extend_from_slice(vendor);
+    comment.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for (name, value) in comments {
+        let entry = format!("{name}={value}");
+        comment.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        comment.extend_from_slice(entry.as_bytes());
+    }
+    let mut out = b"fLaC".to_vec();
+    for (kind, last, body) in [(0u8, false, blocks[0].1), (4, true, &comment[..])] {
+        out.push(kind | if last { 0x80 } else { 0 });
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+    }
+    out.extend_from_slice(&flac[frames..]);
+    out
+}
+
 // --- ID3v2 pictures -----------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
@@ -551,7 +652,6 @@ fn mp3_input_needs_no_opt_in_and_the_setting_changes_nothing() {
     // First the setting at its default, then explicitly stored as false, then on: the MP3 results never differ.
     for (round, explicit) in [None, Some(false), Some(true)].into_iter().enumerate() {
         if let Some(on) = explicit { sandbox.set_opt_in(on); }
-        let on = explicit == Some(true);
         let out = sandbox.dir(&format!("out-{round}"));
         let processed = sandbox.ok(&["process", text(&input), "--format", "match-input", "--output-dir", text(&out)]);
         assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "round {round}: {processed}");
@@ -572,18 +672,18 @@ fn mp3_input_needs_no_opt_in_and_the_setting_changes_nothing() {
 
         let wav_out = sandbox.dir(&format!("wav-out-{round}"));
         let as_wav = sandbox.ok(&["process", text(&input), "--format", "wav", "--output-dir", text(&wav_out)]);
-        // A generic copy into a WAV writes an `ID3 ` chunk (tempo and key) that the default policy drops and the opt-in
-        // keeps: the one non-identical member, a property of the WAV output and not of the MP3 input.
-        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
-        assert_eq!(paths(report(&as_wav, 0)), expected, "round {round}: {as_wav}");
+        // A generic copy into a WAV always writes an `ID3 ` chunk with a tempo and a key through TagLib; for this source
+        // (no tags, tempo or key) that chunk holds a zero tempo and an empty key and carries nothing, so the opt-in drops it
+        // too: no non-identical member, and the WAV is the default policy's output.
+        assert_eq!(paths(report(&as_wav, 0)), Vec::<&str>::new(), "round {round}: {as_wav}");
         let wav = report(&as_wav, 0)["output_path"].as_str().unwrap();
         assert_eq!(Path::new(wav).extension().and_then(|e| e.to_str()), Some("wav"));
         outputs.push((file_sha256(output).unwrap(), analyzed["results"][0]["report"]["volume"].clone()));
-        if !on { wav_digests.push(file_sha256(wav).unwrap()); }
+        wav_digests.push(file_sha256(wav).unwrap());
         assert_eq!(fs::read(&input).unwrap(), before, "the input is never modified");
     }
     assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]), "the opt-in must not change the MP3 output or the analysis of MP3 input: {outputs:?}");
-    assert!(wav_digests.windows(2).all(|pair| pair[0] == pair[1]), "WAV output is identical across the default-off rounds");
+    assert!(wav_digests.windows(2).all(|pair| pair[0] == pair[1]), "WAV output is identical with the opt-in off and on: {wav_digests:?}");
 }
 
 // --- C: identical paths stay identical ------------------------------------------------------
@@ -678,9 +778,8 @@ fn a_48_khz_mp3_is_analyzed_without_a_waveform_and_processes() {
         let processed = sandbox.ok(&["process", text(&mp3), "--format", "wav", "--output-dir", text(&out)]);
         assert_eq!(report(&processed, 0)["input_sample_rate"], 48_000.0, "{processed}");
         assert_eq!(report(&processed, 0)["sample_rate"], 48_000.0, "{processed}");
-        // Only the WAV output's own tag-chunk rule appears (opt-in on); the MP3 input contributes no member.
-        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
-        assert_eq!(paths(report(&processed, 0)), expected, "{processed}");
+        // The MP3 input has no tags, tempo or key: the WAV output's tag chunk would be empty, so there is no member at all.
+        assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "{processed}");
     }
     assert_eq!(fs::read(&mp3).unwrap(), before);
 }
@@ -761,34 +860,97 @@ fn a_truncated_mp3_is_refused_by_the_container_check_before_any_decoder_runs() {
     }
 }
 
-// --- F: AAC stays refused in both directions ------------------------------------------------------
+// --- F: AAC input is decoded, AAC output is produced ------------------------------------------------
 
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn aac_is_always_refused() {
+fn aac_input_is_decoded_and_aac_output_is_produced() {
     let sandbox = Sandbox::configured();
-    let m4a = sandbox.file("tone.m4a", &aac_m4a());
     let wav = sandbox.file("tone.wav", &generated_wav(RATE, SECONDS, false));
-    let before = fs::read(&m4a).unwrap();
+    // AAC output is the exact encoder of `portable::aac`: the CLI publishes one `.m4a` (an AudioToolbox `m4af` file: `ftyp` M4A, `mp4a` + `esds`),
+    // which the engine reads back (`inspect encoded output`) and the tag bridge writes its tags into, with or without the opt-in.
+    let encode_out = sandbox.dir("encode-out");
+    let processed = sandbox.ok(&["process", text(&wav), "--format", "aac", "--output-dir", text(&encode_out)]);
+    assert_eq!(paths(report(&processed, 0)), Vec::<&str>::new(), "{processed}");
+    let published = PathBuf::from(report(&processed, 0)["output_path"].as_str().unwrap());
+    assert_eq!(published.extension().and_then(|extension| extension.to_str()), Some("m4a"), "{processed}");
+    let file = fs::read(&published).unwrap();
+    assert_eq!(&file[4..12], b"ftypM4A ", "{processed}");
+    assert!(["mp4a", "esds"].iter().all(|kind| file.windows(4).any(|window| window == kind.as_bytes())), "an AAC sample entry: {processed}");
+    assert_eq!(fs::read_dir(&encode_out).unwrap().count(), 1, "the published file is the only file left in the output directory");
+
+    // AAC input: that file, as an unprocessed input (the marker the engine wrote is renamed away, as `strip_id3` does for MP3). The portable
+    // decoder is bit-exact with AudioToolbox, so none of this depends on the opt-in: `non_identical_paths` is empty with it off and on.
+    let input = sandbox.file("inputs/tone.m4a", &without_processed_marker(&file));
+    let before = fs::read(&input).unwrap();
+    let mut wav_digests = Vec::new();
     for (round, on) in [false, true].into_iter().enumerate() {
         sandbox.set_opt_in(on);
-        let decode_out = sandbox.dir(&format!("decode-out-{round}"));
-        for args in [
-            vec!["process", text(&m4a), "--format", "wav", "--output-dir", text(&decode_out)],
-            vec!["inspect", text(&m4a)],
-            vec!["analyze", text(&m4a)],
-        ] {
-            let outcome = sandbox.fails(1, &args);
-            assert_failed_item(&outcome, 0, None, "unsupported_input_codec");
-        }
-        assert_no_files(&decode_out);
+        let inspected = sandbox.ok(&["inspect", text(&input)]);
+        let inspection = report(&inspected, 0);
+        assert_eq!(inspection["input_format"], "m4a/aac", "{inspected}");
+        assert_eq!((inspection["sample_rate"].clone(), inspection["channels"].clone()), (json!(44_100.0), json!(2)), "{inspected}");
+        assert_eq!(inspection["frames"], 44_100, "{inspected}");
+        assert!(inspection["bitrate"].as_u64().is_some_and(|bitrate| bitrate > 0) && inspection["bitrate_error"].is_null(), "a bit rate: {inspected}");
+        assert_eq!(inspection["processed"], false, "{inspected}");
+        assert_eq!(paths(inspection), Vec::<&str>::new(), "{inspected}");
 
-        let encode_out = sandbox.dir(&format!("encode-out-{round}"));
-        let outcome = sandbox.fails(1, &["process", text(&wav), "--format", "aac", "--output-dir", text(&encode_out)]);
-        assert_failed_item(&outcome, 0, None, "unsupported_output_codec");
-        assert_no_files(&encode_out);
+        let analyzed = sandbox.ok(&["analyze", text(&input)]);
+        let analysis = report(&analyzed, 0);
+        assert_eq!(analysis["input_format"], "m4a/aac", "{analyzed}");
+        assert_eq!(analysis["frames"], 44_100, "{analyzed}");
+        assert!(analysis["volume"].as_f64().is_some_and(f64::is_finite) && analysis["pitch_hz"].as_f64().is_some_and(|pitch| (pitch - 440.0).abs() < 1.0), "{analyzed}");
+        assert_eq!(paths(analysis), Vec::<&str>::new(), "{analyzed}");
+
+        for format in ["wav", "match-input"] {
+            let out = sandbox.dir(&format!("decode-out-{round}-{format}"));
+            let decoded = sandbox.ok(&["process", text(&input), "--format", format, "--output-dir", text(&out)]);
+            let processing = report(&decoded, 0);
+            assert_eq!(processing["input_format"], "m4a/aac", "{decoded}");
+            assert_eq!(processing["input_frames"], 44_100, "{decoded}");
+            assert_eq!(paths(processing), Vec::<&str>::new(), "round {round}, {format}: {decoded}");
+            let output = PathBuf::from(processing["output_path"].as_str().unwrap());
+            assert!(output.starts_with(&out), "{decoded}");
+            if format == "wav" {
+                let bytes = fs::read(&output).unwrap();
+                assert!(bytes.starts_with(b"RIFF") && bytes.len() > 44_100 * 4, "a decoded WAV of the whole second: {decoded}");
+                wav_digests.push(file_sha256(&output).unwrap());
+            } else {
+                assert_eq!(output.extension().and_then(|extension| extension.to_str()), Some("m4a"), "AAC in, AAC out: {decoded}");
+            }
+        }
+        assert_eq!(fs::read(&input).unwrap(), before, "the input is never modified");
     }
-    assert_eq!(fs::read(&m4a).unwrap(), before);
+    assert!(wav_digests.windows(2).all(|pair| pair[0] == pair[1]), "the decoded WAV is identical with the opt-in off and on: {wav_digests:?}");
+}
+
+#[test]
+#[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
+fn aac_streams_the_decoder_does_not_cover_are_refused_and_a_stub_is_an_invalid_file() {
+    let sandbox = Sandbox::configured();
+    // HE-AAC (AudioToolbox decodes it, the portable decoder does not) and AAC in a WAVE container are refused with the codec code; a stub `.m4a` with no
+    // sample tables is the invalid file AudioToolbox says it is. None of this depends on the opt-in.
+    let he_aac = sandbox.file("he-aac.m4a", &he_aac_m4a());
+    let wave = sandbox.file("aac-in-wave.wav", &aac_in_wave());
+    let stub = sandbox.file("stub.m4a", &aac_m4a());
+    let before: Vec<_> = [&he_aac, &wave, &stub].iter().map(|path| fs::read(path).unwrap()).collect();
+    for (round, on) in [false, true].into_iter().enumerate() {
+        sandbox.set_opt_in(on);
+        let out = sandbox.dir(&format!("decode-out-{round}"));
+        for (input, code) in [(&he_aac, "unsupported_input_codec"), (&wave, "unsupported_input_codec"), (&stub, "invalid_input_file")] {
+            for args in [
+                vec!["process", text(input), "--format", "wav", "--output-dir", text(&out)],
+                vec!["inspect", text(input)],
+                vec!["analyze", text(input)],
+            ] {
+                let outcome = sandbox.fails(1, &args);
+                assert_failed_item(&outcome, 0, None, code);
+            }
+        }
+        assert_no_files(&out);
+    }
+    let after: Vec<_> = [&he_aac, &wave, &stub].iter().map(|path| fs::read(path).unwrap()).collect();
+    assert_eq!(before, after, "refused inputs are never modified");
 }
 
 // --- G: embedded artwork --------------------------------------------------------------------------
@@ -946,6 +1108,15 @@ fn id3v23_frame(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// An ID3v2.3 tag holding the frames, with no padding.
+fn id3v23_tag_of(frames: &[Vec<u8>]) -> Vec<u8> {
+    let frames = frames.concat();
+    let size = frames.len();
+    let mut tag = vec![b'I', b'D', b'3', 3, 0, 0, (size >> 21) as u8 & 0x7f, (size >> 14) as u8 & 0x7f, (size >> 7) as u8 & 0x7f, size as u8 & 0x7f];
+    tag.extend(frames);
+    tag
+}
+
 /// An ID3v2.3 tag with a title, an artist and one PNG picture.
 fn id3v23_tag_with_picture(png: &[u8]) -> Vec<u8> {
     let text = |value: &str| { let mut body = vec![0]; body.extend_from_slice(value.as_bytes()); body };
@@ -962,8 +1133,8 @@ fn id3v23_tag_with_picture(png: &[u8]) -> Vec<u8> {
 }
 
 /// The reference marker writer drops the chunk TagLib saves last (see CLI_CONTRACT.md, WAV tag chunks); with
-/// `parity.allow_non_identical` the engine keeps every chunk TagLib wrote and says so in `non_identical_paths`.
-/// Nothing else about the output changes, and the default policy is exactly what it was.
+/// `parity.allow_non_identical` the engine keeps every chunk TagLib wrote that carries source data and says so in
+/// `non_identical_paths`. Nothing else about the output changes, and the default policy is exactly what it was.
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
 fn wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without() {
@@ -971,12 +1142,14 @@ fn wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without() {
     let png = generated_png(8, 8);
     let id3 = id3v23_tag_with_picture(&png);
     let info = [b"INFO".to_vec(), riff_chunk(b"INAM", b"Info title\0"), riff_chunk(b"IART", b"Info artist\0")].concat();
+    let empty_id3 = id3v23_tag_of(&[id3v23_frame(b"TKEY", &[0]), id3v23_frame(b"TBPM", &[0, b'0'])]);
     // (label, chunks after data, chunk ids the default policy keeps of them, ids the opt-in keeps, the opt-in changes the output)
-    let cases: [(&str, Vec<Vec<u8>>, &[&str], &[&str], bool); 5] = [
+    let cases: [(&str, Vec<Vec<u8>>, &[&str], &[&str], bool); 6] = [
         ("ID3 chunk only", vec![riff_chunk(b"ID3 ", &id3)], &[], &["ID3 "], true),
         ("lowercase id3 chunk only", vec![riff_chunk(b"id3 ", &id3)], &[], &["ID3 "], true),
         ("INFO LIST only", vec![riff_chunk(b"LIST", &info)], &[], &["LIST"], true),
         ("ID3 chunk and INFO LIST", vec![riff_chunk(b"ID3 ", &id3), riff_chunk(b"LIST", &info)], &["ID3 "], &["ID3 ", "LIST"], true),
+        ("ID3 chunk with only a zero tempo and an empty key", vec![riff_chunk(b"ID3 ", &empty_id3)], &[], &[], false),
         ("no tag chunks", Vec::new(), &[], &[], false),
     ];
     let plain = {
@@ -1030,28 +1203,86 @@ fn wav_tag_chunks_are_kept_with_the_opt_in_and_dropped_without() {
     }
 }
 
-/// A cross-format copy into a WAV always writes tempo and key through TagLib, so even a source without tags gains an
-/// `ID3 ` chunk (an empty key and a zero tempo) under the opt-in, and the item says so.
+/// The frames of the leading ID3v2.3/2.4 tag in an `ID3 ` chunk body: `(identifier, body)` in order, up to the padding.
+fn id3_frames(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    assert_eq!(&data[..3], b"ID3", "the chunk holds no ID3v2 tag");
+    let version = data[3];
+    assert!(matches!(version, 3 | 4), "ID3v2.{version} is not handled by this test");
+    let end = 10 + synchsafe(&data[6..10]);
+    let (mut position, mut frames) = (10, Vec::new());
+    while position + 10 <= end && data[position] != 0 {
+        let size_bytes: [u8; 4] = data[position + 4..position + 8].try_into().unwrap();
+        let size = if version == 4 { synchsafe(&size_bytes) } else { u32::from_be_bytes(size_bytes) as usize };
+        frames.push((data[position..position + 4].try_into().unwrap(), data[position + 10..position + 10 + size].to_vec()));
+        position += 10 + size;
+    }
+    frames
+}
+
+/// The text of the first frame `id` of an `ID3 ` chunk body, without its encoding byte (Latin-1 or UTF-8 is all TagLib writes here).
+fn id3_text(body: &[u8], id: &[u8; 4]) -> String {
+    let frames = id3_frames(body);
+    let (_, frame) = frames.iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("no {} frame in {frames:?}", String::from_utf8_lossy(id)));
+    String::from_utf8_lossy(&frame[1..]).into_owned()
+}
+
+/// A cross-format copy into a WAV always writes tempo and key through TagLib (a zero tempo and an empty key when the source has
+/// none), so every item gets an `ID3 ` chunk after the declared RIFF end. The opt-in keeps a trailing tag chunk only when it
+/// carries source data: a source without tags, tempo and key gives the default policy's output and lists nothing, while a
+/// source with a tempo, a key or tags keeps what TagLib wrote for it (byte for byte) and lists the path.
 #[test]
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
-fn cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote() {
+fn cross_format_copies_into_a_wav_keep_only_chunks_that_carry_source_data() {
     let sandbox = Sandbox::configured();
-    let flac = sandbox.flac("plain", None);
-    let mut outputs = Vec::new();
-    for (round, on) in [false, true].into_iter().enumerate() {
-        sandbox.set_opt_in(on);
-        let out = sandbox.dir(&format!("out-{round}"));
-        let processed = sandbox.ok(&["process", text(&flac), "--format", "wav", "--output-dir", text(&out)]);
-        let expected: &[&str] = if on { &["wav_tag_preservation"] } else { &[] };
-        assert_eq!(paths(report(&processed, 0)), expected, "opt-in {on}: {processed}");
-        outputs.push(wav_chunks(&fs::read(report(&processed, 0)["output_path"].as_str().unwrap()).unwrap()));
+    let plain = fs::read(sandbox.flac("plain", None)).unwrap();
+    // (label, the source's Vorbis comments, the chunk ids the opt-in adds to the default policy's output)
+    let cases: [(&str, &[(&str, &str)], &[&str]); 8] = [
+        ("no tags, tempo or key", &[], &[]),
+        ("a zero tempo and an empty key", &[("BPM", "0"), ("INITIALKEY", "")], &[]),
+        ("tempo only", &[("BPM", "128")], &["ID3 "]),
+        ("key only", &[("INITIALKEY", "Am")], &["ID3 "]),
+        ("tempo and key", &[("BPM", "90"), ("INITIALKEY", "F#m")], &["ID3 "]),
+        ("tags only", &[("TITLE", "Plain title"), ("ARTIST", "Plain artist")], &["LIST"]),
+        ("a title and a tempo", &[("TITLE", "Plain title"), ("BPM", "128")], &["LIST"]),
+        ("tags, tempo and key", &[("TITLE", "Plain title"), ("ARTIST", "Plain artist"), ("BPM", "90"), ("INITIALKEY", "F#m")], &["LIST"]),
+    ];
+    for (case, (label, comments, added)) in cases.into_iter().enumerate() {
+        let source = sandbox.file(&format!("inputs/case-{case}.flac"), &flac_with_comments(&plain, comments));
+        let mut outputs = Vec::new();
+        for (round, on) in [false, true].into_iter().enumerate() {
+            sandbox.set_opt_in(on);
+            let out = sandbox.dir(&format!("out-{case}-{round}"));
+            let processed = sandbox.ok(&["process", text(&source), "--format", "wav", "--output-dir", text(&out)]);
+            let expected_paths: &[&str] = if on && !added.is_empty() { &["wav_tag_preservation"] } else { &[] };
+            assert_eq!(paths(report(&processed, 0)), expected_paths, "{label}, opt-in {on}: {processed}");
+            outputs.push(fs::read(report(&processed, 0)["output_path"].as_str().unwrap()).unwrap());
+        }
+        let (off, on) = (wav_chunks(&outputs[0]), wav_chunks(&outputs[1]));
+        // Only chunks are added: everything the default policy writes is byte-identical under the opt-in.
+        for (id, body) in &off {
+            let kept = on.iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("{label}: {id:?} missing under the opt-in"));
+            assert_eq!(&kept.1, body, "{label}: {id:?}");
+        }
+        let ids = |chunks: &[([u8; 4], Vec<u8>)]| chunks.iter().map(|(id, _)| String::from_utf8_lossy(id).into_owned()).collect::<Vec<_>>();
+        let gained: Vec<String> = on.iter().filter(|(id, _)| off.iter().filter(|(other, _)| other == id).count() < on.iter().filter(|(other, _)| other == id).count())
+            .map(|(id, _)| String::from_utf8_lossy(id).into_owned()).collect();
+        assert_eq!(gained, added, "{label}: the opt-in adds exactly the chunks that carry data (off {:?}, on {:?})", ids(&off), ids(&on));
+        if added.is_empty() {
+            assert_eq!(outputs[0], outputs[1], "{label}: nothing to keep, nothing changes");
+            continue;
+        }
+        // The chunk TagLib wrote after the declared end is kept exactly: the zero or empty member of tempo and key stays.
+        let tag_chunk = |chunks: &[([u8; 4], Vec<u8>)]| chunks.iter().filter(|(id, _)| id == b"ID3 ").map(|(_, body)| body.clone()).last();
+        let tag = tag_chunk(&on).unwrap_or_else(|| panic!("{label}: no ID3 chunk in {:?}", ids(&on)));
+        let tempo = comments.iter().find(|(name, _)| *name == "BPM").map_or("0", |(_, value)| value);
+        let key = comments.iter().find(|(name, _)| *name == "INITIALKEY").map_or("", |(_, value)| value);
+        assert_eq!(id3_text(&tag, b"TBPM"), tempo, "{label}");
+        assert_eq!(id3_text(&tag, b"TKEY"), key, "{label}");
+        if let Some((_, title)) = comments.iter().find(|(name, _)| *name == "TITLE") {
+            let list = on.iter().find(|(id, _)| id == b"LIST").map(|(_, body)| body.clone()).unwrap_or_else(|| panic!("{label}: no LIST in {:?}", ids(&on)));
+            assert!(list.starts_with(b"INFO") && list.windows(title.len()).any(|window| window == title.as_bytes()), "{label}: the INFO list holds the title");
+        }
     }
-    for (id, body) in &outputs[0] {
-        let kept = outputs[1].iter().find(|(other, _)| other == id).unwrap_or_else(|| panic!("{id:?} missing under the opt-in"));
-        assert_eq!(&kept.1, body, "{id:?}");
-    }
-    let added: Vec<&[u8; 4]> = outputs[1].iter().map(|(id, _)| id).filter(|id| !outputs[0].iter().any(|(other, _)| other == *id)).collect();
-    assert_eq!(added, [b"ID3 "], "the opt-in only adds the chunk TagLib wrote");
 }
 
 // --- H: failed items carry a code and no report -------------------------------------------------------
@@ -1060,7 +1291,8 @@ fn cross_format_copies_into_a_wav_keep_the_chunk_taglib_wrote() {
 #[ignore = "requires PLATINUM_TEST_TAG_BRIDGE, PN_FLAC_LIB/PN_FLAC_SHA256, PN_LAME_LIB/PN_LAME_SHA256 (the image's libraries)"]
 fn failed_items_have_no_report() {
     let sandbox = Sandbox::configured();
-    let m4a = sandbox.file("tone.m4a", &aac_m4a());
+    // HE-AAC: a codec the portable decoder refuses (a plain AAC-LC `.m4a` is decoded now)
+    let m4a = sandbox.file("tone.m4a", &he_aac_m4a());
     let low = sandbox.file("low-rate.wav", &generated_wav(22_050, SECONDS, false));
     let good = sandbox.file("good.wav", &generated_wav(RATE, SECONDS, false));
     let out = sandbox.dir("out");

@@ -316,8 +316,8 @@ mod candidate_bridge {
     }
 
     /// `TransferOptions::preserve_wav_chunks` (Linux and `portable` builds, the v0.2.0 opt-in): the marker rewrite keeps
-    /// every chunk TagLib wrote, so a WAV source's `ID3 ` chunk (tags and APIC) and INFO `LIST` survive, and nothing
-    /// else about the output changes. The test above pins the default policy these cases deviate from.
+    /// every chunk TagLib wrote that carries source data, so a WAV source's `ID3 ` chunk (tags and APIC) and INFO `LIST`
+    /// survive, and nothing else about the output changes. The test above pins the default policy these cases deviate from.
     #[cfg(any(target_os = "linux", feature = "portable"))]
     #[test]
     #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
@@ -372,7 +372,7 @@ mod candidate_bridge {
     }
 
     /// The generic (cross-format) copy into a WAV goes through the same marker rewrite, so the option keeps the chunks
-    /// TagLib wrote there too, and only adds them.
+    /// TagLib wrote there too when they carry source data, and only adds them.
     #[cfg(any(target_os = "linux", feature = "portable"))]
     #[test]
     #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
@@ -394,6 +394,46 @@ mod candidate_bridge {
         assert_eq!(on_report.wav_tags_preserved, on_chunks.len() > off_chunks.len(), "off {:?} on {:?}", off_chunks.iter().map(|(id, _)| *id).collect::<Vec<_>>(), on_chunks.iter().map(|(id, _)| *id).collect::<Vec<_>>());
         assert!(on_report.wav_tags_preserved, "the generic copy writes tag chunks, and the last one is lost by the default policy");
         assert!(!off_report.wav_tags_preserved);
+    }
+
+    /// The generic copy into a WAV always writes `TBPM` and `TKEY` (a zero tempo and an empty key when the source has none).
+    /// The option keeps the `ID3 ` chunk TagLib appends only when the source gave it data; otherwise the output is the default
+    /// policy's, byte for byte, and nothing is reported (v0.4.0).
+    #[cfg(any(target_os = "linux", feature = "portable"))]
+    #[test]
+    #[ignore = "requires PN_TAG_BRIDGE built from the pinned public TagLib source"]
+    fn preserve_wav_chunks_drops_a_cross_format_tag_chunk_that_carries_no_source_data() {
+        use platinum_engine::tags::TransferOptions;
+        let bridge = library(); let marker = marker();
+        let preserve = TransferOptions { preserve_wav_chunks: true, ..TransferOptions::default() };
+        // (label, the source's ID3 frames, the opt-in keeps a chunk)
+        let cases: [(&str, Vec<Vec<u8>>, bool); 6] = [
+            ("no tag", Vec::new(), false),
+            ("a zero tempo and an empty key", vec![text(b"TBPM", "0"), text(b"TKEY", "")], false),
+            ("a tempo", vec![text(b"TBPM", "128")], true),
+            ("a key", vec![text(b"TKEY", "Am")], true),
+            ("a title", vec![text(b"TIT2", "Title")], true),
+            ("a tempo, a key and a title", vec![text(b"TBPM", "90"), text(b"TKEY", "F#m"), text(b"TIT2", "Title")], true),
+        ];
+        for (label, frames, kept) in cases {
+            let source = if frames.is_empty() { mp3(&[]) } else { mp3(&tag(&frames)) };
+            let src = Temp::new("mp3", &source);
+            let off = Temp::new("wav", &base_wav(&[])); let on = Temp::new("wav", &base_wav(&[]));
+            let off_report = bridge.transfer(src.path(), off.path(), Format::Mp3, Format::Wav, OutputChoice::Explicit, &marker).unwrap();
+            let on_report = bridge.transfer_with_options(src.path(), on.path(), Format::Mp3, Format::Wav, OutputChoice::Explicit, &marker, preserve).unwrap();
+            assert!(off_report.is_success() && on_report.is_success(), "{label}: {off_report:?} {on_report:?}");
+            assert!(!off_report.wav_tags_preserved, "{label}");
+            assert_eq!(on_report.wav_tags_preserved, kept, "{label}");
+            let (off_chunks, on_chunks) = (chunks(&off.bytes()), chunks(&on.bytes()));
+            for (id, body) in &off_chunks {
+                assert_eq!(on_chunks.iter().find(|(other, _)| other == id).map(|(_, kept)| kept), Some(body), "{label}: {id:?}");
+            }
+            if kept {
+                assert!(on_chunks.len() > off_chunks.len(), "{label}: a kept chunk is an added chunk");
+            } else {
+                assert_eq!(off.bytes(), on.bytes(), "{label}: nothing carries source data, nothing changes");
+            }
+        }
     }
 
     #[test]

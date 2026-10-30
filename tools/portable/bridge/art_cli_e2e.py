@@ -2,7 +2,8 @@
 """End-to-end check of cover art into and out of WAV through the real `platinum` CLI (not the bridge alone).
 
   gen  host: ffmpeg + art_containers write 1-second FLAC/MP3/ALAC(M4A)/AIFF/WAV sources, with and without pictures
-       (no tags at all, so the ID3 chunk TagLib saves into a WAV is the last chunk and only the opt-in keeps it).
+       (no tags, tempo or key at all: a source with pictures carries only them, a source without pictures carries nothing, so the
+       empty `ID3 ` chunk TagLib writes into a WAV for a cross-format copy holds no source data and the opt-in drops it, as the reference does).
   run  host or image: `platinum process --format F` for every source and destination format, with
        `parity.allow_non_identical` on and off, and verify the pictures of every published file with stdlib parsers.
 
@@ -135,7 +136,7 @@ def expect(source: dict[str, Any], dest_fmt: str, opt_in: bool) -> dict[str, Any
     direct = SOURCE_OF[src] == dest_fmt or (src, dest_fmt) == ("m4a", "mp3")
     container = DEST[dest_fmt]
     if not pictures:
-        return {"ok": True, "pictures": []}
+        return {"ok": True, "pictures": [], "paths": []}
     if direct:
         if src == "flac":  # FLAC to FLAC: the reference drops picture blocks; the opt-in carries them
             return {"ok": True, "pictures": pictures if opt_in else [], "paths": ["artwork_copy"] if opt_in else []}
@@ -206,7 +207,7 @@ def run(args: argparse.Namespace) -> None:
                         problems.append(f"succeeded, expected {expected['code']}")
                     else:
                         check(container, expected, data, source, problems)
-                        if sorted(report["non_identical_paths"]) != sorted(expected.get("paths", [])) and source["pictures"]:
+                        if sorted(report["non_identical_paths"]) != sorted(expected.get("paths", [])):
                             problems.append(f"non_identical_paths {report['non_identical_paths']} != {expected.get('paths')}")
                         if container == "wav":
                             chunks = [chunk_id for chunk_id, _, _ in ac.riff_chunks(data, False)]

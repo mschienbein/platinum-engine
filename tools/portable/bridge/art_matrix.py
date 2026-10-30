@@ -643,8 +643,11 @@ def load_parity():
 
 
 def trailing_riff_size(data: bytes) -> int | None:
-    """Port of `wav_preserve::trailing_chunks`: the RIFF size that makes the declared end the end of the file, when the
-    bytes after the declared end are a bounded run of well-formed chunks that reach exactly the end of the file."""
+    """Port of the framing rules of `wav_preserve::trailing_chunks`: the RIFF size that makes the declared end the end of the
+    file, when the bytes after the declared end are a bounded run of well-formed chunks that reach exactly the end of the file.
+    Since v0.4.0 the engine also drops the trailing tag chunks that carry no source data (an `ID3 ` chunk of only an empty
+    tempo and key, an INFO `LIST` without a value); this test double keeps every chunk of the run. The matrix asserts only the
+    audio and the pictures of the output, and pictures live in chunks that carry data, so the two agree on everything it checks."""
     length = len(data)
     if length < 20 or length - 8 > 0xFFFFFFFF or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         return None

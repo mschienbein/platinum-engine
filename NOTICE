@@ -115,3 +115,19 @@ https://datatracker.ietf.org/ipr/1914/
 
 Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
+
+Platinum Engine — exact AAC encoder and decoder (Linux and portable builds)
+
+The AAC output and input of Linux and `--features portable` builds are written
+by project-owned Rust in src/portable/aac/ that reproduces what Apple's
+AudioToolbox produces for the engine's call sequence. Its behavior and numeric
+constants were recovered from Apple's binaries (the AudioCodecs component and
+AudioToolbox, macOS 27.2 build 26B123) on one reference machine by static
+analysis, instruction-level transcription and recorded runtime states; among
+the constants are tables that are bit-exact copies of data read from the arm64e
+slice of AudioCodecs (the modules hold 19 table and data files, ten of them
+binary). No Apple binary and no Apple source code is included, no
+Apple API is called by this code, and the project is not affiliated with Apple.
+No legal clearance is claimed. AAC is a patented format; patent licensing may
+apply to encoders and decoders in some jurisdictions, the project grants no
+patent rights and gives no legal advice. See THIRD_PARTY_NOTICES.

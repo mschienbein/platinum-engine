@@ -66,6 +66,59 @@ fn lane_moves_preserve_payloads_and_order() {
     assert_eq!(vfmaq_f32(base, [2.0; 4], [0.5; 4]), [2.0, 3.0, 4.0, 5.0]);
 }
 
+#[test]
+fn estimate_and_step_instruction_rules() {
+    let bits = |x: f32| x.to_bits();
+    let f = f32::from_bits;
+    // FRECPE / FRSQRTE: the values below are those of the real instructions.
+    assert_eq!(bits(frecpe_f32(1.0)), 0x3f7f_8000);
+    assert_eq!(bits(frecpe_f32(0.0)), 0x7f80_0000);
+    assert_eq!(bits(frecpe_f32(-0.0)), 0xff80_0000);
+    assert_eq!(bits(frecpe_f32(f32::NEG_INFINITY)), 0x8000_0000);
+    assert_eq!(bits(frecpe_f32(f(0x7f80_0123))), 0x7fc0_0123);
+    assert_eq!(bits(frecpe_f32_with_mode(f(0xff80_0123), mode(false, true))), 0x7fc0_0000);
+    assert_eq!(bits(frecpe_f32(f(0x001f_ffff))), 0x7f80_0000);
+    assert_eq!(bits(frecpe_f32(f(0x0020_0000))), 0x7f7f_8000);
+    assert_eq!(bits(frecpe_f32_fz(f(0x0020_0000))), 0x7f80_0000);
+    assert_eq!(bits(frecpe_f32(f(0x7e80_0000))), 0x007f_c000);
+    assert_eq!(bits(frecpe_f32_fz(f(0x7e80_0000))), 0);
+    assert_eq!(bits(frecpe_f32(f(0x7f7f_ffff))), 0x0020_0000);
+    assert_eq!(bits(frsqrte_f32(1.0)), 0x3f7f_8000);
+    assert_eq!(bits(frsqrte_f32(0.0)), 0x7f80_0000);
+    assert_eq!(bits(frsqrte_f32(-0.0)), 0xff80_0000);
+    assert_eq!(bits(frsqrte_f32(-1.0)), 0x7fc0_0000);
+    assert_eq!(bits(frsqrte_f32(f32::NEG_INFINITY)), 0x7fc0_0000);
+    assert_eq!(bits(frsqrte_f32(f32::INFINITY)), 0);
+    assert_eq!(bits(frsqrte_f32(f(0xff80_0123))), 0xffc0_0123);
+    assert_eq!(bits(frsqrte_f32(f(0x0000_0001))), 0x64b4_8000);
+    assert_eq!(bits(frsqrte_f32_fz(f(0x0000_0001))), 0x7f80_0000);
+    assert_eq!(bits(frsqrte_f32(f(0x001f_ffff))), 0x5f80_0000);
+    // FRECPS / FRSQRTS: an infinity times a zero is exactly 2 (1.5), an exact zero is +0.
+    assert_eq!(bits(frecps_f32(f32::INFINITY, 0.0)), 0x4000_0000);
+    assert_eq!(bits(frecps_f32(-0.0, f32::NEG_INFINITY)), 0x4000_0000);
+    assert_eq!(bits(frsqrts_f32(0.0, f32::INFINITY)), 0x3fc0_0000);
+    assert_eq!(bits(frsqrts_f32(-0.0, f32::NEG_INFINITY)), 0x3fc0_0000);
+    assert_eq!(bits(frecps_f32(f32::INFINITY, 1.0)), 0xff80_0000);
+    assert_eq!(bits(frecps_f32(2.0, 1.0)), 0);
+    assert_eq!(bits(frecps_f32(3.0, 1.0)), 0xbf80_0000);
+    assert_eq!(bits(frsqrts_f32(3.0, 1.0)), 0);
+    assert_eq!(bits(frsqrts_f32(2.0, 1.0)), 0x3f00_0000);
+    assert_eq!(bits(frecps_f32(1.0, 1.0)), 0x3f80_0000);
+    assert_eq!(bits(frsqrts_f32(1.0, 1.0)), 0x3f80_0000);
+    // The first operand is negated before NaN selection; signaling NaNs are quieted and win over quiet NaNs.
+    assert_eq!(bits(frecps_f32(f(0x7fc0_0001), f(0x7f80_0002))), 0x7fc0_0002);
+    assert_eq!(bits(frecps_f32(f(0x7fc0_0001), 1.0)), 0xffc0_0001);
+    assert_eq!(bits(frsqrts_f32(1.0, f(0xffc0_0003))), 0xffc0_0003);
+    assert_eq!(bits(frsqrts_f32_with_mode(f(0x7fc0_0001), 1.0, mode(false, true))), 0x7fc0_0000);
+    // (3 - a*b)/2 is finite where the product alone would overflow, and exact for a subnormal `a`.
+    assert_eq!(bits(frsqrts_f32(f(0xff7f_ffff), 2.0)), 0x7f7f_ffff);
+    assert_eq!(bits(frecps_f32(f(0xff7f_ffff), 2.0)), 0x7f80_0000);
+    assert_eq!(bits(frsqrts_f32(f(0x0000_0001), f(0x7eff_fffe))), 0x3fbf_ffff);
+    assert_eq!(bits(frsqrts_f32(f(0x0000_0001), 1.0)), 0x3fc0_0000);
+    assert_eq!(bits(frsqrts_f32_fz(f(0x0000_0001), f32::INFINITY)), 0x3fc0_0000);
+    assert_eq!(bits(frsqrts_f32(f(0x0000_0001), f32::INFINITY)), 0xff80_0000);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn x86_flush_controls_do_not_change_the_requested_arm_mode() {
@@ -345,6 +398,56 @@ mod native {
                 assert_eq!(actual.map(f32::to_bits),expected.map(f32::to_bits),
                     "FMLA {mode:?} a={a:08x} b={b:08x} c={c:08x}");
             }}}
+        }}
+    }
+    macro_rules! unary32 {
+        ($op:literal, $name:ident) => {
+            fn $name(a: f32) -> f32 {
+                let out: f32;
+                unsafe { asm!(concat!($op, " {out:s}, {a:s}"), out=lateout(vreg) out, a=in(vreg) a, options(nomem, nostack)); }
+                out
+            }
+        };
+    }
+    unary32!("frecpe", recpe); unary32!("frsqrte", rsqrte);
+    binary32!("frecps", recps); binary32!("frsqrts", rsqrts);
+
+    #[test]
+    fn estimate_and_step_instructions_match_the_real_ones() {
+        let restore = Restore::new();
+        let mut seed = 0xb5ad_4ece_da1c_e2a9_u64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 16) as u32 };
+        for fz in [false, true] { for dn in [false, true] {
+            let mode = mode(fz, dn);
+            restore.set(mode);
+            // every 4099th pattern, and the edge fractions of every exponent
+            let mut patterns: Vec<u32> = (0..=u32::MAX / 4099).map(|i| i * 4099).collect();
+            for e in 0..=255_u32 { for d in [0_u32, 1, 0x3f_ffff, 0x40_0000, 0x40_0001, 0x7f_ffff, 0x7f_fffe, 0x1f_ffff, 0x20_0000] {
+                patterns.push((e << 23) | d); patterns.push(0x8000_0000 | (e << 23) | d);
+            }}
+            for &x in &patterns {
+                let a = f32::from_bits(x);
+                assert_eq!(recpe(a).to_bits(), frecpe_f32_with_mode(a, mode).to_bits(), "FRECPE {x:08x} {mode:?}");
+                assert_eq!(rsqrte(a).to_bits(), frsqrte_f32_with_mode(a, mode).to_bits(), "FRSQRTE {x:08x} {mode:?}");
+            }
+            let mut pairs: Vec<(u32, u32)> = SPECIAL32.iter().flat_map(|&a| SPECIAL32.iter().map(move |&b| (a, b))).collect();
+            for _ in 0..400_000 {
+                let (a, b) = (next(), next());
+                // near-cancelling pairs: a*b close to 2 or 3, and products around the overflow edge
+                let target = [2.0_f64, 3.0, -2.0, -3.0, 2.0_f64.powi(129)][(next() % 5) as usize];
+                // `f64::max` is not for this tree (clippy.toml): the same clamp as a comparison (a NaN divisor also gives 1e-300)
+                let divisor = f64::from(f32::from_bits(a)).abs();
+                let divisor = if divisor > 1e-300 { divisor } else { 1e-300 };
+                let near = f32::from_bits((((target / divisor) as f32).to_bits() as i32).wrapping_add((next() % 7) as i32).wrapping_sub(3) as u32);
+                pairs.push((a, b));
+                pairs.push((a, near.to_bits()));
+                pairs.push(((next() & 0x807f_ffff) | ((100 + next() % 55) << 23), (next() & 0x807f_ffff) | ((100 + next() % 55) << 23)));
+            }
+            for (x, y) in pairs {
+                let (a, b) = (f32::from_bits(x), f32::from_bits(y));
+                assert_eq!(recps(a, b).to_bits(), frecps_f32_with_mode(a, b, mode).to_bits(), "FRECPS {x:08x} {y:08x} {mode:?}");
+                assert_eq!(rsqrts(a, b).to_bits(), frsqrts_f32_with_mode(a, b, mode).to_bits(), "FRSQRTS {x:08x} {y:08x} {mode:?}");
+            }
         }}
     }
 }

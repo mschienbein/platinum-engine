@@ -5,9 +5,11 @@
 //! system originals on macOS; Linux builds use them in place of the originals.
 #![allow(clippy::disallowed_methods)]
 
+pub(crate) mod aac;
 pub mod arm;
 pub mod arm_scalar;
 pub mod audio;
+pub mod dft;
 pub mod digest;
 pub mod fft;
 pub mod fft_sme;

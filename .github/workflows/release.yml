@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published release tag to package (currently v0.3.0)
+        description: Published release tag to package (currently v0.4.0)
         required: true
         type: string
 
@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: platinum-runtime-v0.3.0
+  group: platinum-runtime-v0.4.0
   cancel-in-progress: false
 
 env:
@@ -32,8 +32,8 @@ jobs:
           - arch: amd64
             machine: x86_64
             runner: ubuntu-24.04
-            archive_sha256: a643bc23410c5eebc82ec9ca214c4cbe4900ae4a09c4314bbec1d0e439c9e61b
-            binary_sha256: c4e5e9539dda255b521ac2251ff297c7e5429b0976a42785bc8896b6b0907676
+            archive_sha256: 531f46c43fa1261113a96e157eaacac2fc593477840a317e78cdf35ec00dc4ad
+            binary_sha256: 3d196d68316557f44afd2acb2b917c0f708b998f87a6dcb67e9380f82e75a733
             bridge_sha256: 8c61f6bba22ad2e92bb1774e695c3a1cca5a1658e9ffc86e3ef65418550cefb9
             flac_sha256: 9420c96f562aec7734f09469ed07def4444471cf90d2c3fd70bc257e847b8755
             lame_sha256: cf59ae7fc6445a2b1d24465f423865e971e966b780c3f82d268cd397dbef675b
@@ -41,8 +41,8 @@ jobs:
           - arch: arm64
             machine: aarch64
             runner: ubuntu-24.04-arm
-            archive_sha256: 7ac0a5444cf24a1237f2af24d653e1a6ff538d8edc9d973184dd8c1cc920961f
-            binary_sha256: 7157424200dd277949a90fec5d9c44e56560ca7613846f32d1e11bd152be6d8d
+            archive_sha256: 2818aaa447490543fb432a96aa119b831b794e126f2db187ff5ff931950fe98f
+            binary_sha256: fd5f14dae3aac333c31eeeba1093f1eb199d01af3ed232fe9e3ec1270f07f776
             bridge_sha256: 5c52c5f16da96177a98b3f7569257aeb33d7024b235903da7f0afaecccf73cde
             flac_sha256: 41b59a452fcd7245a0609a924b8cfcd7873e7b740945d49cd25c34321ec01e72
             lame_sha256: c780062f806c3b04ab00b777efd9f842f00800724f7183815374fdabd89c9d87
@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
-          test "$RELEASE_TAG" = v0.3.0
+          test "$RELEASE_TAG" = v0.4.0
           test "$(uname -m)" = "$MACHINE"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease \
             | jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and .isDraft == false and .isPrerelease == false'
@@ -85,7 +85,7 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern SHA256SUMS --pattern "$asset" --dir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          printf '%s  %s\n' dcbf81052903a48b6fc5dc0cac048019f58e1a11a4fab39316dbfe93ded3c902 SHA256SUMS | sha256sum -c -
+          printf '%s  %s\n' 2e19f3c604cc4b5520dd1026f49b867a751ac0c8cec7986f1103a2962b76f170 SHA256SUMS | sha256sum -c -
           grep -Fx -- "$ARCHIVE_SHA256  $asset" SHA256SUMS
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$asset" | sha256sum -c -
           tar -xzf "$asset" -C "$RUNNER_TEMP/runtime-context/linux-$ARCH"
@@ -148,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = mschienbein/platinum-engine
-          test "$RELEASE_TAG" = v0.3.0
+          test "$RELEASE_TAG" = v0.4.0
           amd=$(cat "$RUNNER_TEMP/amd64/digest.txt")
           arm=$(cat "$RUNNER_TEMP/arm64/digest.txt")
           [[ "$amd" =~ ^sha256:[0-9a-f]{64}$ && "$arm" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -192,7 +192,7 @@ jobs:
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           image="$IMAGE@$MANIFEST_DIGEST"
           docker pull "$image"
-          test "$(docker run --rm "$image" --version)" = 'platinum 0.3.0'
+          test "$(docker run --rm "$image" --version)" = 'platinum 0.4.0'
           python3 - "$RUNNER_TEMP/reference.wav" <<'PY'
           import struct, sys, wave
           with open(sys.argv[1], 'xb') as raw:

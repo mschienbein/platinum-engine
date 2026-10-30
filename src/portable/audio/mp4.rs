@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use super::alac::Config;
+use super::alac::{AttemptStats, Config};
 
 #[derive(Debug)]
 pub enum Mp4Error { Io(io::Error), Invalid(&'static str), Unsupported(&'static str) }
@@ -186,6 +186,10 @@ fn sample_size(stsz: &[u8], fixed: u32, index: usize) -> Result<u32> {
     if fixed != 0 { Ok(fixed) } else { u32be(stsz, 12 + index * 4) }
 }
 
+/// Top-level atoms or chunks the readers that cost a system call per atom look at before they give up (the AAC sniffers read through a window and look at
+/// `aac_read::SNIFF_STEPS`; a real file has a handful in front of its movie atom).  What follows a refusal for this is the AAC container model's verdict.
+pub(crate) const MAX_SCANNED_BOXES: usize = 1 << 16;
+
 /// Index one non-fragmented ALAC track. Other tracks are not selected
 /// by guesswork: a file with more than one ALAC track is refused.
 pub fn read_alac<R: Read + Seek>(reader: &mut R) -> Result<AlacFile> {
@@ -194,7 +198,10 @@ pub fn read_alac<R: Read + Seek>(reader: &mut R) -> Result<AlacFile> {
     let mut pos = 0u64;
     let mut moov = None;
     let mut media = Vec::new();
+    let mut seen = 0usize;
     while pos < length {
+        seen += 1;
+        if seen > MAX_SCANNED_BOXES { return Err(Mp4Error::Unsupported("more top-level atoms than are scanned")); }
         if length - pos < 8 { return Err(Mp4Error::Invalid("truncated top-level atom")); }
         reader.seek(SeekFrom::Start(pos))?;
         let mut header = [0u8; 16];
@@ -416,15 +423,15 @@ impl From<io::Error> for WriterError { fn from(e: io::Error) -> Self { Self::Io(
 #[derive(Debug, Clone, Copy)]
 pub struct EncodedPacket { pub size: u32, pub frames: u32 }
 
-fn put32(dst: &mut Vec<u8>, value: u32) { dst.extend_from_slice(&value.to_be_bytes()); }
-fn atom(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+pub(crate) fn put32(dst: &mut Vec<u8>, value: u32) { dst.extend_from_slice(&value.to_be_bytes()); }
+pub(crate) fn atom(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 8);
     put32(&mut out, (data.len() + 8) as u32);
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
     out
 }
-fn append(dst: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) { dst.extend_from_slice(&atom(kind, data)); }
+pub(crate) fn append(dst: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) { dst.extend_from_slice(&atom(kind, data)); }
 fn matrix(dst: &mut Vec<u8>) {
     for x in [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] { put32(dst, x); }
 }
@@ -456,6 +463,71 @@ fn handler(kind: &[u8; 4], vendor: &[u8; 4]) -> Vec<u8> {
     d.extend_from_slice(&[0; 10]);
     atom(b"hdlr", &d)
 }
+/// The 28-byte `ftyp` of every AudioToolbox `m4af` file.
+pub(crate) fn ftyp() -> Vec<u8> { atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom") }
+/// The complete `moov` of a one-track sound file: `mvhd`, `trak` (`tkhd`, `mdia` (`mdhd`, `hdlr`, `minf` (`smhd`, `dinf`, `stbl`))) and the
+/// optional `udta` (`gapless`; empty for none). `stbl` is the codec's sample table; AudioToolbox writes ALAC and AAC with these same atoms.
+pub(crate) fn movie(rate: u32, duration: u32, clock: u32, stbl: &[u8], udta: &[u8]) -> Vec<u8> {
+    let mut dref = vec![0; 4];
+    put32(&mut dref, 1);
+    append(&mut dref, b"url ", &[0, 0, 0, 1]);
+    let mut dinf = Vec::new();
+    append(&mut dinf, b"dref", &dref);
+    let mut minf = atom(b"smhd", &[0; 8]);
+    append(&mut minf, b"dinf", &dinf);
+    append(&mut minf, b"stbl", stbl);
+    let mut mdia = media_header(rate, duration, clock);
+    mdia.extend_from_slice(&handler(b"soun", &[0; 4]));
+    append(&mut mdia, b"minf", &minf);
+    let mut trak = track_header(duration, clock);
+    append(&mut trak, b"mdia", &mdia);
+    let mut moov = movie_header(rate, duration, clock);
+    append(&mut moov, b"trak", &trak);
+    moov.extend_from_slice(udta);
+    atom(b"moov", &moov)
+}
+/// The 28-byte head every AudioToolbox sound sample entry (`alac`, `mp4a`) starts with, before the codec's own boxes: reserved bytes, data reference
+/// index 1, two channels (the real layout lives in the codec's boxes), 16-bit samples and the sample rate as `rate << 16` (16.16 fixed point).
+pub(crate) fn sound_entry(rate: u16) -> Vec<u8> {
+    let mut entry = vec![0; 6];
+    entry.extend_from_slice(&1u16.to_be_bytes());
+    entry.extend_from_slice(&[0; 8]);
+    entry.extend_from_slice(&2u16.to_be_bytes());
+    entry.extend_from_slice(&16u16.to_be_bytes());
+    put32(&mut entry, 0);
+    put32(&mut entry, u32::from(rate) << 16);
+    entry
+}
+
+/// Packets per chunk of AudioToolbox's writer: about half a second of audio, `rate / (2 * packet_frames) + 1`.
+pub(crate) fn packets_per_chunk(rate: u32, packet_frames: u32) -> usize {
+    (rate / (2 * packet_frames) + 1) as usize
+}
+
+/// First sample byte offset: AudioToolbox reserves the sample tables of 301 seconds of `packet_frames`-frame packets (`n` packets in chunks of
+/// [`packets_per_chunk`]) in front of the media data, `(5537 + 4 n + 4 (n / per_chunk))` rounded down to 4096 (the constant is the fixed box overhead of
+/// the ALAC and AAC layouts).
+pub(crate) fn reserved_data_offset(rate: u32, packet_frames: u32) -> u64 {
+    let packets = 301 * u64::from(rate) / u64::from(packet_frames);
+    let per_chunk = packets_per_chunk(rate, packet_frames) as u64;
+    (5537 + 4 * packets + 4 * (packets / per_chunk)) & !4095
+}
+
+/// A `free` atom of `size` bytes (header included, `size >= 8`) whose body is zero: the unused part of the reservation in front of the media data.
+pub(crate) fn write_free<W: Write>(out: &mut W, size: usize) -> io::Result<()> {
+    debug_assert!(size >= 8);
+    out.write_all(&(size as u32).to_be_bytes())?;
+    out.write_all(b"free")?;
+    let zero = [0u8; 4096];
+    let mut remaining = size - 8;
+    while remaining > 0 {
+        let n = remaining.min(zero.len());
+        out.write_all(&zero[..n])?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
 fn sample_description(config: Config, max_frame: u32, average: u32) -> Vec<u8> {
     let mut config_data = Vec::new();
     put32(&mut config_data, 0);
@@ -464,13 +536,7 @@ fn sample_description(config: Config, max_frame: u32, average: u32) -> Vec<u8> {
     put32(&mut config_data, max_frame);
     put32(&mut config_data, average);
     put32(&mut config_data, config.sample_rate);
-    let mut entry = vec![0; 6];
-    entry.extend_from_slice(&1u16.to_be_bytes());
-    entry.extend_from_slice(&[0; 8]);
-    entry.extend_from_slice(&2u16.to_be_bytes());
-    entry.extend_from_slice(&16u16.to_be_bytes());
-    put32(&mut entry, 0);
-    put32(&mut entry, 44100 << 16);
+    let mut entry = sound_entry(44100);
     append(&mut entry, b"alac", &config_data);
     if config.channels > 2 {
         let tag = match config.channels { 3 => 114, 4 => 116, 5 => 120, 6 => 124, 7 => 142, 8 => 127, _ => unreachable!() };
@@ -485,8 +551,9 @@ fn sample_description(config: Config, max_frame: u32, average: u32) -> Vec<u8> {
     append(&mut d, b"alac", &entry);
     atom(b"stsd", &d)
 }
-fn gapless(valid: u64, remainder: u64) -> Vec<u8> {
-    let text = format!(" 00000000 00000000 {remainder:08X} {valid:016X} 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000");
+/// The `udta` atom carrying the `iTunSMPB` gapless tag: priming frames (ALAC 0, AAC 2112), padding of the last packet, valid frames.
+pub(crate) fn gapless(priming: u32, valid: u64, remainder: u64) -> Vec<u8> {
+    let text = format!(" 00000000 {priming:08X} {remainder:08X} {valid:016X}{}", " 00000000".repeat(8));
     let mut mean = vec![0; 4];
     mean.extend_from_slice(b"com.apple.iTunes");
     let mut name = vec![0; 4];
@@ -517,6 +584,13 @@ fn gapless(valid: u64, remainder: u64) -> Vec<u8> {
 /// sample rate and table timescale are its truncated integer.
 pub fn write_alac_with_rate<W: Write, R: Read>(out: &mut W, source: &mut R, config: Config,
     source_rate: f64, packets: &[EncodedPacket], clock: u32) -> Result<(), WriterError> {
+    let stats = AttemptStats::of_packets(packets.iter().map(|p| p.size));
+    write_alac_with_stats(out, source, config, source_rate, packets, stats, clock)
+}
+
+/// As `write_alac_with_rate`, for an encoder that attempted more packets than it kept (see `alac::Stream`).
+pub fn write_alac_with_stats<W: Write, R: Read>(out: &mut W, source: &mut R, config: Config,
+    source_rate: f64, packets: &[EncodedPacket], stats: AttemptStats, clock: u32) -> Result<(), WriterError> {
     if config.frame_length != 4096 || !matches!(config.bit_depth, 16 | 20 | 24 | 32)
         || !(1..=8).contains(&config.channels) || config.pb != 40 || config.mb != 10 || config.kb != 14 {
         return Err(WriterError::Unsupported("ALAC configuration"));
@@ -524,13 +598,10 @@ pub fn write_alac_with_rate<W: Write, R: Read>(out: &mut W, source: &mut R, conf
     if !source_rate.is_finite() || !(22050.0..=96000.0).contains(&source_rate) || source_rate as u32 != config.sample_rate {
         return Err(WriterError::Unsupported("sample rate mismatch or outside verified range"));
     }
-    // AudioToolbox reserves a 301-second sample table before the media data.
-    // It computes chunk capacity with integer division and an additional
-    // packet, including at rates exactly divisible by 8192. The constant is
-    // the observed fixed box/reservation overhead for this ALAC layout.
-    let per_chunk = config.sample_rate as usize / 8192 + 1;
-    let estimated_packets = 301 * config.sample_rate as usize / 4096;
-    let data_offset = (5537 + 4 * estimated_packets + 4 * (estimated_packets / per_chunk)) & !4095;
+    // AudioToolbox reserves a 301-second sample table before the media data (`reserved_data_offset`). It computes chunk capacity with integer division and
+    // an additional packet, including at rates exactly divisible by 8192.
+    let per_chunk = packets_per_chunk(config.sample_rate, 4096);
+    let data_offset = reserved_data_offset(config.sample_rate, 4096) as usize;
     if packets.len() > 1_000_000 { return Err(WriterError::Unsupported("too many packets")); }
     let mut bytes = 0u64;
     let mut actual = 0u64;
@@ -548,9 +619,15 @@ pub fn write_alac_with_rate<W: Write, R: Read>(out: &mut W, source: &mut R, conf
     }
     if bytes > u64::from(u32::MAX - 8) || nominal > u64::from(u32::MAX) { return Err(WriterError::Unsupported("large MP4")); }
     if packets.is_empty() { max_size = 4096 * u32::from(config.channels) * 5 + 1; }
+    // The cookie statistics are AudioToolbox's own tally over every encode attempt: an attempt whose packet was rejected
+    // and encoded again counts too, so they cover at least the packets of the sample table and can exceed them.
+    if !packets.is_empty() && (stats.attempts < packets.len() as u64 || stats.bytes < bytes || stats.max_bytes < max_size) {
+        return Err(WriterError::Invalid("attempt statistics smaller than the packets"));
+    }
     let average = if packets.is_empty() { 0 } else {
-        let denominator = (packets.len() * 4096) as f64;
-        let value = (source_rate * bytes as f64) * 8.0 / denominator;
+        max_size = stats.max_bytes;
+        let denominator = (stats.attempts * 4096) as f64;
+        let value = (source_rate * stats.bytes as f64) * 8.0 / denominator;
         if value >= u32::MAX as f64 { return Err(WriterError::Unsupported("bitrate overflow")); }
         value as u32
     };
@@ -591,27 +668,9 @@ pub fn write_alac_with_rate<W: Write, R: Read>(out: &mut W, source: &mut R, conf
     append(&mut stbl, b"stsc", &stsc);
     append(&mut stbl, b"stsz", &stsz);
     append(&mut stbl, b"stco", &stco);
-    let mut dref = vec![0; 4];
-    put32(&mut dref, 1);
-    append(&mut dref, b"url ", &[0, 0, 0, 1]);
-    let mut dinf = Vec::new();
-    append(&mut dinf, b"dref", &dref);
-    let mut minf = atom(b"smhd", &[0; 8]);
-    append(&mut minf, b"dinf", &dinf);
-    append(&mut minf, b"stbl", &stbl);
-    let mut mdia = media_header(config.sample_rate, nominal as u32, clock);
-    mdia.extend_from_slice(&handler(b"soun", &[0; 4]));
-    append(&mut mdia, b"minf", &minf);
-    let mut trak = track_header(nominal as u32, clock);
-    append(&mut trak, b"mdia", &mdia);
-    let mut moov = movie_header(config.sample_rate, nominal as u32, clock);
-    append(&mut moov, b"trak", &trak);
-    if !packets.is_empty() {
-        let remainder = (packets.len() as u64) * 4096 - actual;
-        moov.extend_from_slice(&gapless(actual, remainder));
-    }
-    let ftyp = atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom");
-    let moov = atom(b"moov", &moov);
+    let udta = if packets.is_empty() { Vec::new() } else { gapless(0, actual, (packets.len() as u64) * 4096 - actual) };
+    let ftyp = ftyp();
+    let moov = movie(config.sample_rate, nominal as u32, clock, &stbl, &udta);
     let available = data_offset - 8 - ftyp.len();
     // AudioToolbox puts moov last when it does not fit, or when the leftover
     // front gap is 1–7 bytes (too short for a free atom). An exact fit is
@@ -623,15 +682,7 @@ pub fn write_alac_with_rate<W: Write, R: Read>(out: &mut W, source: &mut R, conf
     if !packets.is_empty() {
         let free_size = available - if front_moov { moov.len() } else { 0 };
         if free_size != 0 {
-            out.write_all(&(free_size as u32).to_be_bytes())?;
-            out.write_all(b"free")?;
-            let zero = [0u8; 4096];
-            let mut remaining = free_size - 8;
-            while remaining > 0 {
-                let n = remaining.min(zero.len());
-                out.write_all(&zero[..n])?;
-                remaining -= n;
-            }
+            write_free(out, free_size)?;
         }
         out.write_all(&((bytes as u32) + 8).to_be_bytes())?;
         out.write_all(b"mdat")?;

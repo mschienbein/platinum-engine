@@ -206,7 +206,7 @@ def main() -> int:
                                "remote_host": args.ssh_host, "remote_output": remote,
                                "arm_image": args.arm_image, "x86_image": args.x86_image,
                                "build_command": "cargo build --offline --locked --release --bin platinum --features portable",
-                               "test_command": "cargo test --offline --locked --all-targets"}
+                               "test_command": "cargo test --offline --locked --all-targets --no-fail-fast"}
     try:
         snapshot = output / "snapshot"
         shutil.copytree(REPO, snapshot, symlinks=True, ignore=ignore_generated)

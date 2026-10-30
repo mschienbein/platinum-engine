@@ -527,8 +527,10 @@ fn batch_outcome(command: &str, results: Vec<ItemResult>, cancel: &Cancellation,
 // Every submitted index is either returned exactly once or remains not_started.
 // The cancellation token is checked before and after taking an index; active
 // engine calls receive that same token and own their transaction cleanup.
-fn parallel_items<F>(indices: &[usize], jobs: usize, cancel: &Cancellation, operation: F) -> Vec<(usize, ItemResult)>
-where F: Fn(usize) -> ItemResult + Sync {
+// A panic inside one item is that item's failure (`internal_error`), never the
+// loss of the batch: the other items keep running and are reported.
+fn parallel_items<F, P>(indices: &[usize], jobs: usize, cancel: &Cancellation, input_of: P, operation: F) -> Vec<(usize, ItemResult)>
+where F: Fn(usize) -> ItemResult + Sync, P: Fn(usize) -> PathBuf + Sync {
     if indices.is_empty() { return Vec::new(); }
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel();
@@ -538,18 +540,28 @@ where F: Fn(usize) -> ItemResult + Sync {
             let tx = tx.clone();
             let next = &next;
             let operation = &operation;
+            let input_of = &input_of;
             scope.spawn(move || loop {
                 if cancel.is_cancelled() { break; }
                 let slot = next.fetch_add(1, Ordering::Relaxed);
                 if slot >= indices.len() || cancel.is_cancelled() { break; }
                 let index = indices[slot];
-                if tx.send((index, operation(index))).is_err() { break; }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(index)))
+                    .unwrap_or_else(|payload| ItemResult::failed(&input_of(index), json!({
+                        "stage": "worker", "code": ErrorCode::InternalError,
+                        "message": format!("internal error: the worker panicked: {}", panic_message(payload.as_ref())),
+                    })));
+                if tx.send((index, result)).is_err() { break; }
             });
         }
         drop(tx);
         results.extend(rx);
     });
     results
+}
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "no message".to_owned())
 }
 fn worker_count(requested: Option<NonZeroUsize>, settings: &Settings, cores: usize) -> usize {
     let max = settings.processor_max.clamp(1, cores.max(1));
@@ -663,7 +675,7 @@ fn process(args: ProcessArgs, mut settings: Settings, home: &Path, cores: usize,
     if conflict.is_none() && !cancel.is_cancelled() {
         let job_trace = JobTrace::from_env()?;
         let slots: Vec<_> = (0..ready.len()).collect();
-        for (slot, result) in parallel_items(&slots, jobs, cancel, |slot| {
+        for (slot, result) in parallel_items(&slots, jobs, cancel, |slot| files[ready[slot]].path.clone(), |slot| {
             let file = &files[ready[slot]];
             if let Some(trace) = &job_trace { trace.event("begin", slot, &file.path); }
             let processed = engine::process_file(&prepared[slot], &template, &settings, cancel);
@@ -830,7 +842,7 @@ fn analyze(args: AnalyzeArgs, mut settings: Settings, cores: usize, cancel: &Can
     let (files, mut errors) = discovery(&args.batch.inputs, settings.admitted_formats());
     let indices: Vec<usize> = (0..files.len()).collect();
     let mut results: Vec<Option<ItemResult>> = (0..files.len()).map(|_| None).collect();
-    for (index, result) in parallel_items(&indices, jobs, cancel, |index| {
+    for (index, result) in parallel_items(&indices, jobs, cancel, |index| files[index].path.clone(), |index| {
         let file = &files[index];
         match engine::analyze_file(&file.path, &settings, cancel) {
             Ok(report) => match serde_json::to_value(report) {
@@ -848,7 +860,7 @@ fn inspect(args: InspectArgs, settings: &Settings, cores: usize, cancel: &Cancel
     let jobs = worker_count(args.jobs, settings, cores);
     let indices: Vec<usize> = (0..args.files.len()).collect();
     let mut results: Vec<Option<ItemResult>> = (0..args.files.len()).map(|_| None).collect();
-    for (index, result) in parallel_items(&indices, jobs, cancel, |index| {
+    for (index, result) in parallel_items(&indices, jobs, cancel, |index| args.files[index].clone(), |index| {
         let path = &args.files[index];
         match engine::inspect_file(path, settings) {
             Ok(report) => match serde_json::to_value(report) {
@@ -1173,13 +1185,33 @@ mod statistics_outcome_tests {
     }
 
     #[test]
+    fn a_panicking_item_fails_alone_and_the_rest_of_the_batch_is_reported() {
+        let cancel = Cancellation::new();
+        let paths = [PathBuf::from("a.wav"), PathBuf::from("b.wav"), PathBuf::from("c.wav")];
+        for jobs in [1, 3] {
+            let mut items = parallel_items(&[0, 1, 2], jobs, &cancel, |index| paths[index].clone(), |index| {
+                if index == 1 { panic!("boom {index}"); }
+                ItemResult::ok(&paths[index], json!({}))
+            });
+            items.sort_by_key(|(index, _)| *index);
+            assert_eq!(items.len(), 3);
+            assert_eq!((items[0].1.status, items[2].1.status), ("ok", "ok"));
+            assert_eq!(items[1].1.status, "failed");
+            let error = items[1].1.error.as_ref().unwrap();
+            assert_eq!(error["code"], "internal_error");
+            assert!(error["message"].as_str().unwrap().contains("boom 1"), "{error}");
+            assert_eq!(items[1].1.input, path_value(&paths[1]));
+        }
+    }
+
+    #[test]
     fn cancellation_before_dispatch_does_not_record_but_after_publication_does() {
         let fixture = Fixture::new();
         let store = fixture.store();
         let cancel = Cancellation::new();
         cancel.cancel();
         let started = AtomicBool::new(false);
-        let items = parallel_items(&[0], 1, &cancel, |_| {
+        let items = parallel_items(&[0], 1, &cancel, |_| PathBuf::from("input.wav"), |_| {
             started.store(true, Ordering::Relaxed);
             processed_report(Path::new("input.wav"), report(), &store, &cancel)
         });

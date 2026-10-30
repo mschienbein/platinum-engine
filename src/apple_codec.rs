@@ -156,9 +156,9 @@ struct AlignedBufferList(AudioBufferList);
 // These calls go through `call_with_sp_residue`, which fixes `sp % 64` at the callee's entry.
 // Residue 0 is neither of those two SME cases, so both calls run the NEON kernel, whose
 // output matches the native application's AAC references (docs/VERIFICATION.md) and the
-// pre-0.2.0 releases' output on the same inputs (the layout study is recorded in
-// local-artifacts/release-v0.2.0/aac-layout-control-01). This is a bounded runtime
-// observation of the tested macOS arm64 AudioToolbox, not a cross-version guarantee.
+// pre-0.2.0 releases' output on the same inputs (the stack-layout study behind the choice
+// of residue is part of the release evidence). This is a bounded runtime observation of
+// the tested macOS arm64 AudioToolbox, not a cross-version guarantee.
 const WRITE_SP_RESIDUE: usize = 0;
 const DISPOSE_SP_RESIDUE: usize = 0;
 
@@ -171,8 +171,8 @@ const DISPOSE_SP_RESIDUE: usize = 0;
 // call was whatever the compiler's frame for the caller produced (measured as 0 in the
 // shipped v0.2.0 binary; the AAC research recorded 32 for the interleaved read of another
 // build), so a different frame layout could have selected class S. Both reads now go through
-// `call_with_sp_residue` with residue 0, which is class G by construction (evidence:
-// local-artifacts/aac-lane-01/research/FINDINGS.md section 15, DECODER-REPORT.md; the v0.3.0
+// `call_with_sp_residue` with residue 0, which is class G by construction (the AAC decoder
+// research that found the two classes is part of the release evidence; the v0.3.0
 // proof compared 43,380 engine results against the v0.2.0 binary without a difference). The pin
 // only removes the dependence on compiler frame layout. A bounded runtime observation of the
 // tested macOS arm64 AudioToolbox.

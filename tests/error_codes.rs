@@ -488,9 +488,13 @@ fn output_conflict_is_reported_when_two_inputs_share_one_destination() {
 /// test that covers a code this file cannot provoke through the CLI.
 const LEDGER: &[(&str, &str)] = &[
     // Input admission and capability.
+    // What the portable decoders still refuse: HE-AAC in an MP4 and AAC in a WAVE container (`aac_streams_the_decoder_does_not_cover_are_refused_and_a_stub_is_an_invalid_file`,
+    // `failed_items_have_no_report`). Plain AAC-LC input is decoded since v0.4.0 and no longer produces this code; a stub `.m4a` with no sample tables is `invalid_input_file`.
     ("unsupported_input_codec", "tests/linux_opt_in.rs"),
     ("unsupported_input_format", "unsupported_input_format_is_reported_for_ogg_sources"),
-    ("unsupported_output_codec", "tests/linux_opt_in.rs"),
+    // Emitted by no build: the AAC encoder is exact on Linux and AudioToolbox is used on macOS, so no codec path returns an encoding refusal any more.
+    // The code stays in the contract; the mapping from `UnsupportedCodec { operation: "encoding" }` is the unit test in `src/error_code.rs`.
+    ("unsupported_output_codec", "src/error_code.rs"),
     ("unsupported_output_format", "tests/linux_opt_in.rs"),
     ("unsupported_sample_rate_conversion", "tests/linux_opt_in.rs"),
     ("artwork_conversion_unavailable", "tests/linux_opt_in.rs"),

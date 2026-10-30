@@ -64,7 +64,7 @@ exec "$@" "$image" sh -c '
   fi
   cargo build "$@" --locked --release --bin platinum --features portable > /out/build.stdout 2> /out/build.stderr
   build=$?
-  cargo test "$@" --locked --all-targets > /out/test.stdout 2> /out/test.stderr
+  cargo test "$@" --locked --all-targets --no-fail-fast > /out/test.stdout 2> /out/test.stderr
   test=$?
   # Library-gated lane: scenario tests that need the native libraries of this image.
   lib=/opt/platinum-native/lib
@@ -72,7 +72,7 @@ exec "$@" "$image" sh -c '
     PN_FLAC_LIB=$lib/libFLAC.so PN_FLAC_SHA256=$(sha256sum $lib/libFLAC.so | cut -d" " -f1) \
     PN_LAME_LIB=$lib/libmp3lame.so PN_LAME_SHA256=$(sha256sum $lib/libmp3lame.so | cut -d" " -f1) \
     PLATINUM_TEST_OPUS_LIB=$lib/libopus.so PLATINUM_TEST_OPUS_SHA256=$(sha256sum $lib/libopus.so | cut -d" " -f1) \
-    cargo test "$@" --locked --test error_codes --test linux_opt_in --test portable_art_copy --test opus_cli -- --ignored > /out/ignored.stdout 2> /out/ignored.stderr
+    cargo test "$@" --locked --no-fail-fast --test error_codes --test linux_opt_in --test portable_art_copy --test opus_cli -- --ignored > /out/ignored.stdout 2> /out/ignored.stderr
   gated=$?
   # The tag bridge tests that pin the default WAV marker policy and the opt-in that keeps the chunks TagLib wrote.
   PN_TAG_BRIDGE=$lib/libpn-tag-bridge.so \

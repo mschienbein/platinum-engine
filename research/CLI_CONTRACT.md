@@ -10,12 +10,15 @@ Production processing uses Rust DSP and explicitly configured public native libr
 
 ### Linux capability and error boundary
 
-By default Linux refuses AAC decoding, AAC encoding, unequal-rate
+By default Linux refuses unequal-rate
 sample-rate conversion, artwork conversion that requires Apple's transcoder,
 unverified codec and container variants (including unverified GSM masks), and
-ALAC packet conditions known to lose native audio. Portable ALAC output admits
-only finite 22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit depths in
-its supported layout. Processing that requires an unavailable conversion is
+ALAC packets that AudioToolbox cannot place after its retries and would lose
+audio for (the portable writer reproduces the retries and refuses where the macOS
+writer's frame check refuses the file; see [ALAC
+output](../docs/LINUX.md#alac-output-on-linux-and-portable-builds)). Portable ALAC
+output admits only finite 22,050–96,000 Hz rates, 1–8 channels and 16/20/24/32-bit
+depths in its supported layout. Processing that requires an unavailable conversion is
 refused before publication; analysis of non-MP3 inputs at or below 22,050 Hz is
 refused. A non-44.1 kHz waveform is unavailable rather than approximated; an
 otherwise supported analysis can still succeed.
@@ -31,8 +34,19 @@ RIFF/WAVE or AIFF file named `.mp3` is refused as `invalid_input_file` on Linux
 exactly as on macOS; under any other name the content decides. One opt-in,
 `parity.allow_non_identical` (below), relaxes one refusal on Linux and
 `portable` builds, the unchanged copy of embedded cover art, and keeps the WAV
-tag chunks the reference marker writer drops. AAC stays refused. Without the
-opt-in Linux behaves as v0.1.0 did except that MP3 input is decoded.
+tag chunks that carry source data and the reference marker writer drops. Without the
+opt-in Linux behaves as v0.1.0 did except that MP3 input is decoded and AAC input
+and output are exact.
+
+AAC input and output are not among the refusals either (v0.4.0). Linux and
+`portable` builds read AAC-LC (MP4/M4A, ADTS, LOAS/LATM, CAF) and write
+`--format aac` and `match-input` of an AAC source with exact ports of
+AudioToolbox's decoder and encoder that need no setting and are identical paths;
+the output formats, the answers for every other rate and channel count, the
+typed refusals and the diagnostic clock option are specified under
+[Files and encoders](#files-and-encoders), the contracts of the ports in
+[AAC_INPUT.md](../docs/AAC_INPUT.md) and
+[LINUX.md](../docs/LINUX.md#aac-input-and-output).
 
 The Rust codec layer uses `UnsupportedCodec`, `UnsupportedFormat` and
 `UnsupportedSampleRateConversion` variants; artwork uses
@@ -104,22 +118,34 @@ What it enables, on Linux and on `--features portable` builds only:
   since v0.3.0 such a conversion is refused with the setting on, and still
   ignored with it off.
 - **WAV tag chunks** (`ID3 `/`id3 ` and INFO `LIST`) that TagLib writes into a
-  WAV output are all kept, instead of losing the one TagLib saved last (see the
-  WAV tag-chunk paragraph under the processed-marker rules). The marker
-  rewrite, which stays in Rust, trusts the physical chunk sequence when the RIFF
-  size is stale because TagLib's size update is still buffered, but only when
-  everything after the declared end is a run of at most 64 well-formed chunks
-  ending exactly at the end of the file; anything else after the declared end is
-  dropped as before. Every other rule of the rewrite is unchanged, so the output
-  differs from the default only by the added chunks, and an output that kept at
-  least one lists `wav_tag_preservation`. A cross-format copy into a WAV always
-  writes tempo and key, so even a source without tags then gains an `ID3 ` chunk
-  holding an empty key and a zero tempo. With the setting off the behavior is the
-  reference's, byte for byte.
+  WAV output and that carry source data are kept, instead of losing the one TagLib
+  saved last (see the WAV tag-chunk paragraph under the processed-marker rules).
+  The marker rewrite, which stays in Rust, trusts the physical chunk sequence when
+  the RIFF size is stale because TagLib's size update is still buffered, but only
+  when the chunks before the declared end tile it exactly and everything after the
+  declared end is a run of at most 64 well-formed chunks ending exactly at the end
+  of the file; anything else after the declared end is
+  dropped as before. Within that run a chunk is kept unless it provably carries
+  nothing: an `ID3 `/`id3 ` chunk whose ID3v2.2, 2.3 or 2.4 tag holds no frame other
+  than `TBPM` frames whose text is empty or `0` and `TKEY` frames whose text is empty
+  (zero padding ignored), an INFO `LIST` in which no sub-chunk has a value, and the
+  chunks the reference rewrite drops anyway (`PLTN`, a `LIST` shorter than its type)
+  are dropped. Any other frame, a non-zero tempo, a non-empty key, a frame or header
+  flag, or an ID3 tag that cannot be parsed counts as source data, and its chunk is
+  kept exactly as TagLib wrote it; every other chunk of the run is kept as before.
+  Every other rule of the rewrite is unchanged, so the output differs from the
+  default only by the kept chunks, an output with no kept chunk is byte-identical to
+  the default policy's, and an output that kept at least one lists
+  `wav_tag_preservation`. TagLib writes tempo and key into every cross-format copy
+  into a WAV, so a source without tempo, key and tags yields an `ID3 ` chunk
+  holding only a zero tempo and an empty key: the opt-in drops it, the output is the
+  default one and nothing is listed. A source with a tempo, a key or tags keeps the
+  chunk and lists the path. With the setting off the behavior is the reference's, byte
+  for byte.
 
-It never enables AAC decoding or encoding, sample-rate conversion, or any other
-refused path; those keep their codes. It does not gate MP3 input, which has no
-setting: until v0.2.0 the setting also gated an open-source, non-byte-exact MP3
+It never enables sample-rate conversion or any other refused path; those keep
+their codes. It does not gate AAC input or output (exact since v0.4.0) or MP3
+input, which have no setting: until v0.2.0 the setting also gated an open-source, non-byte-exact MP3
 decoder on Linux (items using it listed `mp3_decode`), and v0.3.0 replaced it
 by the exact port; a state file that stores the setting remains valid and keeps
 its meaning for the two paths above.
@@ -158,12 +184,13 @@ when several apply, are:
 | Member | Meaning |
 | --- | --- |
 | `artwork_copy` | At least one embedded picture was stored byte for byte where the macOS bridge would have transcoded or dropped it (only `process`). It is absent when the source had no artwork or every picture moved through a path identical to macOS. |
-| `wav_tag_preservation` | A WAV output kept at least one tag chunk (`ID3 `, INFO `LIST`) that TagLib wrote and the reference marker writer drops (only `process`, WAV destinations). It is listed for a WAV source whose tag chunks TagLib copied, and for every cross-format copy into a WAV: that copy always writes tempo and key, so even a source without tags gains an `ID3 ` chunk holding an empty key and a zero tempo (a picture copied into a WAV travels in that chunk). It is absent for a WAV source without tag chunks and whenever TagLib wrote no chunk after the declared RIFF end. |
+| `wav_tag_preservation` | A WAV output kept at least one tag chunk (`ID3 `, INFO `LIST`) that TagLib wrote, that carries source data and that the reference marker writer drops (only `process`, WAV destinations). It is listed for a WAV source whose tag chunks TagLib copied, and for a cross-format copy into a WAV whose source has a tempo, a key or tags (a picture copied into a WAV travels in that chunk and counts as source data). It is absent for a WAV source without tag chunks, for a cross-format copy from a source without tempo, key and tags (TagLib's `ID3 ` chunk then holds only a zero tempo and an empty key and is dropped), and whenever TagLib wrote no chunk after the declared RIFF end. |
 
 New members may be added in later releases; consumers must treat an unknown
 member as non-identical and must not require an exact array. v0.2.0 also
 defined `mp3_decode` (an open-source MP3 decoder on Linux behind the setting);
-MP3 decoding is identical to macOS since v0.3.0 and the member no longer exists.
+MP3 decoding is identical to macOS since v0.3.0 and the member no longer exists;
+AAC input and output are identical paths since v0.4.0 and are never listed.
 
 ## Opt-in format: Opus
 
@@ -268,14 +295,14 @@ code would be a test failure and the final fallback is `internal_error`.
 
 | Code | Meaning | Reachable |
 | --- | --- | --- |
-| `unsupported_input_codec` | The input's audio codec cannot be decoded here: AAC/MP4A on Linux (also AAC data, and FLAC data under a name not ending in `flac`, when the name does not select their reader); MP3 inside a WAVE container whose name does not end `.mp3`; `match-input` of an unrecognized source codec (for example MPEG Layer I/II). | Linux/portable; unrecognized codec on all |
-| `unsupported_input_format` | The input's container, sample format, bit depth, channel layout or file extension is not admitted (for example OGG, an unverified WAV subtype, multichannel FLAC waveform, an MP3 larger than 2 GiB). | all |
-| `unsupported_output_codec` | The requested output encoding is unavailable: AAC output on Linux. | Linux/portable |
-| `unsupported_output_format` | The requested output encoder cannot write this audio's format although the input is fine: ALAC output above 96,000 Hz or with more than 8 channels on Linux. A format refusal raised in an encoder stage always has this side. | Linux/portable; macOS when an Apple encoder refuses the format |
+| `unsupported_input_codec` | The input's audio codec cannot be decoded here: an AAC stream that AudioToolbox decodes and the port does not reproduce (HE-AAC whose SBR or PS is signalled, AAC-LD, AAC-ELD, USAC and MPEG-1 audio object types, a CAF whose rate or channel count differs from its cookie, a packet table of more than 16,777,216 packets, a stereo read of a damaged 5.1 stream whose in-band program config element with a matrix mix-down index is not the stream's own 5.1 layout); AAC inside a WAVE container, which AudioToolbox does not open; FLAC data under a name not ending in `flac`, when the name does not select its reader; MP3 inside a WAVE container whose name does not end `.mp3`; `match-input` of an unrecognized source codec (for example MPEG Layer I/II). | Linux/portable; unrecognized codec on all |
+| `unsupported_input_format` | The input's container, sample format, bit depth, channel layout or file extension is not admitted (for example OGG, an unverified WAV subtype, multichannel FLAC waveform, an MP3 or AAC file larger than 2 GiB). | all |
+| `unsupported_output_codec` | Reserved: the requested output encoding is unavailable. Linux produced it for AAC output until v0.3.0; since v0.4.0 AAC output is exact and no build produces this code. It stays in the table because codes are never renamed, reused or removed. | none (reserved) |
+| `unsupported_output_format` | The requested output encoder cannot write this audio's format although the input is fine: ALAC output above 96,000 Hz or with more than 8 channels on Linux, and AAC output at a fractional sample rate or at an integral rate within 10 Hz of an AAC rate but not equal to it on Linux. A format refusal raised in an encoder stage always has this side. | Linux/portable; macOS when an Apple encoder refuses the format |
 | `unsupported_sample_rate_conversion` | Processing or analysis needs sample-rate conversion that Linux does not reproduce. | Linux/portable |
 | `artwork_conversion_unavailable` | Embedded artwork would need Apple image transcoding on Linux, or (opt-in on) the destination cannot store the picture unchanged. | Linux/portable |
 | `protected_source` | The input is a protected `m4p` or `wl.mp3` source. | all |
-| `invalid_input_file` | The input is malformed, truncated, empty of audio or otherwise not decodable, or its tag container cannot be read. A name ending `.mp1 .mp2 .mp3 .mpa .mpeg` selects the MPEG reader, so a file with that name whose bytes are not MPEG audio (for example a RIFF/WAVE or AIFF file named `.mp3`) is refused here (`'dta?'`), and data that no reader recognizes under another name is `'typ?'`; this is the same on macOS and Linux. | all |
+| `invalid_input_file` | The input is malformed, truncated, empty of audio or otherwise not decodable, or its tag container cannot be read. A name ending `.mp1 .mp2 .mp3 .mpa .mpeg` selects the MPEG reader, so a file with that name whose bytes are not MPEG audio (for example a RIFF/WAVE or AIFF file named `.mp3`) is refused here (`'dta?'`), and data that no reader recognizes under another name is `'typ?'`; this is the same on macOS and Linux. An MP4 whose first sound entry is neither `mp4a` nor `alac` nor a type AudioToolbox opens as another codec fails the open (`'wht?'`) on every build. | all |
 | `invalid_input_path` | The input path is a symlink, neither file nor directory, cannot be represented in JSON, or cannot be passed to the tag bridge. | all |
 | `no_input_files` | A selected input held no admitted audio files. | all |
 | `opus_not_enabled` | Opus output was requested (`--format opus`) while `formats.opus` is off. | all |
@@ -289,7 +316,7 @@ code would be a test failure and the final fallback is `internal_error`.
 | `library_unapproved` | A library's SHA-256 does not match the configured pin or the compiled Linux allowlist. | all |
 | `library_load_failed` | A configured library could not be loaded, whatever the reason: the path does not exist or is a directory, the file is no loadable library, it has the wrong ABI or version, or its identity check failed. Every load stage (tag bridge, libFLAC for decoding and encoding, LAME) maps a failing path or loader the same way; a digest that does not match is `library_unapproved`. | all |
 | `decode_failed` | The decoder failed while reading audio. | all |
-| `encode_failed` | The encoder or its postflight check failed. | all |
+| `encode_failed` | The encoder or its postflight check failed. On Linux and `portable` this includes AAC output for a rate and channel count that the macOS writer also fails (the 256 kbit/s warning at stage `configure Apple encoder`, AudioToolbox's native status at stage `create Apple encoder`), an AAC stream that needs 64-bit MP4 offsets or duration, and an ALAC packet that AudioToolbox cannot place after its retries (stages `encode Apple output` and `finish Apple output`). | all |
 | `processing_failed` | A processing stage rejected the audio parameters (for example an unusable sample rate) or failed internally. | all |
 | `io_error` | A filesystem operation failed. Also the code of a failed cleanup, rollback or backup removal, and of a cancellation that left such a failure, a recovery file or a publication behind. | all |
 | `atomic_rename_unsupported` | The filesystem or kernel does not support the atomic rename the transaction requires. | all |
@@ -306,7 +333,7 @@ code would be a test failure and the final fallback is `internal_error`.
 | `settings_error` | A settings or template operation failed. | all |
 | `statistics_error` | The statistics store failed (also `results[].statistics.code` when the accounting `failed`). | all |
 | `signal_handler_failed` | The Ctrl-C handler could not be installed. | all |
-| `internal_error` | An unclassified failure; also the fallback for an unknown stage. | all |
+| `internal_error` | An unclassified failure; also the fallback for an unknown stage, and a panic inside one item's worker (stage `worker`): that item fails and the other items of the batch are processed and reported as usual. The failed item can leave its staging files behind (`.pn-workflow-*` directories and a `.<name>.pn-reservation` file next to the output), which must be removed by hand before the item is reprocessed (v0.3.0 left the same files when the run ended). | all |
 
 The table, `ErrorCode::ALL` in `src/error_code.rs` and the unit and CLI tests
 are kept consistent by a test that fails when a code is added to one and not
@@ -578,11 +605,16 @@ source whose only copied fields are tempo and key. This is parity behavior, not 
 defect.
 
 With `parity.allow_non_identical` on (Linux and `portable` builds) the marker
-rewrite keeps every chunk TagLib wrote: an `ID3 `/`id3 ` chunk (text and
-artwork) and an INFO `LIST` both survive WAV-to-WAV, `match-input` and
+rewrite keeps the chunks TagLib wrote that carry source data: an `ID3 `/`id3 ` chunk
+(text and artwork) and an INFO `LIST` both survive WAV-to-WAV, `match-input` and
 cross-format copies to WAV, the output is the default one plus those chunks, and
-`non_identical_paths` lists `wav_tag_preservation`. This is deliberately not
-parity with the reference, which is why it sits behind the opt-in.
+`non_identical_paths` lists `wav_tag_preservation`. A chunk that carries nothing is
+dropped as the reference does: TagLib writes `TBPM` and `TKEY` in every cross-format
+copy, so for a source without tempo, key and tags the `ID3 ` chunk holds only a zero
+tempo and an empty key (then padding), and an INFO `LIST` may hold no value; the
+opt-in drops such a chunk, an output in which every trailing chunk is dropped is
+byte-identical to the default policy's, and nothing is listed. This is deliberately
+not parity with the reference, which is why it sits behind the opt-in.
 
 For a first run, use a disposable copy of an input and an existing separate
 output directory. After following the build guide, set `INPUT` and `OUTPUT_DIR`
@@ -641,7 +673,11 @@ established marker/suffix state. `AnalysisReport.waveform` may be null with
 `original_waveform` and `original_waveform_unavailable` describe the recorded
 backup's waveform or error, and the latter may be null. The diagnostic-only
 `controlled_mp4_time_1904` field is the supplied second or null; it does not
-claim the original clock's sampling phase.
+claim the original clock's sampling phase. It is set by the hidden `process`
+option `--controlled-mp4-time-1904 SECONDS_SINCE_1904`, which replaces the
+creation and modification times in `mvhd`, every `tkhd` and every `mdhd` of an
+AAC or ALAC output on every build, the Linux and `portable` AAC output
+included.
 
 On the portable path, MP3 postflight inspects the encoded output without
 decoding it. For an `Info` tag with a LAME or erased identifier
@@ -840,6 +876,39 @@ under a permitted extension, with source tags unavailable if TagLib cannot
 interpret that named container. Actual decoding and encoding depend on the
 source and host codecs, and these options do not establish byte parity.
 
+AAC output and input. `--format aac`, and `match-input` of an AAC source, write an
+`.m4a` of one fixed configuration: 256 kbit/s average bit rate, the only AAC
+setting the engine uses. On macOS the engine drives AudioToolbox's
+`ExtAudioFile`. On Linux and `portable` builds an exact port of its AAC-LC
+encoder writes the same file, byte for byte except for the close-time second in
+`mvhd`, every `tkhd` and every `mdhd`, which the hidden diagnostic option
+`--controlled-mp4-time-1904` replaces on every build (the Linux AAC output
+included) and which is how two files are compared as a whole. The port encodes
+44.1 and 48 kHz with 1–8 channels, 32 kHz with 3–8, 24 and 22.05 kHz with 4–8 and
+16 kHz with 7–8, and answers every other rate and channel count as the macOS
+writer does: a format AudioToolbox takes no 256 kbit/s for fails at stage
+`configure Apple encoder` and a format it has no AAC converter for fails at stage
+`create Apple encoder` (both `encode_failed`, and nothing is published), and a
+fractional rate or an integral rate only within 10 Hz of an AAC rate, which
+AudioToolbox serves but encodes at the exact rate, is refused with
+`unsupported_output_format`. AAC input is decoded by AudioToolbox on macOS and by
+an exact port on Linux and `portable` builds: AAC-LC in MP4/M4A, ADTS, LOAS/LATM
+and CAF with the same samples, lengths, bit rates and `OSStatus` values for the
+recorded shapes of damaged and unusual files (the rules recorded from
+AudioToolbox, and the damaged shapes that are not reproduced and may give a
+different result or status, are listed in
+[AAC_INPUT.md](../docs/AAC_INPUT.md)). On Linux and `portable`, HE-AAC whose SBR
+or PS is signalled, AAC-LD, AAC-ELD, USAC and MPEG-1 audio object types, a CAF
+whose rate or channel count differs from its cookie, a stereo read of a damaged
+5.1 stream whose in-band program config element with a matrix mix-down index is
+not the stream's own 5.1 layout, and AAC inside a WAVE
+container (which AudioToolbox does not open) are refused with
+`unsupported_input_codec`, a client rate other than the file's with
+`unsupported_sample_rate_conversion` and a file above 2 GiB with
+`unsupported_input_format`. Input discovery still admits an AAC file by its
+`.m4a` extension and the tag stage must classify the container. Neither
+direction appears in `non_identical_paths`.
+
 With `PLATINUM_DIAGNOSTIC_JOB_TRACE`, macOS records loaded-image callbacks
 with Mach-O UUIDs. Linux snapshots loaded ELF images at initialization and at
 each job boundary, recording a GNU build ID when present. This snapshot is not
@@ -866,8 +935,8 @@ been reproduced. For other non-44.1 kHz sources, analysis can proceed but the
 primary waveform is `null` with `waveform_unavailable` explaining the missing
 conversion. An MP3 whose rate is not 22,050, 32,000, 44,100 or 48,000 Hz needs
 the processing-rate conversion and is refused the same way (`inspect` still
-reports it). AAC decoding, AAC encoding and output sample-rate conversion
-fail before publication. Portable FLAC and MP3 output can use caller-pinned
+reports it). Output sample-rate conversion fails before publication, and so do
+the AAC refusals listed above. Portable FLAC and MP3 output can use caller-pinned
 encoders; sampled patched Linux builds are documented separately and are not
 a proof of whole-pipeline parity. MP3 output is inspected without decoding it;
 the postflight validates MPEG frame structure and computes the
@@ -896,6 +965,15 @@ generated six-channel 24-bit WAV matched both pinned native MP3 captures.
 After macOS ALAC finalization, the private output is decoded and its valid
 frame count checked against submitted frames before publication. Valid empty
 ALAC containers remain accepted; a silently truncated stream is refused.
+On Linux and `portable` builds the portable ALAC writer reproduces AudioToolbox's
+handling of a packet larger than its converter's output buffer: the packet is
+encoded again at later write calls and every attempt is counted in the cookie
+fields `maxFrameBytes` and `avgBitRate`, and where the macOS check would refuse
+the file the item fails with `encode_failed`. For write sizes that do not divide
+4,096 frames (the engine's own write calls are of that kind unless the limiter
+latency is a multiple of 512: the first call of a span is 512 frames minus that
+latency modulo 512 and the last is cut to the file's length) it can refuse a
+file AudioToolbox writes; it never writes a different one.
 
 Destination policy covers a selected directory, the input directory, mirrored input folders and replacement mode. Replacement forces match-input, retains the configured backup workflow, and exposes restoration. Ordinary outputs use the observed `_PN` naming convention. Already-processed tags and suffix checks must not disappear in the CLI.
 
